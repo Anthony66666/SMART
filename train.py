@@ -4,6 +4,7 @@ import pytorch_lightning as pl
 from pytorch_lightning.callbacks import LearningRateMonitor
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.strategies import DDPStrategy
+from smart.callbacks import ValidationVisualizationCallback
 from smart.utils.config import load_config_act
 from smart.datamodules import MultiDataModule
 from smart.model import SMART
@@ -45,11 +46,23 @@ if __name__ == '__main__':
                                        save_top_k=5,
                                        mode=monitor_mode)
     lr_monitor = LearningRateMonitor(logging_interval='epoch')
+    callbacks = [model_checkpoint, lr_monitor]
+    visualization_config = getattr(config, 'Visualization', None)
+    if visualization_config is not None and getattr(visualization_config, 'enabled', False):
+        callbacks.append(
+            ValidationVisualizationCallback(
+                enabled=True,
+                interval_epochs=getattr(visualization_config, 'interval_epochs', 1),
+                sample_indices=getattr(visualization_config, 'sample_indices', [0]),
+                output_dir=getattr(visualization_config, 'output_dir', 'outputs/val_visualizations'),
+                max_agents=getattr(visualization_config, 'max_agents', 0),
+            )
+        )
     trainer = pl.Trainer(accelerator=trainer_config.accelerator, devices=trainer_config.devices,
                          strategy=strategy,
                          accumulate_grad_batches=trainer_config.accumulate_grad_batches,
                          num_nodes=trainer_config.num_nodes,
-                         callbacks=[model_checkpoint, lr_monitor],
+                         callbacks=callbacks,
                          max_epochs=trainer_config.max_epochs,
                          num_sanity_val_steps=0,
                          gradient_clip_val=0.5)

@@ -38,6 +38,13 @@ Trainer:
   monitor_metric: "val_minADE"
   monitor_mode: "min"
 
+Visualization:
+  enabled: true
+  interval_epochs: 1
+  sample_indices: [0, 1, 2, 3]
+  output_dir: "./outputs/val_visualizations"
+  max_agents: 0
+
 Model:
   mode: "train"
   predictor: "smart_jepa"

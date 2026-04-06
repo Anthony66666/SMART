@@ -35,6 +35,15 @@ Trainer:
   ckpt_path:
   precision: 32
   accumulate_grad_batches: 1
+  monitor_metric: "val_cls_acc"
+  monitor_mode: "max"
+
+Visualization:
+  enabled: true
+  interval_epochs: 1
+  sample_indices: [0, 1, 2, 3]
+  output_dir: "./outputs/val_visualizations"
+  max_agents: 0
 
 Model:
   mode: "train"

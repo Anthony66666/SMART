@@ -341,6 +341,54 @@ checkpoint monitor 现在由 config 控制：
   - `monitor_metric: val_minADE`
   - `monitor_mode: min`
 
+## Validation Visualization During Training
+
+训练现在支持自动从固定的 `val` 样本保存可视化图，用来直接比较 baseline 和 `SMARTJEPA`。
+
+当前实现方式是：
+
+- 在每个 validation epoch 结束后触发
+- 从 `Visualization.sample_indices` 指定的固定索引读取样本
+- 对每个样本运行 `model.inference(...)`
+- 保存地图、历史、GT 和预测轨迹图
+
+这样只要 baseline 和 JEPA 使用同一组 `sample_indices`，两边的图就是一一对应的。
+
+默认训练配置里已经把两条线都设成了：
+
+```yaml
+Visualization:
+  enabled: true
+  interval_epochs: 1
+  sample_indices: [0, 1, 2, 3]
+  output_dir: "./outputs/val_visualizations"
+  max_agents: 0
+```
+
+输出目录结构是：
+
+```text
+outputs/val_visualizations/
+├── smart/
+│   ├── epoch_001/
+│   ├── epoch_002/
+├── smart_jepa/
+│   ├── epoch_001/
+│   ├── epoch_002/
+```
+
+所以你后面比较时，直接对齐看：
+
+- `smart/epoch_005/idx_00000_*.png`
+- `smart_jepa/epoch_005/idx_00000_*.png`
+
+如果你想改固定样本，只需要同时修改两份训练配置里的：
+
+- `configs/train/train_scalable.yaml`
+- `configs/train/train_scalable_jepa.yaml`
+
+并保证 `sample_indices` 完全一致。
+
 ## Smoke Tests
 
 开始正式训练前，建议至少做下面 3 件事：
