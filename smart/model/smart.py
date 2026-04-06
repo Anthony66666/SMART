@@ -100,8 +100,8 @@ class SMART(pl.LightningModule):
         self.test_predictions = dict()
         self.cls_loss = nn.CrossEntropyLoss(label_smoothing=0.1)
         self.map_cls_loss = nn.CrossEntropyLoss(label_smoothing=0.1)
-        self.inference_token = False
-        self.rollout_num = 1
+        self.inference_token = bool(getattr(model_config, "inference_token", False))
+        self.rollout_num = int(getattr(model_config, "rollout_num", 1))
 
     def get_trajectory_token(self):
         token_data = pickle.load(open(self.token_path, 'rb'))

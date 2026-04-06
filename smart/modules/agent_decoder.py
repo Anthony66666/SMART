@@ -218,13 +218,14 @@ class SMARTAgentDecoder(nn.Module):
 
         return token_res
 
-    def build_temporal_edge(self, pos_a, head_a, head_vector_a, num_agent, mask, inference_mask=None):
+    def build_temporal_edge(self, pos_a, head_a, head_vector_a, num_agent, mask, inference_mask=None,
+                            apply_random_hist_mask=True):
         pos_t = pos_a.reshape(-1, self.input_dim)
         head_t = head_a.reshape(-1)
         head_vector_t = head_vector_a.reshape(-1, 2)
         hist_mask = mask.clone()
 
-        if self.hist_mask and self.training:
+        if self.hist_mask and self.training and apply_random_hist_mask:
             hist_mask[
                 torch.arange(mask.shape[0]).unsqueeze(1), torch.randint(0, mask.shape[1], (num_agent, 10))] = False
             mask_t = hist_mask.unsqueeze(2) & hist_mask.unsqueeze(1)
@@ -261,6 +262,79 @@ class SMARTAgentDecoder(nn.Module):
              rel_head_a2a], dim=-1)
         r_a2a = self.r_a2a_emb(continuous_inputs=r_a2a, categorical_embs=None)
         return edge_index_a2a, r_a2a
+
+    def _build_temporal_batches(self, data, num_step, pos_a):
+        if isinstance(data, Batch):
+            batch_s = torch.cat([data['agent']['batch'] + data.num_graphs * t
+                                 for t in range(num_step)], dim=0)
+            batch_pl = torch.cat([data['pt_token']['batch'] + data.num_graphs * t
+                                  for t in range(num_step)], dim=0)
+            agent_batch = data['agent']['batch']
+        else:
+            batch_s = torch.arange(num_step,
+                                   device=pos_a.device).repeat_interleave(data['agent']['num_nodes'])
+            batch_pl = torch.arange(num_step,
+                                    device=pos_a.device).repeat_interleave(data['pt_token']['num_nodes'])
+            agent_batch = torch.zeros(data['agent']['num_nodes'], dtype=torch.long, device=pos_a.device)
+        return batch_s, batch_pl, agent_batch
+
+    def encode_history_context(self,
+                               data: HeteroData,
+                               map_enc: Mapping[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        pos_a = data['agent']['token_pos']
+        head_a = data['agent']['token_heading']
+        head_vector_a = torch.stack([head_a.cos(), head_a.sin()], dim=-1)
+        num_agent, num_step, _traj_dim = pos_a.shape
+        agent_category = data['agent']['category']
+        agent_token_index = data['agent']['token_idx']
+        feat_a, _ = self.agent_token_embedding(data, agent_category, agent_token_index, pos_a, head_vector_a)
+
+        history_token_steps = max(1, (self.num_historical_steps - 1) // self.shift)
+        history_mask = data['agent']['agent_valid_mask'].clone()
+        history_mask[:, history_token_steps:] = False
+        temporal_mask = history_mask.clone()
+        edge_index_t, r_t = self.build_temporal_edge(
+            pos_a,
+            head_a,
+            head_vector_a,
+            num_agent,
+            temporal_mask,
+            apply_random_hist_mask=False,
+        )
+
+        batch_s, batch_pl, agent_batch = self._build_temporal_batches(data, num_step, pos_a)
+        mask_s = temporal_mask.transpose(0, 1).reshape(-1)
+        edge_index_a2a, r_a2a = self.build_interaction_edge(pos_a, head_a, head_vector_a, batch_s, mask_s)
+        map_mask = temporal_mask.clone()
+        map_mask[data['agent']['type'] == 3] = False
+        edge_index_pl2a, r_pl2a = self.build_map2agent_edge(
+            data,
+            num_step,
+            agent_category,
+            pos_a,
+            head_a,
+            head_vector_a,
+            map_mask,
+            batch_s,
+            batch_pl,
+        )
+
+        for i in range(self.num_layers):
+            feat_a = feat_a.reshape(-1, self.hidden_dim)
+            feat_a = self.t_attn_layers[i](feat_a, r_t, edge_index_t)
+            feat_a = feat_a.reshape(-1, num_step,
+                                    self.hidden_dim).transpose(0, 1).reshape(-1, self.hidden_dim)
+            feat_a = self.pt2a_attn_layers[i]((map_enc['x_pt'].repeat_interleave(
+                repeats=num_step, dim=0).reshape(-1, num_step, self.hidden_dim).transpose(0, 1).reshape(
+                    -1, self.hidden_dim), feat_a), r_pl2a, edge_index_pl2a)
+            feat_a = self.a2a_attn_layers[i](feat_a, r_a2a, edge_index_a2a)
+            feat_a = feat_a.reshape(num_step, -1, self.hidden_dim).transpose(0, 1)
+
+        return {
+            'x_a_history': feat_a,
+            'history_token_mask': history_mask,
+            'agent_batch': agent_batch,
+        }
 
     def build_map2agent_edge(self, data, num_step, agent_category, pos_a, head_a, head_vector_a, mask,
                              batch_s, batch_pl):
@@ -303,16 +377,7 @@ class SMARTAgentDecoder(nn.Module):
         mask = agent_valid_mask
         edge_index_t, r_t = self.build_temporal_edge(pos_a, head_a, head_vector_a, num_agent, mask)
 
-        if isinstance(data, Batch):
-            batch_s = torch.cat([data['agent']['batch'] + data.num_graphs * t
-                                 for t in range(num_step)], dim=0)
-            batch_pl = torch.cat([data['pt_token']['batch'] + data.num_graphs * t
-                                  for t in range(num_step)], dim=0)
-        else:
-            batch_s = torch.arange(num_step,
-                                   device=pos_a.device).repeat_interleave(data['agent']['num_nodes'])
-            batch_pl = torch.arange(num_step,
-                                    device=pos_a.device).repeat_interleave(data['pt_token']['num_nodes'])
+        batch_s, batch_pl, _agent_batch = self._build_temporal_batches(data, num_step, pos_a)
 
         mask_s = mask.transpose(0, 1).reshape(-1)
         edge_index_a2a, r_a2a = self.build_interaction_edge(pos_a, head_a, head_vector_a, batch_s, mask_s)

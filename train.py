@@ -7,12 +7,16 @@ from pytorch_lightning.strategies import DDPStrategy
 from smart.utils.config import load_config_act
 from smart.datamodules import MultiDataModule
 from smart.model import SMART
+from smart.model import SMARTJEPA
 from smart.utils.log import Logging
 
 
 if __name__ == '__main__':
     parser = ArgumentParser()
-    Predictor_hash = {"smart": SMART, }
+    Predictor_hash = {
+        "smart": SMART,
+        "smart_jepa": SMARTJEPA,
+    }
     parser.add_argument('--config', type=str, default='configs/train/train_scalable.yaml')
     parser.add_argument('--pretrain_ckpt', type=str, default="")
     parser.add_argument('--ckpt_path', type=str, default="")
@@ -32,12 +36,14 @@ if __name__ == '__main__':
         model.load_params_from_file(filename=args.pretrain_ckpt,
                                     logger=logger)
     trainer_config = config.Trainer
+    monitor_metric = getattr(trainer_config, 'monitor_metric', 'val_cls_acc')
+    monitor_mode = getattr(trainer_config, 'monitor_mode', 'max')
     model_checkpoint = ModelCheckpoint(dirpath=args.save_ckpt_path,
                                        filename="{epoch:02d}",
-                                       monitor='val_cls_acc',
+                                       monitor=monitor_metric,
                                        every_n_epochs=1,
                                        save_top_k=5,
-                                       mode='max')
+                                       mode=monitor_mode)
     lr_monitor = LearningRateMonitor(logging_interval='epoch')
     trainer = pl.Trainer(accelerator=trainer_config.accelerator, devices=trainer_config.devices,
                          strategy=strategy,
