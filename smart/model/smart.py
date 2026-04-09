@@ -15,6 +15,7 @@ import pickle
 from collections import defaultdict
 import os
 from waymo_open_dataset.protos import sim_agents_submission_pb2
+from smart.utils.torch_compat import torch_load_compat
 
 
 def cal_polygon_contour(x, y, theta, width, length):
@@ -221,7 +222,7 @@ class SMART(pl.LightningModule):
 
         logger.info('==> Loading parameters from checkpoint %s to %s' % (filename, 'CPU' if to_cpu else 'GPU'))
         loc_type = torch.device('cpu') if to_cpu else None
-        checkpoint = torch.load(filename, map_location=loc_type, weights_only=False)
+        checkpoint = torch_load_compat(filename, map_location=loc_type, weights_only=False)
         model_state_disk = checkpoint['state_dict']
 
         version = checkpoint.get("version", None)

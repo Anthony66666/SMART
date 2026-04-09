@@ -1,7 +1,5 @@
 
 from argparse import ArgumentParser
-import torch
-from easydict import EasyDict
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import LearningRateMonitor
 from pytorch_lightning.callbacks import ModelCheckpoint
@@ -12,8 +10,9 @@ from smart.datamodules import MultiDataModule
 from smart.model import SMART
 from smart.model import SMARTJEPA
 from smart.utils.log import Logging
+from smart.utils.torch_compat import register_checkpoint_safe_globals
 
-torch.serialization.add_safe_globals([EasyDict])
+register_checkpoint_safe_globals()
 
 
 if __name__ == '__main__':

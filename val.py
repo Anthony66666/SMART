@@ -1,7 +1,5 @@
 
 from argparse import ArgumentParser
-import torch
-from easydict import EasyDict
 import pytorch_lightning as pl
 from torch_geometric.loader import DataLoader
 from smart.datasets.scalable_dataset import MultiDataset
@@ -10,8 +8,9 @@ from smart.model import SMARTJEPA
 from smart.transforms import WaymoTargetBuilder
 from smart.utils.config import load_config_act
 from smart.utils.log import Logging
+from smart.utils.torch_compat import register_checkpoint_safe_globals
 
-torch.serialization.add_safe_globals([EasyDict])
+register_checkpoint_safe_globals()
 
 if __name__ == '__main__':
     pl.seed_everything(2, workers=True)
