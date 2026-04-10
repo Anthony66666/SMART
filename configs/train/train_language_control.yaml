@@ -1,0 +1,22 @@
+# First-stage language-control config stub.
+# This keeps language modules isolated from the existing SMART/JEPA training entrypoints.
+
+LanguageControl:
+  enabled: true
+  hidden_dim: 128
+  token_size: 2048
+  vocab_size: 32768
+  max_prompt_tokens: 64
+  dropout: 0.1
+  freeze_scene_encoder: true
+  losses:
+    scene_text_alignment_weight: 1.0
+    token_prediction_weight: 1.0
+  data:
+    annotation_paths: []
+    womd_root:
+    load_scene: false
+  evaluation:
+    prompt_controllability: true
+    trajectory_realism: true
+    collision_offroad_filter: true
