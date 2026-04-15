@@ -25,6 +25,8 @@ class ValidationVisualizationCallback(pl.Callback):
     def on_validation_epoch_end(self, trainer, pl_module) -> None:
         if not self.enabled or not trainer.is_global_zero:
             return
+        if getattr(pl_module, "training_stage", "joint") == "pretrain":
+            return
         epoch = trainer.current_epoch + 1
         if epoch % self.interval_epochs != 0:
             return

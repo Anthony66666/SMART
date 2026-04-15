@@ -2,22 +2,19 @@
 time_info: &time_info
   num_historical_steps: 11
   num_future_steps: 80
-  use_intention: True
   token_size: 2048
 
 Dataset:
   root:
-  train_batch_size: 1
-  val_batch_size: 1
-  test_batch_size: 1
+  batch_size: 1
   shuffle: True
   num_workers: 1
   pin_memory: True
   persistent_workers: True
-  train_raw_dir: ["data/valid_demo"]
+  train_raw_dir:
   val_raw_dir: ["data/valid_demo"]
   test_raw_dir:
-  transform: WaymoTargetBuilder
+  TargetBuilder: WaymoTargetBuilder
   train_processed_dir:
   val_processed_dir:
   test_processed_dir:
@@ -35,18 +32,9 @@ Trainer:
   ckpt_path:
   precision: 32
   accumulate_grad_batches: 1
-  monitor_metric: "val_minADE"
-  monitor_mode: "min"
-
-Visualization:
-  enabled: true
-  interval_epochs: 1
-  sample_indices: [0, 1, 2, 3]
-  output_dir: "./outputs/val_visualizations"
-  max_agents: 0
 
 Model:
-  mode: "train"
+  mode: "validation"
   predictor: "smart_jepa"
   dataset: "waymo"
   input_dim: 2
@@ -61,7 +49,7 @@ Model:
   lr: 0.0005
   warmup_steps: 0
   total_steps: 32
-  inference_token: True
+  inference_token: False
   rollout_num: 1
   decoder:
     <<: *time_info
@@ -73,7 +61,7 @@ Model:
     time_span: 30
   jepa:
     enabled: true
-    training_stage: "joint"
+    training_stage: "pretrain"
     mask_strategy: "interaction_multiblock"
     future_chunk_steps: 5
     mask_ratio: 0.5
@@ -86,7 +74,7 @@ Model:
     predict_map_latent: true
     agent_loss_weight: 0.5
     map_loss_weight: 0.5
-    masked_agent_history_mode: "partial_dropout"
+    masked_agent_history_mode: "visible"
     masked_agent_history_dropout_ratio: 0.5
     masked_agent_history_min_visible_tokens: 1
     disable_map_mae_aux_when_jepa: true

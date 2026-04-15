@@ -1,6 +1,6 @@
 # Training Guide
 
-This document is the practical server-side training guide for this repo. Use it when you want to start baseline SMART training, run SMARTJEPA, or launch the three masked-agent-history ablations.
+This document is the practical server-side training guide for this repo. Use it when you want to start baseline SMART training, run SMARTJEPA, or launch the two-stage JEPA pretrain plus scenario-generation finetune workflow.
 
 ## 1. Environment
 
@@ -53,7 +53,7 @@ Default JEPA:
 - `configs/train/train_scalable_jepa.yaml`
 - `configs/validation/validation_scalable_jepa.yaml`
 
-JEPA ablations:
+Joint JEPA ablations:
 
 | Ablation | Meaning | Train config | Validation config |
 | --- | --- | --- | --- |
@@ -61,18 +61,36 @@ JEPA ablations:
 | `A1` | masked-agent history partial dropout | `configs/train/train_scalable_jepa_a1_partial_dropout.yaml` | `configs/validation/validation_scalable_jepa_a1_partial_dropout.yaml` |
 | `A2` | masked-agent history hidden | `configs/train/train_scalable_jepa_a2_hidden.yaml` | `configs/validation/validation_scalable_jepa_a2_hidden.yaml` |
 
-The only intended difference across `A0/A1/A2` is `Model.jepa.masked_agent_history_mode`.
+JEPA pretrain ablations:
+
+| Ablation | Meaning | Train config | Validation config |
+| --- | --- | --- | --- |
+| `A0-pretrain` | masked-agent history fully visible | `configs/train/train_scalable_jepa_pretrain_a0_visible.yaml` | `configs/validation/validation_scalable_jepa_pretrain_a0_visible.yaml` |
+| `A1-pretrain` | masked-agent history partial dropout | `configs/train/train_scalable_jepa_pretrain_a1_partial_dropout.yaml` | `configs/validation/validation_scalable_jepa_pretrain_a1_partial_dropout.yaml` |
+| `A2-pretrain` | masked-agent history hidden | `configs/train/train_scalable_jepa_pretrain_a2_hidden.yaml` | `configs/validation/validation_scalable_jepa_pretrain_a2_hidden.yaml` |
+
+The only intended difference across `A0/A1/A2` is `Model.jepa.masked_agent_history_mode`. The pretrain configs additionally set:
+
+- `Model.jepa.training_stage: pretrain`
+- `Model.inference_token: false`
+- `Visualization.enabled: false`
+- `Trainer.monitor_metric: val_jepa_loss`
+- `Trainer.monitor_mode: min`
 
 ## 4. Recommended Experiment Order
 
-1. Train a baseline SMART model.
-2. Validate the baseline checkpoint.
-3. Train `A0`.
-4. Train `A1`.
-5. Train `A2`.
-6. Compare `val_minADE`, `val_minFDE`, `val_jepa_loss`, `val_agent_jepa_loss`, `val_map_jepa_loss`.
+1. `B0`: train a baseline SMART model from scratch.
+2. `B1`: train the joint SMARTJEPA baseline from scratch.
+3. `P0-pretrain`: run pure JEPA pretraining, defaulting to `A1 partial_dropout`.
+4. `P0-finetune`: initialize baseline SMART from the JEPA checkpoint and finetune for scenario generation.
+5. Compare `B0`, `B1`, and `P0` using the same offline evaluation pipeline.
 
-If you want JEPA to start from a trained baseline checkpoint, use `--pretrain_ckpt`.
+Default fair-budget comparison:
+
+- `B1 joint`: `32` epochs
+- `P0`: `16` epochs pretrain + `16` epochs finetune
+
+If the two-stage pipeline is already better, extend it to `32 + 32`.
 
 ## 5. Baseline Commands
 
@@ -128,7 +146,51 @@ python train.py \
   --ckpt_path checkpoints/jepa_default/last.ckpt
 ```
 
-## 7. Ablation Commands
+## 7. Two-Stage JEPA Pretrain Then Finetune
+
+Recommended main path:
+
+- pretrain with `A1 partial_dropout`
+- finetune `SMART` with the JEPA checkpoint using baseline configs
+
+### P0 Step 1: JEPA pretrain
+
+```bash
+python train.py \
+  --config configs/train/train_scalable_jepa_pretrain_a1_partial_dropout.yaml \
+  --save_ckpt_path checkpoints/jepa_pretrain_a1
+```
+
+```bash
+python val.py \
+  --config configs/validation/validation_scalable_jepa_pretrain_a1_partial_dropout.yaml \
+  --pretrain_ckpt checkpoints/jepa_pretrain_a1/last.ckpt
+```
+
+### P0 Step 2: Scenario-generation finetune with SMART
+
+```bash
+python train.py \
+  --config configs/train/train_scalable.yaml \
+  --pretrain_ckpt checkpoints/jepa_pretrain_a1/last.ckpt \
+  --save_ckpt_path checkpoints/smart_from_jepa_a1
+```
+
+```bash
+python val.py \
+  --config configs/validation/validation_scalable.yaml \
+  --pretrain_ckpt checkpoints/smart_from_jepa_a1/last.ckpt
+```
+
+### Offline evaluation
+
+```bash
+python eval_waymo_official.py \
+  --config configs/validation/validation_scalable.yaml \
+  --pretrain_ckpt checkpoints/smart_from_jepa_a1/last.ckpt
+```
+
+## 8. Joint Ablation Commands
 
 ### A0: history visible
 
@@ -172,23 +234,49 @@ python val.py \
   --pretrain_ckpt checkpoints/jepa_a2_hidden/last.ckpt
 ```
 
-## 8. Running On A Server
+## 9. JEPA Pretrain Ablation Commands
+
+### A0-pretrain: history visible
+
+```bash
+python train.py \
+  --config configs/train/train_scalable_jepa_pretrain_a0_visible.yaml \
+  --save_ckpt_path checkpoints/jepa_pretrain_a0
+```
+
+### A1-pretrain: partial history dropout
+
+```bash
+python train.py \
+  --config configs/train/train_scalable_jepa_pretrain_a1_partial_dropout.yaml \
+  --save_ckpt_path checkpoints/jepa_pretrain_a1
+```
+
+### A2-pretrain: history hidden
+
+```bash
+python train.py \
+  --config configs/train/train_scalable_jepa_pretrain_a2_hidden.yaml \
+  --save_ckpt_path checkpoints/jepa_pretrain_a2
+```
+
+## 10. Running On A Server
 
 Single GPU example:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python train.py \
-  --config configs/train/train_scalable_jepa_a0_visible.yaml \
-  --save_ckpt_path checkpoints/jepa_a0_visible
+  --config configs/train/train_scalable_jepa_pretrain_a1_partial_dropout.yaml \
+  --save_ckpt_path checkpoints/jepa_pretrain_a1
 ```
 
 Background run example:
 
 ```bash
 nohup python train.py \
-  --config configs/train/train_scalable_jepa_a0_visible.yaml \
-  --save_ckpt_path checkpoints/jepa_a0_visible \
-  > outputs/train_a0.log 2>&1 &
+  --config configs/train/train_scalable_jepa_pretrain_a1_partial_dropout.yaml \
+  --save_ckpt_path checkpoints/jepa_pretrain_a1 \
+  > outputs/train_pretrain_a1.log 2>&1 &
 ```
 
 Multi-GPU runs are controlled through the config:
@@ -199,7 +287,7 @@ Multi-GPU runs are controlled through the config:
 
 `train.py` already uses Lightning `DDPStrategy`, so you normally do not need to modify the launcher script.
 
-## 9. What To Monitor
+## 11. What To Monitor
 
 Baseline:
 
@@ -220,7 +308,16 @@ JEPA:
 - `masked_map_count`
 - `masked_agent_history_visible_fraction`
 - `val_jepa_loss`
+
+Joint JEPA only:
+
 - `val_total_loss`
+- `val_minADE`
+- `val_minFDE`
+
+Two-stage finetune only:
+
+- `val_cls_acc`
 - `val_minADE`
 - `val_minFDE`
 
@@ -232,13 +329,13 @@ Interpretation of the new history metric:
 
 If those values do not match the intended ablation, the wrong config is being used.
 
-## 10. Debugging The JEPA Mask
+## 12. Debugging The JEPA Mask
 
 To visualize the current joint agent-map mask and confirm the history mode:
 
 ```bash
 python scripts/visualize_jepa_masks.py \
-  --config configs/train/train_scalable_jepa_a1_partial_dropout.yaml \
+  --config configs/train/train_scalable_jepa_pretrain_a1_partial_dropout.yaml \
   --split train \
   --indices 0 1 2 3 \
   --output-dir outputs/jepa_mask_debug_a1
@@ -251,7 +348,7 @@ The figure title box will show:
 - `history=<mode>`
 - `hist vis=<fraction>`
 
-## 11. Common Failure Modes
+## 13. Common Failure Modes
 
 ### Wrong dataset paths
 
@@ -264,6 +361,9 @@ Always validate with the matching validation config:
 - `A0` train pairs with `A0` validation
 - `A1` train pairs with `A1` validation
 - `A2` train pairs with `A2` validation
+- `A0-pretrain` train pairs with `A0-pretrain` validation
+- `A1-pretrain` train pairs with `A1-pretrain` validation
+- `A2-pretrain` train pairs with `A2-pretrain` validation
 
 ### Invalid future chunk setup
 
@@ -276,7 +376,7 @@ Always validate with the matching validation config:
 
 ### Watching only token accuracy
 
-For JEPA, do not judge runs using only `val_cls_acc`. The primary comparison should be:
+For JEPA pretraining, do not judge runs using only `val_cls_acc`. The primary comparison should be:
 
 - `val_minADE`
 - `val_minFDE`
@@ -284,7 +384,7 @@ For JEPA, do not judge runs using only `val_cls_acc`. The primary comparison sho
 - `val_agent_jepa_loss`
 - `val_map_jepa_loss`
 
-## 12. Minimal Start-From-Zero Workflow
+## 14. Minimal Start-From-Zero Workflow
 
 ```bash
 cd /home/anthony/SimAgentJEPA/external/SMART
@@ -293,12 +393,14 @@ conda activate smart
 
 # edit the config paths first
 
-# baseline
+# B0 baseline
 python train.py --config configs/train/train_scalable.yaml --save_ckpt_path checkpoints/baseline
 python val.py --config configs/validation/validation_scalable.yaml --pretrain_ckpt checkpoints/baseline/last.ckpt
 
-# JEPA ablations
-python train.py --config configs/train/train_scalable_jepa_a0_visible.yaml --save_ckpt_path checkpoints/jepa_a0_visible
-python train.py --config configs/train/train_scalable_jepa_a1_partial_dropout.yaml --save_ckpt_path checkpoints/jepa_a1_partial_dropout
-python train.py --config configs/train/train_scalable_jepa_a2_hidden.yaml --save_ckpt_path checkpoints/jepa_a2_hidden
+# B1 joint JEPA
+python train.py --config configs/train/train_scalable_jepa_a1_partial_dropout.yaml --save_ckpt_path checkpoints/jepa_joint_a1
+
+# P0 JEPA pretrain -> SMART finetune
+python train.py --config configs/train/train_scalable_jepa_pretrain_a1_partial_dropout.yaml --save_ckpt_path checkpoints/jepa_pretrain_a1
+python train.py --config configs/train/train_scalable.yaml --pretrain_ckpt checkpoints/jepa_pretrain_a1/last.ckpt --save_ckpt_path checkpoints/smart_from_jepa_a1
 ```

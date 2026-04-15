@@ -61,6 +61,7 @@ Model:
     time_span: 30
   jepa:
     enabled: true
+    training_stage: "joint"
     mask_strategy: "interaction_multiblock"
     future_chunk_steps: 5
     mask_ratio: 0.5

@@ -39,6 +39,7 @@ class SMARTJEPA(SMART):
         self.map_loss_weight = float(getattr(model_config.jepa, "map_loss_weight", 0.5))
         self.disable_map_mae_aux_when_jepa = bool(getattr(model_config.jepa, "disable_map_mae_aux_when_jepa", True))
         self.mask_ratio = float(getattr(model_config.jepa, "mask_ratio", 0.5))
+        self.training_stage = str(getattr(model_config.jepa, "training_stage", "joint"))
         self.masked_agent_history_mode = str(getattr(model_config.jepa, "masked_agent_history_mode", "visible"))
         self.masked_agent_history_dropout_ratio = float(
             getattr(model_config.jepa, "masked_agent_history_dropout_ratio", 0.5)
@@ -49,6 +50,10 @@ class SMARTJEPA(SMART):
 
         if self.map_block_unit != "polygon":
             raise ValueError(f"Unsupported map_block_unit: {self.map_block_unit}")
+        if self.training_stage not in {"joint", "pretrain"}:
+            raise ValueError(
+                f"Unsupported jepa.training_stage: {self.training_stage}"
+            )
         if self.masked_agent_history_mode not in {"visible", "partial_dropout", "hidden"}:
             raise ValueError(
                 f"Unsupported jepa.masked_agent_history_mode: {self.masked_agent_history_mode}"
@@ -67,6 +72,13 @@ class SMARTJEPA(SMART):
 
     def training_step(self, data, batch_idx):
         data = self._prepare_batch(data)
+        if self.training_stage == "pretrain":
+            jepa_loss, jepa_stats = self.compute_jepa_loss(data)
+            self.log('train_loss', jepa_loss, prog_bar=True, on_step=True, on_epoch=True, batch_size=1)
+            self.log('jepa_loss', jepa_loss, prog_bar=True, on_step=True, on_epoch=True, batch_size=1)
+            self._log_jepa_stats(jepa_stats, prefix="", on_step=True, on_epoch=True, sync_dist=False)
+            return jepa_loss
+
         pred = self(data)
         cls_loss = self._compute_cls_loss(pred)
         jepa_loss, jepa_stats = self.compute_jepa_loss(data)
@@ -75,22 +87,18 @@ class SMARTJEPA(SMART):
         self.log('train_loss', loss, prog_bar=True, on_step=True, on_epoch=True, batch_size=1)
         self.log('cls_loss', cls_loss, prog_bar=True, on_step=True, on_epoch=True, batch_size=1)
         self.log('jepa_loss', jepa_loss, prog_bar=True, on_step=True, on_epoch=True, batch_size=1)
-        self.log('jepa_cosine', jepa_stats['jepa_cosine'], prog_bar=False, on_step=True, on_epoch=True, batch_size=1)
-        self.log('jepa_masked_fraction', jepa_stats['masked_fraction'], prog_bar=False, on_step=True, on_epoch=True, batch_size=1)
-        self.log('agent_jepa_loss', jepa_stats['agent_jepa_loss'], prog_bar=False, on_step=True, on_epoch=True, batch_size=1)
-        self.log('map_jepa_loss', jepa_stats['map_jepa_loss'], prog_bar=False, on_step=True, on_epoch=True, batch_size=1)
-        self.log('masked_agent_count', jepa_stats['masked_agent_count'], prog_bar=False, on_step=True, on_epoch=True, batch_size=1)
-        self.log('masked_map_count', jepa_stats['masked_map_count'], prog_bar=False, on_step=True, on_epoch=True, batch_size=1)
-        self.log('masked_agent_history_visible_fraction', jepa_stats['masked_agent_history_visible_fraction'],
-                 prog_bar=False, on_step=True, on_epoch=True, batch_size=1)
-        self.log('masked_agent_history_visible_tokens', jepa_stats['masked_agent_history_visible_tokens'],
-                 prog_bar=False, on_step=True, on_epoch=True, batch_size=1)
-        self.log('masked_agent_history_total_tokens', jepa_stats['masked_agent_history_total_tokens'],
-                 prog_bar=False, on_step=True, on_epoch=True, batch_size=1)
+        self._log_jepa_stats(jepa_stats, prefix="", on_step=True, on_epoch=True, sync_dist=False)
         return loss
 
     def validation_step(self, data, batch_idx):
         data = self._prepare_batch(data)
+        if self.training_stage == "pretrain":
+            jepa_loss, jepa_stats = self.compute_jepa_loss(data)
+            self.log('val_loss', jepa_loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=1, sync_dist=True)
+            self.log('val_jepa_loss', jepa_loss, prog_bar=False, on_step=False, on_epoch=True, batch_size=1, sync_dist=True)
+            self._log_jepa_stats(jepa_stats, prefix="val_", on_step=False, on_epoch=True, sync_dist=True)
+            return
+
         pred = self(data)
         cls_loss = self._compute_cls_loss(pred)
         jepa_loss, jepa_stats = self.compute_jepa_loss(data)
@@ -109,17 +117,7 @@ class SMARTJEPA(SMART):
         self.log('val_loss', cls_loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=1, sync_dist=True)
         self.log('val_jepa_loss', jepa_loss, prog_bar=False, on_step=False, on_epoch=True, batch_size=1, sync_dist=True)
         self.log('val_total_loss', total_loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=1, sync_dist=True)
-        self.log('val_jepa_cosine', jepa_stats['jepa_cosine'], prog_bar=False, on_step=False, on_epoch=True, batch_size=1, sync_dist=True)
-        self.log('val_agent_jepa_loss', jepa_stats['agent_jepa_loss'], prog_bar=False, on_step=False, on_epoch=True, batch_size=1, sync_dist=True)
-        self.log('val_map_jepa_loss', jepa_stats['map_jepa_loss'], prog_bar=False, on_step=False, on_epoch=True, batch_size=1, sync_dist=True)
-        self.log('val_masked_agent_count', jepa_stats['masked_agent_count'], prog_bar=False, on_step=False, on_epoch=True, batch_size=1, sync_dist=True)
-        self.log('val_masked_map_count', jepa_stats['masked_map_count'], prog_bar=False, on_step=False, on_epoch=True, batch_size=1, sync_dist=True)
-        self.log('val_masked_agent_history_visible_fraction', jepa_stats['masked_agent_history_visible_fraction'],
-                 prog_bar=False, on_step=False, on_epoch=True, batch_size=1, sync_dist=True)
-        self.log('val_masked_agent_history_visible_tokens', jepa_stats['masked_agent_history_visible_tokens'],
-                 prog_bar=False, on_step=False, on_epoch=True, batch_size=1, sync_dist=True)
-        self.log('val_masked_agent_history_total_tokens', jepa_stats['masked_agent_history_total_tokens'],
-                 prog_bar=False, on_step=False, on_epoch=True, batch_size=1, sync_dist=True)
+        self._log_jepa_stats(jepa_stats, prefix="val_", on_step=False, on_epoch=True, sync_dist=True)
 
         if self.inference_token:
             pred_inference = self.inference(data)
@@ -221,6 +219,26 @@ class SMARTJEPA(SMART):
         next_token_idx_gt = pred['next_token_idx_gt']
         next_token_eval_mask = pred['next_token_eval_mask']
         return self.cls_loss(next_token_prob[next_token_eval_mask], next_token_idx_gt[next_token_eval_mask])
+
+    def _log_jepa_stats(
+        self,
+        jepa_stats: Dict[str, torch.Tensor],
+        prefix: str,
+        on_step: bool,
+        on_epoch: bool,
+        sync_dist: bool,
+    ) -> None:
+        name = lambda metric: f"{prefix}{metric}"
+        self.log(name('jepa_cosine'), jepa_stats['jepa_cosine'], prog_bar=False, on_step=on_step, on_epoch=on_epoch, batch_size=1, sync_dist=sync_dist)
+        if prefix == "":
+            self.log(name('jepa_masked_fraction'), jepa_stats['masked_fraction'], prog_bar=False, on_step=on_step, on_epoch=on_epoch, batch_size=1, sync_dist=sync_dist)
+        self.log(name('agent_jepa_loss'), jepa_stats['agent_jepa_loss'], prog_bar=False, on_step=on_step, on_epoch=on_epoch, batch_size=1, sync_dist=sync_dist)
+        self.log(name('map_jepa_loss'), jepa_stats['map_jepa_loss'], prog_bar=False, on_step=on_step, on_epoch=on_epoch, batch_size=1, sync_dist=sync_dist)
+        self.log(name('masked_agent_count'), jepa_stats['masked_agent_count'], prog_bar=False, on_step=on_step, on_epoch=on_epoch, batch_size=1, sync_dist=sync_dist)
+        self.log(name('masked_map_count'), jepa_stats['masked_map_count'], prog_bar=False, on_step=on_step, on_epoch=on_epoch, batch_size=1, sync_dist=sync_dist)
+        self.log(name('masked_agent_history_visible_fraction'), jepa_stats['masked_agent_history_visible_fraction'], prog_bar=False, on_step=on_step, on_epoch=on_epoch, batch_size=1, sync_dist=sync_dist)
+        self.log(name('masked_agent_history_visible_tokens'), jepa_stats['masked_agent_history_visible_tokens'], prog_bar=False, on_step=on_step, on_epoch=on_epoch, batch_size=1, sync_dist=sync_dist)
+        self.log(name('masked_agent_history_total_tokens'), jepa_stats['masked_agent_history_total_tokens'], prog_bar=False, on_step=on_step, on_epoch=on_epoch, batch_size=1, sync_dist=sync_dist)
 
     def _pool_scene_summary(
         self,
