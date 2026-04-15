@@ -8,6 +8,10 @@
 
 当前建议把这个仓库当成你的正式算法实现仓库；外围的 `SimAgentJEPA` 仓库继续只做脚手架、可视化和补充评估。
 
+服务器训练和 ablation 启动说明见：
+
+- `TRAINING.md`
+
 ## Current Status
 
 当前分支支持两条模型线：

@@ -1,5 +1,5 @@
 from copy import deepcopy
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -38,6 +38,24 @@ class FutureBlockEncoder(nn.Module):
         return tokens, block_mask
 
 
+class MapBlockEncoder(nn.Module):
+    def __init__(self, hidden_dim: int) -> None:
+        super().__init__()
+        self.projection = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
+    def forward(
+        self,
+        map_features: torch.Tensor,
+        map_valid_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if map_features.numel() == 0:
+            return map_features, map_valid_mask
+        return self.projection(map_features), map_valid_mask.bool()
+
+
 class JointEmbeddingPredictiveModule(nn.Module):
     def __init__(
         self,
@@ -47,16 +65,28 @@ class JointEmbeddingPredictiveModule(nn.Module):
         num_heads: int,
         dropout: float,
         mask_ratio: float,
+        agent_loss_weight: float = 0.5,
+        map_loss_weight: float = 0.5,
     ) -> None:
         super().__init__()
+        self.hidden_dim = hidden_dim
         self.mask_ratio = mask_ratio
+        self.agent_loss_weight = agent_loss_weight
+        self.map_loss_weight = map_loss_weight
+
         self.online_future_encoder = FutureBlockEncoder(hidden_dim, future_steps, future_chunk_steps)
         self.target_future_encoder = deepcopy(self.online_future_encoder)
+        self.online_map_encoder = MapBlockEncoder(hidden_dim)
+        self.target_map_encoder = deepcopy(self.online_map_encoder)
         for parameter in self.target_future_encoder.parameters():
+            parameter.requires_grad = False
+        for parameter in self.target_map_encoder.parameters():
             parameter.requires_grad = False
 
         self.context_projection = nn.Linear(hidden_dim, hidden_dim)
-        self.mask_token = nn.Parameter(torch.randn(hidden_dim) * 0.02)
+        self.agent_mask_token = nn.Parameter(torch.randn(hidden_dim) * 0.02)
+        self.map_mask_token = nn.Parameter(torch.randn(hidden_dim) * 0.02)
+        self.token_type_embedding = nn.Embedding(2, hidden_dim)
         predictor_layer = nn.TransformerEncoderLayer(
             d_model=hidden_dim,
             nhead=num_heads,
@@ -73,41 +103,69 @@ class JointEmbeddingPredictiveModule(nn.Module):
         future_states: torch.Tensor,
         valid_agents: torch.Tensor,
         future_mask: torch.Tensor,
-        graph_index: torch.Tensor,
+        agent_graph_index: torch.Tensor,
+        agent_prediction_mask: torch.Tensor,
+        map_online_features: Optional[torch.Tensor] = None,
+        map_target_features: Optional[torch.Tensor] = None,
+        map_valid_mask: Optional[torch.Tensor] = None,
+        map_graph_index: Optional[torch.Tensor] = None,
+        map_prediction_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        online_tokens, block_mask = self.online_future_encoder(future_states, valid_agents, future_mask)
+        online_agent_tokens, agent_block_mask = self.online_future_encoder(future_states, valid_agents, future_mask)
         with torch.no_grad():
-            target_tokens, _ = self.target_future_encoder(future_states, valid_agents, future_mask)
-            target_tokens = F.normalize(target_tokens, dim=-1)
+            target_agent_tokens, _ = self.target_future_encoder(future_states, valid_agents, future_mask)
+            target_agent_tokens = F.normalize(target_agent_tokens, dim=-1)
 
-        packed_online, packed_target, packed_mask = self._pack_tokens_by_graph(
-            online_tokens,
-            target_tokens,
-            block_mask,
-            graph_index,
+        if map_online_features is None:
+            map_online_features = scene_summary.new_zeros((0, self.hidden_dim))
+        if map_target_features is None:
+            map_target_features = map_online_features
+        if map_valid_mask is None:
+            map_valid_mask = torch.zeros(map_online_features.shape[0], dtype=torch.bool, device=scene_summary.device)
+        else:
+            map_valid_mask = map_valid_mask.to(device=scene_summary.device, dtype=torch.bool)
+        if map_graph_index is None:
+            map_graph_index = torch.zeros(map_online_features.shape[0], dtype=torch.long, device=scene_summary.device)
+        if map_prediction_mask is None:
+            map_prediction_mask = torch.zeros(map_online_features.shape[0], dtype=torch.bool, device=scene_summary.device)
+
+        online_map_tokens, map_block_mask = self.online_map_encoder(map_online_features, map_valid_mask)
+        with torch.no_grad():
+            target_map_tokens, _ = self.target_map_encoder(map_target_features, map_valid_mask)
+            target_map_tokens = F.normalize(target_map_tokens, dim=-1) if target_map_tokens.numel() > 0 else target_map_tokens
+
+        packed_online, packed_target, packed_valid_mask, packed_prediction_mask, token_type_ids = (
+            self._pack_tokens_by_graph(
+                num_graphs=scene_summary.shape[0],
+                agent_online_tokens=online_agent_tokens,
+                agent_target_tokens=target_agent_tokens,
+                agent_block_mask=agent_block_mask,
+                agent_prediction_mask=agent_prediction_mask,
+                agent_graph_index=agent_graph_index,
+                map_online_tokens=online_map_tokens,
+                map_target_tokens=target_map_tokens,
+                map_block_mask=map_block_mask,
+                map_prediction_mask=map_prediction_mask,
+                map_graph_index=map_graph_index,
+            )
         )
-        if packed_mask.numel() == 0 or not packed_mask.any():
+        if packed_valid_mask.numel() == 0 or not packed_valid_mask.any():
             zero = scene_summary.new_zeros(())
-            return zero, {"jepa_cosine": zero, "masked_fraction": zero}
-
-        prediction_mask = (torch.rand_like(packed_mask.float()) < self.mask_ratio) & packed_mask
-        empty_rows = (prediction_mask.sum(dim=-1) == 0) & (packed_mask.sum(dim=-1) > 0)
-        if empty_rows.any():
-            first_valid = packed_mask.float().argmax(dim=-1)
-            prediction_mask[empty_rows, first_valid[empty_rows]] = True
-        if not prediction_mask.any():
+            return self._zero_output(zero)
+        if not packed_prediction_mask.any():
             zero = scene_summary.new_zeros(())
-            return zero, {"jepa_cosine": zero, "masked_fraction": zero}
+            return self._zero_output(zero)
 
-        predictor_tokens = torch.where(
-            prediction_mask.unsqueeze(-1),
-            self.mask_token.view(1, 1, -1),
+        predictor_tokens = self._build_predictor_tokens(
             packed_online,
+            packed_prediction_mask,
+            token_type_ids,
         )
+        predictor_tokens = predictor_tokens + self.token_type_embedding(token_type_ids.clamp(min=0))
         context_token = self.context_projection(scene_summary).unsqueeze(1)
         predictor_input = torch.cat([context_token, predictor_tokens], dim=1)
         predictor_mask = torch.cat(
-            [torch.ones(scene_summary.shape[0], 1, dtype=torch.bool, device=scene_summary.device), packed_mask],
+            [torch.ones(scene_summary.shape[0], 1, dtype=torch.bool, device=scene_summary.device), packed_valid_mask],
             dim=1,
         )
         predicted = self.predictor(
@@ -117,64 +175,164 @@ class JointEmbeddingPredictiveModule(nn.Module):
         predicted = F.normalize(self.output_projection(predicted), dim=-1)
 
         cosine = (predicted * packed_target).sum(dim=-1)
-        loss = (1.0 - cosine)[prediction_mask].mean()
+        agent_mask = packed_prediction_mask & (token_type_ids == 0)
+        map_mask = packed_prediction_mask & (token_type_ids == 1)
+
+        zero = scene_summary.new_zeros(())
+        agent_loss = (1.0 - cosine)[agent_mask].mean() if agent_mask.any() else zero
+        map_loss = (1.0 - cosine)[map_mask].mean() if map_mask.any() else zero
+
+        total_loss = zero
+        total_weight = 0.0
+        if agent_mask.any():
+            total_loss = total_loss + self.agent_loss_weight * agent_loss
+            total_weight += self.agent_loss_weight
+        if map_mask.any():
+            total_loss = total_loss + self.map_loss_weight * map_loss
+            total_weight += self.map_loss_weight
+        if total_weight > 0.0:
+            total_loss = total_loss / total_weight
+
         stats = {
-            "jepa_cosine": cosine[prediction_mask].mean(),
-            "masked_fraction": prediction_mask.float().mean(),
+            "jepa_cosine": cosine[packed_prediction_mask].mean(),
+            "masked_fraction": packed_prediction_mask.float().sum() / packed_valid_mask.float().sum().clamp_min(1.0),
+            "agent_jepa_loss": agent_loss,
+            "map_jepa_loss": map_loss,
+            "masked_agent_count": agent_mask.float().sum(),
+            "masked_map_count": map_mask.float().sum(),
         }
-        return loss, stats
+        return total_loss, stats
+
+    def _build_predictor_tokens(
+        self,
+        packed_online: torch.Tensor,
+        packed_prediction_mask: torch.Tensor,
+        token_type_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        if packed_online.numel() == 0:
+            return packed_online
+
+        agent_mask_token = self.agent_mask_token.view(1, 1, -1)
+        map_mask_token = self.map_mask_token.view(1, 1, -1)
+        mask_tokens = torch.where(
+            (token_type_ids == 0).unsqueeze(-1),
+            agent_mask_token,
+            map_mask_token,
+        )
+        return torch.where(packed_prediction_mask.unsqueeze(-1), mask_tokens, packed_online)
 
     def _pack_tokens_by_graph(
         self,
-        online_tokens: torch.Tensor,
-        target_tokens: torch.Tensor,
-        block_mask: torch.Tensor,
-        graph_index: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if graph_index.numel() == 0:
-            hidden_dim = online_tokens.shape[-1]
-            empty_tokens = online_tokens.new_zeros((0, 0, hidden_dim))
-            empty_mask = block_mask.new_zeros((0, 0))
-            return empty_tokens, empty_tokens, empty_mask
-
-        num_graphs = int(graph_index.max().item()) + 1
+        num_graphs: int,
+        agent_online_tokens: torch.Tensor,
+        agent_target_tokens: torch.Tensor,
+        agent_block_mask: torch.Tensor,
+        agent_prediction_mask: torch.Tensor,
+        agent_graph_index: torch.Tensor,
+        map_online_tokens: torch.Tensor,
+        map_target_tokens: torch.Tensor,
+        map_block_mask: torch.Tensor,
+        map_prediction_mask: torch.Tensor,
+        map_graph_index: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         sequences_online = []
         sequences_target = []
-        sequences_mask = []
-        max_blocks = 0
+        sequences_valid = []
+        sequences_prediction = []
+        sequences_type = []
+        max_tokens = 0
+
         for graph_id in range(num_graphs):
-            graph_agents = graph_index == graph_id
-            graph_online = online_tokens[graph_agents].reshape(-1, online_tokens.shape[-1])
-            graph_target = target_tokens[graph_agents].reshape(-1, target_tokens.shape[-1])
-            graph_mask = block_mask[graph_agents].reshape(-1)
-            valid_online = graph_online[graph_mask]
-            valid_target = graph_target[graph_mask]
-            sequences_online.append(valid_online)
-            sequences_target.append(valid_target)
-            sequences_mask.append(torch.ones(valid_online.shape[0], dtype=torch.bool, device=graph_mask.device))
-            max_blocks = max(max_blocks, valid_online.shape[0])
+            graph_online_parts = []
+            graph_target_parts = []
+            graph_prediction_parts = []
+            graph_type_parts = []
 
-        if max_blocks == 0:
-            empty_tokens = online_tokens.new_zeros((num_graphs, 0, online_tokens.shape[-1]))
-            empty_mask = block_mask.new_zeros((num_graphs, 0))
-            return empty_tokens, empty_tokens, empty_mask
+            graph_agents = agent_graph_index == graph_id
+            if graph_agents.any():
+                graph_online = agent_online_tokens[graph_agents].reshape(-1, self.hidden_dim)
+                graph_target = agent_target_tokens[graph_agents].reshape(-1, self.hidden_dim)
+                graph_valid = agent_block_mask[graph_agents].reshape(-1)
+                graph_prediction = agent_prediction_mask[graph_agents].reshape(-1)
+                if graph_valid.any():
+                    graph_online_parts.append(graph_online[graph_valid])
+                    graph_target_parts.append(graph_target[graph_valid])
+                    graph_prediction_parts.append(graph_prediction[graph_valid])
+                    graph_type_parts.append(torch.zeros(int(graph_valid.sum().item()), dtype=torch.long, device=graph_valid.device))
 
-        packed_online = online_tokens.new_zeros((num_graphs, max_blocks, online_tokens.shape[-1]))
-        packed_target = target_tokens.new_zeros((num_graphs, max_blocks, target_tokens.shape[-1]))
-        packed_mask = block_mask.new_zeros((num_graphs, max_blocks))
-        for graph_id, (graph_online, graph_target, graph_mask) in enumerate(
-            zip(sequences_online, sequences_target, sequences_mask)
+            graph_maps = map_graph_index == graph_id
+            if graph_maps.any():
+                graph_online = map_online_tokens[graph_maps]
+                graph_target = map_target_tokens[graph_maps]
+                graph_valid = map_block_mask[graph_maps]
+                graph_prediction = map_prediction_mask[graph_maps]
+                if graph_valid.any():
+                    graph_online_parts.append(graph_online[graph_valid])
+                    graph_target_parts.append(graph_target[graph_valid])
+                    graph_prediction_parts.append(graph_prediction[graph_valid])
+                    graph_type_parts.append(torch.ones(int(graph_valid.sum().item()), dtype=torch.long, device=graph_valid.device))
+
+            if graph_online_parts:
+                graph_online = torch.cat(graph_online_parts, dim=0)
+                graph_target = torch.cat(graph_target_parts, dim=0)
+                graph_prediction = torch.cat(graph_prediction_parts, dim=0)
+                graph_type = torch.cat(graph_type_parts, dim=0)
+            else:
+                graph_online = agent_online_tokens.new_zeros((0, self.hidden_dim))
+                graph_target = agent_target_tokens.new_zeros((0, self.hidden_dim))
+                graph_prediction = agent_block_mask.new_zeros((0,))
+                graph_type = torch.zeros((0,), dtype=torch.long, device=agent_online_tokens.device)
+
+            sequences_online.append(graph_online)
+            sequences_target.append(graph_target)
+            sequences_prediction.append(graph_prediction)
+            sequences_type.append(graph_type)
+            sequences_valid.append(torch.ones(graph_online.shape[0], dtype=torch.bool, device=graph_online.device))
+            max_tokens = max(max_tokens, graph_online.shape[0])
+
+        if max_tokens == 0:
+            empty_tokens = agent_online_tokens.new_zeros((num_graphs, 0, self.hidden_dim))
+            empty_mask = agent_block_mask.new_zeros((num_graphs, 0))
+            empty_types = torch.zeros((num_graphs, 0), dtype=torch.long, device=agent_online_tokens.device)
+            return empty_tokens, empty_tokens, empty_mask, empty_mask, empty_types
+
+        packed_online = agent_online_tokens.new_zeros((num_graphs, max_tokens, self.hidden_dim))
+        packed_target = agent_target_tokens.new_zeros((num_graphs, max_tokens, self.hidden_dim))
+        packed_valid = agent_block_mask.new_zeros((num_graphs, max_tokens))
+        packed_prediction = agent_block_mask.new_zeros((num_graphs, max_tokens))
+        token_type_ids = torch.zeros((num_graphs, max_tokens), dtype=torch.long, device=agent_online_tokens.device)
+
+        for graph_id, (graph_online, graph_target, graph_valid, graph_prediction, graph_type) in enumerate(
+            zip(sequences_online, sequences_target, sequences_valid, sequences_prediction, sequences_type)
         ):
             if graph_online.shape[0] == 0:
                 continue
-            packed_online[graph_id, : graph_online.shape[0]] = graph_online
-            packed_target[graph_id, : graph_target.shape[0]] = graph_target
-            packed_mask[graph_id, : graph_mask.shape[0]] = graph_mask
-        return packed_online, packed_target, packed_mask
+            length = graph_online.shape[0]
+            packed_online[graph_id, :length] = graph_online
+            packed_target[graph_id, :length] = graph_target
+            packed_valid[graph_id, :length] = graph_valid
+            packed_prediction[graph_id, :length] = graph_prediction
+            token_type_ids[graph_id, :length] = graph_type
+
+        return packed_online, packed_target, packed_valid, packed_prediction, token_type_ids
+
+    def _zero_output(self, zero: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        return zero, {
+            "jepa_cosine": zero,
+            "masked_fraction": zero,
+            "agent_jepa_loss": zero,
+            "map_jepa_loss": zero,
+            "masked_agent_count": zero,
+            "masked_map_count": zero,
+        }
 
     @torch.no_grad()
     def update_target_encoder(self, ema_decay: float) -> None:
         for target_param, online_param in zip(
             self.target_future_encoder.parameters(), self.online_future_encoder.parameters()
+        ):
+            target_param.data.mul_(ema_decay).add_(online_param.data, alpha=1.0 - ema_decay)
+        for target_param, online_param in zip(
+            self.target_map_encoder.parameters(), self.online_map_encoder.parameters()
         ):
             target_param.data.mul_(ema_decay).add_(online_param.data, alpha=1.0 - ema_decay)

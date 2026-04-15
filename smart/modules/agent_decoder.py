@@ -280,7 +280,8 @@ class SMARTAgentDecoder(nn.Module):
 
     def encode_history_context(self,
                                data: HeteroData,
-                               map_enc: Mapping[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+                               map_enc: Mapping[str, torch.Tensor],
+                               agent_history_mask: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         pos_a = data['agent']['token_pos']
         head_a = data['agent']['token_heading']
         head_vector_a = torch.stack([head_a.cos(), head_a.sin()], dim=-1)
@@ -292,6 +293,8 @@ class SMARTAgentDecoder(nn.Module):
         history_token_steps = max(1, (self.num_historical_steps - 1) // self.shift)
         history_mask = data['agent']['agent_valid_mask'].clone()
         history_mask[:, history_token_steps:] = False
+        if agent_history_mask is not None:
+            history_mask = history_mask & agent_history_mask.bool()
         temporal_mask = history_mask.clone()
         edge_index_t, r_t = self.build_temporal_edge(
             pos_a,
@@ -317,6 +320,7 @@ class SMARTAgentDecoder(nn.Module):
             map_mask,
             batch_s,
             batch_pl,
+            map_token_visible_mask=map_enc.get('pt_visibility_mask'),
         )
 
         for i in range(self.num_layers):
@@ -337,7 +341,7 @@ class SMARTAgentDecoder(nn.Module):
         }
 
     def build_map2agent_edge(self, data, num_step, agent_category, pos_a, head_a, head_vector_a, mask,
-                             batch_s, batch_pl):
+                             batch_s, batch_pl, map_token_visible_mask=None):
         mask_pl2a = mask.clone()
         mask_pl2a = mask_pl2a.transpose(0, 1).reshape(-1)
         pos_s = pos_a.transpose(0, 1).reshape(-1, self.input_dim)
@@ -349,7 +353,11 @@ class SMARTAgentDecoder(nn.Module):
         orient_pl = orient_pl.repeat(num_step)
         edge_index_pl2a = radius(x=pos_s[:, :2], y=pos_pl[:, :2], r=self.pl2a_radius,
                                  batch_x=batch_s, batch_y=batch_pl, max_num_neighbors=300)
-        edge_index_pl2a = edge_index_pl2a[:, mask_pl2a[edge_index_pl2a[1]]]
+        edge_keep_mask = mask_pl2a[edge_index_pl2a[1]]
+        if map_token_visible_mask is not None:
+            expanded_map_visible_mask = map_token_visible_mask.bool().repeat(num_step)
+            edge_keep_mask = edge_keep_mask & expanded_map_visible_mask[edge_index_pl2a[0]]
+        edge_index_pl2a = edge_index_pl2a[:, edge_keep_mask]
         rel_pos_pl2a = pos_pl[edge_index_pl2a[0]] - pos_s[edge_index_pl2a[1]]
         rel_orient_pl2a = wrap_angle(orient_pl[edge_index_pl2a[0]] - head_s[edge_index_pl2a[1]])
         r_pl2a = torch.stack(

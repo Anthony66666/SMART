@@ -73,7 +73,7 @@ Model:
     predict_map_latent: true
     agent_loss_weight: 0.5
     map_loss_weight: 0.5
-    masked_agent_history_mode: "visible"
+    masked_agent_history_mode: "partial_dropout"
     masked_agent_history_dropout_ratio: 0.5
     masked_agent_history_min_visible_tokens: 1
     disable_map_mae_aux_when_jepa: true
