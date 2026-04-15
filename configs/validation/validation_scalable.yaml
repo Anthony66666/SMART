@@ -6,13 +6,13 @@ time_info: &time_info
 
 Dataset:
   root:
-  batch_size: 1
+  batch_size: 4
   shuffle: True
   num_workers: 1
   pin_memory: True
   persistent_workers: True
   train_raw_dir:
-  val_raw_dir: ["data/valid_demo"]
+  val_raw_dir: ["/home/anthony/SimAgentJEPA/data/waymo/validation"]
   test_raw_dir:
   TargetBuilder: WaymoTargetBuilder
   train_processed_dir:
@@ -57,4 +57,13 @@ Model:
     pl2pl_radius: 10
     pl2a_radius: 30
     time_span: 30
+  inference_token: True
+  rollout_num: 1
 
+# ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+#      Validate metric           DataLoader 0
+# ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+#        val_cls_acc          0.5827018022537231
+#         val_loss             2.517838954925537
+#        val_minADE           0.6088225245475769
+#        val_minFDE            2.690039873123169
