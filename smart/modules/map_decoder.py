@@ -116,6 +116,8 @@ class SMARTMapDecoder(nn.Module):
                                  self.polygon_type_emb(data['pt_token']['pl_type'].long()),
                                  self.light_pl_emb(token_light_type.long()),]
         x_pt = x_pt + torch.stack(x_pt_categorical_embs).sum(dim=0)
+        if has_polygon_mask:
+            x_pt = x_pt.masked_fill(~pt_visible_mask.unsqueeze(-1), 0.0)
         edge_index_pt2pt = radius_graph(x=pos_pt[:, :2], r=self.pl2pl_radius,
                                         batch=data['pt_token']['batch'] if isinstance(data, Batch) else None,
                                         loop=False, max_num_neighbors=100)
@@ -141,6 +143,8 @@ class SMARTMapDecoder(nn.Module):
         r_pt2pt = self.r_pt2pt_emb(continuous_inputs=r_pt2pt, categorical_embs=None)
         for i in range(self.num_layers):
             x_pt = self.pt2pt_layers[i](x_pt, r_pt2pt, edge_index_pt2pt)
+            if has_polygon_mask:
+                x_pt = x_pt.masked_fill(~pt_visible_mask.unsqueeze(-1), 0.0)
 
         if disable_prediction:
             next_token_prob = x_pt.new_zeros((0, self.token_size))

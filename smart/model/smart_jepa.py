@@ -1,3 +1,4 @@
+from copy import deepcopy
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -5,6 +6,7 @@ from torch_geometric.data import Batch, HeteroData
 
 from smart.model.jepa import JointEmbeddingPredictiveModule
 from smart.model.smart import SMART
+from smart.utils.torch_compat import torch_load_compat
 from smart.utils import wrap_angle
 
 
@@ -69,6 +71,11 @@ class SMARTJEPA(SMART):
             agent_loss_weight=self.agent_loss_weight,
             map_loss_weight=self.map_loss_weight,
         )
+        # Keep a separate EMA teacher for map features. Using the online map encoder
+        # directly as the target makes the JEPA target drift with the student.
+        self.target_map_backbone = deepcopy(self.encoder.map_encoder)
+        for parameter in self.target_map_backbone.parameters():
+            parameter.requires_grad = False
 
     def training_step(self, data, batch_idx):
         data = self._prepare_batch(data)
@@ -89,6 +96,16 @@ class SMARTJEPA(SMART):
         self.log('jepa_loss', jepa_loss, prog_bar=True, on_step=True, on_epoch=True, batch_size=1)
         self._log_jepa_stats(jepa_stats, prefix="", on_step=True, on_epoch=True, sync_dist=False)
         return loss
+
+    def load_params_from_file(self, filename, logger, to_cpu=False):
+        it, epoch = super().load_params_from_file(filename=filename, logger=logger, to_cpu=to_cpu)
+        loc_type = torch.device('cpu') if to_cpu else None
+        checkpoint = torch_load_compat(filename, map_location=loc_type, weights_only=False)
+        state_dict = checkpoint['state_dict']
+        if not any(key.startswith('target_map_backbone.') for key in state_dict.keys()):
+            logger.info('Checkpoint missing target_map_backbone; syncing EMA map teacher from online map encoder.')
+            self.target_map_backbone.load_state_dict(self.encoder.map_encoder.state_dict())
+        return it, epoch
 
     def validation_step(self, data, batch_idx):
         data = self._prepare_batch(data)
@@ -182,12 +199,24 @@ class SMARTJEPA(SMART):
         map_valid_mask = None
         map_graph_index = None
         if self.predict_map_latent and self.joint_predictor:
-            target_map_enc = self.encoder.map_encoder(
+            map_online_features, online_map_valid_mask, map_graph_index = self._pool_map_polygon_features(
+                context['x_pt'],
                 data,
-                disable_prediction=self.disable_map_mae_aux_when_jepa,
+                token_visible_mask=context.get('pt_visibility_mask'),
             )
-            map_online_features, online_map_valid_mask, map_graph_index = self._pool_map_polygon_features(context['x_pt'], data)
-            map_target_features, target_map_valid_mask, _ = self._pool_map_polygon_features(target_map_enc['x_pt'], data)
+            with torch.no_grad():
+                was_training = self.target_map_backbone.training
+                self.target_map_backbone.eval()
+                target_map_enc = self.target_map_backbone(
+                    data,
+                    disable_prediction=self.disable_map_mae_aux_when_jepa,
+                )
+                if was_training and self.training:
+                    self.target_map_backbone.train()
+            map_target_features, target_map_valid_mask, _ = self._pool_map_polygon_features(
+                target_map_enc['x_pt'],
+                data,
+            )
             map_valid_mask = online_map_valid_mask & target_map_valid_mask
             map_prediction_mask = map_prediction_mask & map_valid_mask
 
@@ -467,6 +496,7 @@ class SMARTJEPA(SMART):
         self,
         pt_features: torch.Tensor,
         data: HeteroData,
+        token_visible_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         num_polygons = int(data['map_polygon']['num_nodes'])
         token2pl = data[('pt_token', 'to', 'map_polygon')]['edge_index']
@@ -474,10 +504,16 @@ class SMARTJEPA(SMART):
         polygon_indices = token2pl[1].long()
         polygon_features = pt_features.new_zeros((num_polygons, pt_features.shape[-1]))
         polygon_counts = pt_features.new_zeros((num_polygons,))
-        polygon_features.index_add_(0, polygon_indices, pt_features[token_indices])
+        visible_counts = pt_features.new_zeros((num_polygons,))
+        if token_visible_mask is None:
+            token_weights = torch.ones(token_indices.shape[0], device=pt_features.device, dtype=pt_features.dtype)
+        else:
+            token_weights = token_visible_mask[token_indices].to(device=pt_features.device, dtype=pt_features.dtype)
+        polygon_features.index_add_(0, polygon_indices, pt_features[token_indices] * token_weights.unsqueeze(-1))
         polygon_counts.index_add_(0, polygon_indices, torch.ones(polygon_indices.shape[0], device=pt_features.device))
+        visible_counts.index_add_(0, polygon_indices, token_weights)
         polygon_valid_mask = polygon_counts > 0
-        polygon_features = polygon_features / polygon_counts.clamp_min(1).unsqueeze(-1)
+        polygon_features = polygon_features / visible_counts.clamp_min(1).unsqueeze(-1)
         polygon_graph_index = self._get_node_batch(data, 'map_polygon', num_nodes=num_polygons)
         return polygon_features, polygon_valid_mask, polygon_graph_index
 
@@ -512,4 +548,9 @@ class SMARTJEPA(SMART):
         return torch.zeros(num_nodes, dtype=torch.long, device=data['agent']['position'].device)
 
     def on_before_zero_grad(self, optimizer) -> None:
+        for target_param, online_param in zip(
+            self.target_map_backbone.parameters(),
+            self.encoder.map_encoder.parameters(),
+        ):
+            target_param.data.mul_(self.jepa_ema_decay).add_(online_param.data, alpha=1.0 - self.jepa_ema_decay)
         self.jepa.update_target_encoder(self.jepa_ema_decay)

@@ -192,31 +192,12 @@ class SMARTAgentDecoder(nn.Module):
             return feat_a, agent_token_traj
 
     def agent_predict_next(self, data, agent_category, feat_a):
-        num_agent, num_step, traj_dim = data['agent']['token_pos'].shape
-        agent_type = data['agent']['type']
-        veh_mask = (agent_type == 0)  # * agent_category==3
-        cyc_mask = (agent_type == 2)  # * agent_category==3
-        ped_mask = (agent_type == 1)  # * agent_category==3
-        token_res = torch.zeros((num_agent, num_step, self.token_size), device=agent_category.device)
-        token_res[veh_mask] = self.token_predict_head(feat_a[veh_mask])
-        token_res[cyc_mask] = self.token_predict_cyc_head(feat_a[cyc_mask])
-        token_res[ped_mask] = self.token_predict_walker_head(feat_a[ped_mask])
-        return token_res
+        del data, agent_category
+        return self.token_predict_head(feat_a)
 
     def agent_predict_next_inf(self, data, agent_category, feat_a):
-        num_agent, traj_dim = feat_a.shape
-        agent_type = data['agent']['type']
-
-        veh_mask = (agent_type == 0)  # * agent_category==3
-        cyc_mask = (agent_type == 2)  # * agent_category==3
-        ped_mask = (agent_type == 1)  # * agent_category==3
-
-        token_res = torch.zeros((num_agent, self.token_size), device=agent_category.device)
-        token_res[veh_mask] = self.token_predict_head(feat_a[veh_mask])
-        token_res[cyc_mask] = self.token_predict_cyc_head(feat_a[cyc_mask])
-        token_res[ped_mask] = self.token_predict_walker_head(feat_a[ped_mask])
-
-        return token_res
+        del data, agent_category
+        return self.token_predict_head(feat_a)
 
     def build_temporal_edge(self, pos_a, head_a, head_vector_a, num_agent, mask, inference_mask=None,
                             apply_random_hist_mask=True):
