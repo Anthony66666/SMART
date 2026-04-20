@@ -67,6 +67,7 @@ class SMARTJEPA(SMART):
             future_chunk_steps=future_chunk_steps,
             num_heads=self.model_config.num_heads,
             dropout=self.model_config.dropout,
+            num_freq_bands=self.model_config.num_freq_bands,
             mask_ratio=self.mask_ratio,
             agent_loss_weight=self.agent_loss_weight,
             map_loss_weight=self.map_loss_weight,
@@ -151,6 +152,18 @@ class SMARTJEPA(SMART):
         future_states, future_mask, valid_agents = self._build_future_targets(data)
         agent_chunk_mask = self._build_agent_chunk_mask(valid_agents, future_mask)
         agent_graph_index = self._get_node_batch(data, 'agent')
+        history_pos = data['agent']['position'][:, self.num_historical_steps - 1, :2].float()
+        graph_centers = self._compute_graph_centers(
+            positions=history_pos,
+            graph_index=agent_graph_index,
+            valid_mask=valid_agents,
+        )
+        agent_token_positions = history_pos - graph_centers[agent_graph_index]
+        map_token_positions = None
+        if self.predict_map_latent and self.joint_predictor:
+            polygon_centers, polygon_valid_mask, polygon_graph_index = self._compute_polygon_centers(data)
+            map_token_positions = polygon_centers - graph_centers[polygon_graph_index]
+            map_token_positions = map_token_positions.masked_fill(~polygon_valid_mask.unsqueeze(-1), 0.0)
         if self.mask_strategy == 'interaction_multiblock':
             agent_prediction_mask, map_prediction_mask, map_visible_mask = self._build_interaction_joint_masks(
                 data,
@@ -227,11 +240,13 @@ class SMARTJEPA(SMART):
             future_mask=future_mask,
             agent_graph_index=agent_graph_index,
             agent_prediction_mask=agent_prediction_mask,
+            agent_token_positions=agent_token_positions,
             map_online_features=map_online_features,
             map_target_features=map_target_features,
             map_valid_mask=map_valid_mask,
             map_graph_index=map_graph_index,
             map_prediction_mask=map_prediction_mask,
+            map_token_positions=map_token_positions,
         )
         jepa_stats.update(history_stats)
         return jepa_loss, jepa_stats
@@ -439,8 +454,20 @@ class SMARTJEPA(SMART):
         window_length: int,
         device: torch.device,
     ) -> int:
-        chosen_chunk = int(valid_chunks[torch.randint(valid_chunks.numel(), (1,), device=device)].item())
-        return min(chosen_chunk, max(0, num_chunks - window_length))
+        max_start = max(0, num_chunks - window_length)
+        candidate_starts = torch.arange(max_start + 1, device=device)
+        if candidate_starts.numel() == 0:
+            return 0
+
+        overlap_mask = (
+            (valid_chunks.unsqueeze(0) >= candidate_starts.unsqueeze(1))
+            & (valid_chunks.unsqueeze(0) < (candidate_starts + window_length).unsqueeze(1))
+        )
+        valid_starts = candidate_starts[overlap_mask.any(dim=1)]
+        if valid_starts.numel() == 0:
+            return min(int(valid_chunks.min().item()), max_start)
+        chosen_start = valid_starts[torch.randint(valid_starts.numel(), (1,), device=device)]
+        return int(chosen_start.item())
 
     def _build_masked_agent_history_context_mask(
         self,
@@ -534,6 +561,35 @@ class SMARTJEPA(SMART):
         polygon_centers = polygon_centers / polygon_counts.clamp_min(1).unsqueeze(-1)
         polygon_graph_index = self._get_node_batch(data, 'map_polygon', num_nodes=num_polygons)
         return polygon_centers, polygon_valid_mask, polygon_graph_index
+
+    def _compute_graph_centers(
+        self,
+        positions: torch.Tensor,
+        graph_index: torch.Tensor,
+        valid_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        num_graphs = int(graph_index.max().item()) + 1 if graph_index.numel() > 0 else 1
+        graph_centers = positions.new_zeros((num_graphs, positions.shape[-1]))
+        graph_counts = positions.new_zeros((num_graphs,))
+
+        if graph_index.numel() == 0:
+            return graph_centers
+
+        if valid_mask.any():
+            valid_graph_index = graph_index[valid_mask]
+            graph_centers.index_add_(0, valid_graph_index, positions[valid_mask])
+            graph_counts.index_add_(0, valid_graph_index, torch.ones(valid_graph_index.shape[0], device=positions.device))
+
+        missing_graphs = graph_counts == 0
+        if missing_graphs.any():
+            fallback_centers = positions.new_zeros((num_graphs, positions.shape[-1]))
+            fallback_counts = positions.new_zeros((num_graphs,))
+            fallback_centers.index_add_(0, graph_index, positions)
+            fallback_counts.index_add_(0, graph_index, torch.ones(graph_index.shape[0], device=positions.device))
+            graph_centers[missing_graphs] = fallback_centers[missing_graphs] / fallback_counts[missing_graphs].clamp_min(1).unsqueeze(-1)
+            graph_counts[missing_graphs] = fallback_counts[missing_graphs]
+
+        return graph_centers / graph_counts.clamp_min(1).unsqueeze(-1)
 
     def _get_node_batch(
         self,

@@ -5,6 +5,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from smart.layers.fourier_embedding import FourierEmbedding
+
 
 class FutureBlockEncoder(nn.Module):
     def __init__(self, hidden_dim: int, future_steps: int, future_chunk_steps: int) -> None:
@@ -64,12 +66,14 @@ class JointEmbeddingPredictiveModule(nn.Module):
         future_chunk_steps: int,
         num_heads: int,
         dropout: float,
+        num_freq_bands: int,
         mask_ratio: float,
         agent_loss_weight: float = 0.5,
         map_loss_weight: float = 0.5,
     ) -> None:
         super().__init__()
         self.hidden_dim = hidden_dim
+        self.num_future_chunks = future_steps // future_chunk_steps
         self.mask_ratio = mask_ratio
         self.agent_loss_weight = agent_loss_weight
         self.map_loss_weight = map_loss_weight
@@ -86,6 +90,17 @@ class JointEmbeddingPredictiveModule(nn.Module):
         self.context_projection = nn.Linear(hidden_dim, hidden_dim)
         self.agent_mask_token = nn.Parameter(torch.randn(hidden_dim) * 0.02)
         self.map_mask_token = nn.Parameter(torch.randn(hidden_dim) * 0.02)
+        self.agent_chunk_embedding = nn.Embedding(self.num_future_chunks, hidden_dim)
+        self.agent_position_embedding = FourierEmbedding(
+            input_dim=2,
+            hidden_dim=hidden_dim,
+            num_freq_bands=num_freq_bands,
+        )
+        self.map_position_embedding = FourierEmbedding(
+            input_dim=2,
+            hidden_dim=hidden_dim,
+            num_freq_bands=num_freq_bands,
+        )
         self.token_type_embedding = nn.Embedding(2, hidden_dim)
         predictor_layer = nn.TransformerEncoderLayer(
             d_model=hidden_dim,
@@ -96,6 +111,7 @@ class JointEmbeddingPredictiveModule(nn.Module):
         )
         self.predictor = nn.TransformerEncoder(predictor_layer, num_layers=2)
         self.output_projection = nn.Linear(hidden_dim, hidden_dim)
+        nn.init.normal_(self.agent_chunk_embedding.weight, std=0.02)
 
     def forward(
         self,
@@ -105,16 +121,28 @@ class JointEmbeddingPredictiveModule(nn.Module):
         future_mask: torch.Tensor,
         agent_graph_index: torch.Tensor,
         agent_prediction_mask: torch.Tensor,
+        agent_token_positions: Optional[torch.Tensor] = None,
         map_online_features: Optional[torch.Tensor] = None,
         map_target_features: Optional[torch.Tensor] = None,
         map_valid_mask: Optional[torch.Tensor] = None,
         map_graph_index: Optional[torch.Tensor] = None,
         map_prediction_mask: Optional[torch.Tensor] = None,
+        map_token_positions: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         online_agent_tokens, agent_block_mask = self.online_future_encoder(future_states, valid_agents, future_mask)
         with torch.no_grad():
             target_agent_tokens, _ = self.target_future_encoder(future_states, valid_agents, future_mask)
             target_agent_tokens = F.normalize(target_agent_tokens, dim=-1)
+
+        if agent_token_positions is None:
+            agent_token_positions = future_states.new_zeros((future_states.shape[0], 2))
+        else:
+            agent_token_positions = agent_token_positions.to(device=scene_summary.device, dtype=scene_summary.dtype)
+        agent_chunk_ids = torch.arange(
+            self.num_future_chunks,
+            device=scene_summary.device,
+            dtype=torch.long,
+        ).unsqueeze(0).expand(online_agent_tokens.shape[0], -1)
 
         if map_online_features is None:
             map_online_features = scene_summary.new_zeros((0, self.hidden_dim))
@@ -128,13 +156,25 @@ class JointEmbeddingPredictiveModule(nn.Module):
             map_graph_index = torch.zeros(map_online_features.shape[0], dtype=torch.long, device=scene_summary.device)
         if map_prediction_mask is None:
             map_prediction_mask = torch.zeros(map_online_features.shape[0], dtype=torch.bool, device=scene_summary.device)
+        if map_token_positions is None:
+            map_token_positions = scene_summary.new_zeros((map_online_features.shape[0], 2))
+        else:
+            map_token_positions = map_token_positions.to(device=scene_summary.device, dtype=scene_summary.dtype)
 
         online_map_tokens, map_block_mask = self.online_map_encoder(map_online_features, map_valid_mask)
         with torch.no_grad():
             target_map_tokens, _ = self.target_map_encoder(map_target_features, map_valid_mask)
             target_map_tokens = F.normalize(target_map_tokens, dim=-1) if target_map_tokens.numel() > 0 else target_map_tokens
 
-        packed_online, packed_target, packed_valid_mask, packed_prediction_mask, token_type_ids = (
+        (
+            packed_online,
+            packed_target,
+            packed_valid_mask,
+            packed_prediction_mask,
+            token_type_ids,
+            packed_chunk_ids,
+            packed_positions,
+        ) = (
             self._pack_tokens_by_graph(
                 num_graphs=scene_summary.shape[0],
                 agent_online_tokens=online_agent_tokens,
@@ -142,11 +182,14 @@ class JointEmbeddingPredictiveModule(nn.Module):
                 agent_block_mask=agent_block_mask,
                 agent_prediction_mask=agent_prediction_mask,
                 agent_graph_index=agent_graph_index,
+                agent_chunk_ids=agent_chunk_ids,
+                agent_token_positions=agent_token_positions,
                 map_online_tokens=online_map_tokens,
                 map_target_tokens=target_map_tokens,
                 map_block_mask=map_block_mask,
                 map_prediction_mask=map_prediction_mask,
                 map_graph_index=map_graph_index,
+                map_token_positions=map_token_positions,
             )
         )
         if packed_valid_mask.numel() == 0 or not packed_valid_mask.any():
@@ -160,6 +203,12 @@ class JointEmbeddingPredictiveModule(nn.Module):
             packed_online,
             packed_prediction_mask,
             token_type_ids,
+        )
+        predictor_tokens = predictor_tokens + self._build_token_metadata_embeddings(
+            packed_valid_mask=packed_valid_mask,
+            token_type_ids=token_type_ids,
+            agent_chunk_ids=packed_chunk_ids,
+            token_positions=packed_positions,
         )
         predictor_tokens = predictor_tokens + self.token_type_embedding(token_type_ids.clamp(min=0))
         context_token = self.context_projection(scene_summary).unsqueeze(1)
@@ -221,6 +270,36 @@ class JointEmbeddingPredictiveModule(nn.Module):
         )
         return torch.where(packed_prediction_mask.unsqueeze(-1), mask_tokens, packed_online)
 
+    def _build_token_metadata_embeddings(
+        self,
+        packed_valid_mask: torch.Tensor,
+        token_type_ids: torch.Tensor,
+        agent_chunk_ids: torch.Tensor,
+        token_positions: torch.Tensor,
+    ) -> torch.Tensor:
+        metadata = token_positions.new_zeros((*token_type_ids.shape, self.hidden_dim))
+        flat_metadata = metadata.reshape(-1, self.hidden_dim)
+        flat_valid_mask = packed_valid_mask.reshape(-1)
+        flat_token_type_ids = token_type_ids.reshape(-1)
+        flat_agent_chunk_ids = agent_chunk_ids.reshape(-1)
+        flat_token_positions = token_positions.reshape(-1, token_positions.shape[-1])
+
+        agent_mask = flat_valid_mask & (flat_token_type_ids == 0)
+        if agent_mask.any():
+            clamped_chunk_ids = flat_agent_chunk_ids[agent_mask].clamp(min=0, max=self.num_future_chunks - 1)
+            flat_metadata[agent_mask] = flat_metadata[agent_mask] + self.agent_chunk_embedding(clamped_chunk_ids)
+            flat_metadata[agent_mask] = flat_metadata[agent_mask] + self.agent_position_embedding(
+                continuous_inputs=flat_token_positions[agent_mask],
+            )
+
+        map_mask = flat_valid_mask & (flat_token_type_ids == 1)
+        if map_mask.any():
+            flat_metadata[map_mask] = flat_metadata[map_mask] + self.map_position_embedding(
+                continuous_inputs=flat_token_positions[map_mask],
+            )
+
+        return metadata
+
     def _pack_tokens_by_graph(
         self,
         num_graphs: int,
@@ -229,17 +308,22 @@ class JointEmbeddingPredictiveModule(nn.Module):
         agent_block_mask: torch.Tensor,
         agent_prediction_mask: torch.Tensor,
         agent_graph_index: torch.Tensor,
+        agent_chunk_ids: torch.Tensor,
+        agent_token_positions: torch.Tensor,
         map_online_tokens: torch.Tensor,
         map_target_tokens: torch.Tensor,
         map_block_mask: torch.Tensor,
         map_prediction_mask: torch.Tensor,
         map_graph_index: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        map_token_positions: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         sequences_online = []
         sequences_target = []
         sequences_valid = []
         sequences_prediction = []
         sequences_type = []
+        sequences_chunk_ids = []
+        sequences_positions = []
         max_tokens = 0
 
         for graph_id in range(num_graphs):
@@ -247,6 +331,8 @@ class JointEmbeddingPredictiveModule(nn.Module):
             graph_target_parts = []
             graph_prediction_parts = []
             graph_type_parts = []
+            graph_chunk_id_parts = []
+            graph_position_parts = []
 
             graph_agents = agent_graph_index == graph_id
             if graph_agents.any():
@@ -254,11 +340,19 @@ class JointEmbeddingPredictiveModule(nn.Module):
                 graph_target = agent_target_tokens[graph_agents].reshape(-1, self.hidden_dim)
                 graph_valid = agent_block_mask[graph_agents].reshape(-1)
                 graph_prediction = agent_prediction_mask[graph_agents].reshape(-1)
+                graph_chunk_id = agent_chunk_ids[graph_agents].reshape(-1)
+                graph_position = agent_token_positions[graph_agents].unsqueeze(1).expand(
+                    -1,
+                    agent_online_tokens.shape[1],
+                    -1,
+                ).reshape(-1, agent_token_positions.shape[-1])
                 if graph_valid.any():
                     graph_online_parts.append(graph_online[graph_valid])
                     graph_target_parts.append(graph_target[graph_valid])
                     graph_prediction_parts.append(graph_prediction[graph_valid])
                     graph_type_parts.append(torch.zeros(int(graph_valid.sum().item()), dtype=torch.long, device=graph_valid.device))
+                    graph_chunk_id_parts.append(graph_chunk_id[graph_valid])
+                    graph_position_parts.append(graph_position[graph_valid])
 
             graph_maps = map_graph_index == graph_id
             if graph_maps.any():
@@ -266,27 +360,36 @@ class JointEmbeddingPredictiveModule(nn.Module):
                 graph_target = map_target_tokens[graph_maps]
                 graph_valid = map_block_mask[graph_maps]
                 graph_prediction = map_prediction_mask[graph_maps]
+                graph_position = map_token_positions[graph_maps]
                 if graph_valid.any():
                     graph_online_parts.append(graph_online[graph_valid])
                     graph_target_parts.append(graph_target[graph_valid])
                     graph_prediction_parts.append(graph_prediction[graph_valid])
                     graph_type_parts.append(torch.ones(int(graph_valid.sum().item()), dtype=torch.long, device=graph_valid.device))
+                    graph_chunk_id_parts.append(torch.zeros(int(graph_valid.sum().item()), dtype=torch.long, device=graph_valid.device))
+                    graph_position_parts.append(graph_position[graph_valid])
 
             if graph_online_parts:
                 graph_online = torch.cat(graph_online_parts, dim=0)
                 graph_target = torch.cat(graph_target_parts, dim=0)
                 graph_prediction = torch.cat(graph_prediction_parts, dim=0)
                 graph_type = torch.cat(graph_type_parts, dim=0)
+                graph_chunk_ids = torch.cat(graph_chunk_id_parts, dim=0)
+                graph_positions = torch.cat(graph_position_parts, dim=0)
             else:
                 graph_online = agent_online_tokens.new_zeros((0, self.hidden_dim))
                 graph_target = agent_target_tokens.new_zeros((0, self.hidden_dim))
                 graph_prediction = agent_block_mask.new_zeros((0,))
                 graph_type = torch.zeros((0,), dtype=torch.long, device=agent_online_tokens.device)
+                graph_chunk_ids = torch.zeros((0,), dtype=torch.long, device=agent_online_tokens.device)
+                graph_positions = agent_token_positions.new_zeros((0, agent_token_positions.shape[-1]))
 
             sequences_online.append(graph_online)
             sequences_target.append(graph_target)
             sequences_prediction.append(graph_prediction)
             sequences_type.append(graph_type)
+            sequences_chunk_ids.append(graph_chunk_ids)
+            sequences_positions.append(graph_positions)
             sequences_valid.append(torch.ones(graph_online.shape[0], dtype=torch.bool, device=graph_online.device))
             max_tokens = max(max_tokens, graph_online.shape[0])
 
@@ -294,16 +397,36 @@ class JointEmbeddingPredictiveModule(nn.Module):
             empty_tokens = agent_online_tokens.new_zeros((num_graphs, 0, self.hidden_dim))
             empty_mask = agent_block_mask.new_zeros((num_graphs, 0))
             empty_types = torch.zeros((num_graphs, 0), dtype=torch.long, device=agent_online_tokens.device)
-            return empty_tokens, empty_tokens, empty_mask, empty_mask, empty_types
+            empty_chunk_ids = torch.zeros((num_graphs, 0), dtype=torch.long, device=agent_online_tokens.device)
+            empty_positions = agent_token_positions.new_zeros((num_graphs, 0, agent_token_positions.shape[-1]))
+            return empty_tokens, empty_tokens, empty_mask, empty_mask, empty_types, empty_chunk_ids, empty_positions
 
         packed_online = agent_online_tokens.new_zeros((num_graphs, max_tokens, self.hidden_dim))
         packed_target = agent_target_tokens.new_zeros((num_graphs, max_tokens, self.hidden_dim))
         packed_valid = agent_block_mask.new_zeros((num_graphs, max_tokens))
         packed_prediction = agent_block_mask.new_zeros((num_graphs, max_tokens))
         token_type_ids = torch.zeros((num_graphs, max_tokens), dtype=torch.long, device=agent_online_tokens.device)
+        packed_chunk_ids = torch.zeros((num_graphs, max_tokens), dtype=torch.long, device=agent_online_tokens.device)
+        packed_positions = agent_token_positions.new_zeros((num_graphs, max_tokens, agent_token_positions.shape[-1]))
 
-        for graph_id, (graph_online, graph_target, graph_valid, graph_prediction, graph_type) in enumerate(
-            zip(sequences_online, sequences_target, sequences_valid, sequences_prediction, sequences_type)
+        for graph_id, (
+            graph_online,
+            graph_target,
+            graph_valid,
+            graph_prediction,
+            graph_type,
+            graph_chunk_ids,
+            graph_positions,
+        ) in enumerate(
+            zip(
+                sequences_online,
+                sequences_target,
+                sequences_valid,
+                sequences_prediction,
+                sequences_type,
+                sequences_chunk_ids,
+                sequences_positions,
+            )
         ):
             if graph_online.shape[0] == 0:
                 continue
@@ -313,8 +436,10 @@ class JointEmbeddingPredictiveModule(nn.Module):
             packed_valid[graph_id, :length] = graph_valid
             packed_prediction[graph_id, :length] = graph_prediction
             token_type_ids[graph_id, :length] = graph_type
+            packed_chunk_ids[graph_id, :length] = graph_chunk_ids
+            packed_positions[graph_id, :length] = graph_positions
 
-        return packed_online, packed_target, packed_valid, packed_prediction, token_type_ids
+        return packed_online, packed_target, packed_valid, packed_prediction, token_type_ids, packed_chunk_ids, packed_positions
 
     def _zero_output(self, zero: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         return zero, {

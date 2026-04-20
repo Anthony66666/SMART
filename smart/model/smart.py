@@ -209,8 +209,16 @@ class SMART(pl.LightningModule):
         def lr_lambda(current_step):
             if current_step + 1 < self.warmup_steps:
                 return float(current_step + 1) / float(max(1, self.warmup_steps))
+            if current_step >= self.total_steps:
+                return 0.0
             return max(
-                0.0, 0.5 * (1.0 + math.cos(math.pi * (current_step - self.warmup_steps) / float(max(1, self.total_steps - self.warmup_steps))))
+                0.0,
+                0.5 * (
+                    1.0 + math.cos(
+                        math.pi * (current_step - self.warmup_steps)
+                        / float(max(1, self.total_steps - self.warmup_steps))
+                    )
+                ),
             )
 
         lr_scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
