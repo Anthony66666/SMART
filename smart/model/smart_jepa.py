@@ -284,8 +284,6 @@ class SMARTJEPA(SMART):
         return self.pretrain_objective == 'forecast_aligned_ego30_v1'
 
     def _get_effective_masked_agent_history_mode(self) -> str:
-        if self._uses_forecast_aligned_pretrain_objective():
-            return 'visible'
         return self.masked_agent_history_mode
 
     def _get_effective_agent_region_radius(self) -> float:
