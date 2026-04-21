@@ -29,6 +29,7 @@ class SMARTJEPA(SMART):
         self.rollout_num = int(getattr(model_config, "rollout_num", 1))
         self.jepa_aux_loss_weight = float(model_config.jepa.aux_loss_weight)
         self.jepa_ema_decay = float(model_config.jepa.ema_decay)
+        self.pretrain_objective = str(getattr(model_config.jepa, "pretrain_objective", "legacy"))
         self.mask_strategy = str(getattr(model_config.jepa, "mask_strategy", "random_chunk"))
         self.agent_mask_radius = float(getattr(model_config.jepa, "agent_mask_radius", model_config.decoder.a2a_radius))
         self.map_mask_radius = float(getattr(model_config.jepa, "map_mask_radius", model_config.decoder.pl2a_radius))
@@ -49,6 +50,8 @@ class SMARTJEPA(SMART):
         self.masked_agent_history_min_visible_tokens = int(
             getattr(model_config.jepa, "masked_agent_history_min_visible_tokens", 1)
         )
+        self.forecast_aligned_agent_region_radius = 30.0
+        self.forecast_aligned_map_region_radius = 30.0
 
         if self.map_block_unit != "polygon":
             raise ValueError(f"Unsupported map_block_unit: {self.map_block_unit}")
@@ -56,10 +59,17 @@ class SMARTJEPA(SMART):
             raise ValueError(
                 f"Unsupported jepa.training_stage: {self.training_stage}"
             )
+        if self.pretrain_objective not in {"legacy", "forecast_aligned_ego30_v1"}:
+            raise ValueError(f"Unsupported jepa.pretrain_objective: {self.pretrain_objective}")
         if self.masked_agent_history_mode not in {"visible", "partial_dropout", "hidden"}:
             raise ValueError(
                 f"Unsupported jepa.masked_agent_history_mode: {self.masked_agent_history_mode}"
             )
+        if self.pretrain_objective == "forecast_aligned_ego30_v1":
+            if self.training_stage != "pretrain":
+                raise ValueError("forecast_aligned_ego30_v1 is only supported for jepa.training_stage = pretrain.")
+            if not self.joint_predictor or not self.predict_map_latent:
+                raise ValueError("forecast_aligned_ego30_v1 requires joint_predictor = true and predict_map_latent = true.")
 
         self.jepa = JointEmbeddingPredictiveModule(
             hidden_dim=self.hidden_dim,
@@ -164,34 +174,21 @@ class SMARTJEPA(SMART):
             polygon_centers, polygon_valid_mask, polygon_graph_index = self._compute_polygon_centers(data)
             map_token_positions = polygon_centers - graph_centers[polygon_graph_index]
             map_token_positions = map_token_positions.masked_fill(~polygon_valid_mask.unsqueeze(-1), 0.0)
-        if self.mask_strategy == 'interaction_multiblock':
-            agent_prediction_mask, map_prediction_mask, map_visible_mask = self._build_interaction_joint_masks(
-                data,
-                agent_chunk_mask,
-                agent_graph_index,
-            )
-        elif self.mask_strategy == 'random_chunk':
-            agent_prediction_mask = self._build_random_chunk_mask(agent_chunk_mask, agent_graph_index)
-            map_prediction_mask = torch.zeros(
-                int(data['map_polygon']['num_nodes']),
-                dtype=torch.bool,
-                device=agent_chunk_mask.device,
-            )
-            map_visible_mask = None
-        else:
-            raise ValueError(f"Unsupported jepa.mask_strategy: {self.mask_strategy}")
+        jepa_masks = self._build_jepa_masks(
+            data,
+            agent_chunk_mask,
+            agent_graph_index,
+        )
 
-        if not self.predict_map_latent or not self.joint_predictor:
-            map_prediction_mask = torch.zeros(
-                int(data['map_polygon']['num_nodes']),
-                dtype=torch.bool,
-                device=agent_chunk_mask.device,
-            )
-            map_visible_mask = None
+        agent_include_mask = jepa_masks['agent_include_mask'] & agent_chunk_mask
+        agent_input_hidden_mask = jepa_masks['agent_input_hidden_mask'] & agent_include_mask
+        agent_loss_mask = jepa_masks['agent_loss_mask'] & agent_include_mask
+        map_visible_mask = jepa_masks['map_visible_mask']
 
         agent_history_mask, history_stats = self._build_masked_agent_history_context_mask(
             data,
-            agent_prediction_mask,
+            jepa_masks['target_agent_mask'],
+            history_mode=self._get_effective_masked_agent_history_mode(),
         )
         context = self.encoder.encode_history_context(
             data,
@@ -211,6 +208,9 @@ class SMARTJEPA(SMART):
         map_target_features = None
         map_valid_mask = None
         map_graph_index = None
+        map_include_mask = jepa_masks['map_include_mask']
+        map_input_hidden_mask = jepa_masks['map_input_hidden_mask']
+        map_loss_mask = jepa_masks['map_loss_mask']
         if self.predict_map_latent and self.joint_predictor:
             map_online_features, online_map_valid_mask, map_graph_index = self._pool_map_polygon_features(
                 context['x_pt'],
@@ -231,7 +231,9 @@ class SMARTJEPA(SMART):
                 data,
             )
             map_valid_mask = online_map_valid_mask & target_map_valid_mask
-            map_prediction_mask = map_prediction_mask & map_valid_mask
+            map_include_mask = map_include_mask & map_valid_mask
+            map_input_hidden_mask = map_input_hidden_mask & map_include_mask
+            map_loss_mask = map_loss_mask & map_include_mask
 
         jepa_loss, jepa_stats = self.jepa(
             scene_summary=scene_summary,
@@ -239,16 +241,30 @@ class SMARTJEPA(SMART):
             valid_agents=valid_agents,
             future_mask=future_mask,
             agent_graph_index=agent_graph_index,
-            agent_prediction_mask=agent_prediction_mask,
+            agent_include_mask=agent_include_mask,
+            agent_input_hidden_mask=agent_input_hidden_mask,
+            agent_loss_mask=agent_loss_mask,
             agent_token_positions=agent_token_positions,
             map_online_features=map_online_features,
             map_target_features=map_target_features,
             map_valid_mask=map_valid_mask,
             map_graph_index=map_graph_index,
-            map_prediction_mask=map_prediction_mask,
+            map_include_mask=map_include_mask,
+            map_input_hidden_mask=map_input_hidden_mask,
+            map_loss_mask=map_loss_mask,
             map_token_positions=map_token_positions,
+            pack_hidden_map_tokens_last=self._uses_forecast_aligned_pretrain_objective(),
         )
         jepa_stats.update(history_stats)
+        agent_visible_future_tokens = (agent_include_mask & ~agent_input_hidden_mask).sum().to(torch.float32)
+        total_included_agent_future_tokens = agent_include_mask.sum().clamp_min(1).to(torch.float32)
+        jepa_stats.update(
+            {
+                'target_agent_count': jepa_masks['target_agent_mask'].sum().to(torch.float32),
+                'target_polygon_count': jepa_masks['target_polygon_mask'].sum().to(torch.float32),
+                'student_agent_future_visible_fraction': agent_visible_future_tokens / total_included_agent_future_tokens,
+            }
+        )
         return jepa_loss, jepa_stats
 
     def _prepare_batch(self, data: HeteroData) -> HeteroData:
@@ -263,6 +279,24 @@ class SMARTJEPA(SMART):
         next_token_idx_gt = pred['next_token_idx_gt']
         next_token_eval_mask = pred['next_token_eval_mask']
         return self.cls_loss(next_token_prob[next_token_eval_mask], next_token_idx_gt[next_token_eval_mask])
+
+    def _uses_forecast_aligned_pretrain_objective(self) -> bool:
+        return self.pretrain_objective == 'forecast_aligned_ego30_v1'
+
+    def _get_effective_masked_agent_history_mode(self) -> str:
+        if self._uses_forecast_aligned_pretrain_objective():
+            return 'visible'
+        return self.masked_agent_history_mode
+
+    def _get_effective_agent_region_radius(self) -> float:
+        if self._uses_forecast_aligned_pretrain_objective():
+            return self.forecast_aligned_agent_region_radius
+        return self.agent_mask_radius
+
+    def _get_effective_map_region_radius(self) -> float:
+        if self._uses_forecast_aligned_pretrain_objective():
+            return self.forecast_aligned_map_region_radius
+        return self.map_mask_radius
 
     def _log_jepa_stats(
         self,
@@ -280,6 +314,9 @@ class SMARTJEPA(SMART):
         self.log(name('map_jepa_loss'), jepa_stats['map_jepa_loss'], prog_bar=False, on_step=on_step, on_epoch=on_epoch, batch_size=1, sync_dist=sync_dist)
         self.log(name('masked_agent_count'), jepa_stats['masked_agent_count'], prog_bar=False, on_step=on_step, on_epoch=on_epoch, batch_size=1, sync_dist=sync_dist)
         self.log(name('masked_map_count'), jepa_stats['masked_map_count'], prog_bar=False, on_step=on_step, on_epoch=on_epoch, batch_size=1, sync_dist=sync_dist)
+        self.log(name('target_agent_count'), jepa_stats['target_agent_count'], prog_bar=False, on_step=on_step, on_epoch=on_epoch, batch_size=1, sync_dist=sync_dist)
+        self.log(name('target_polygon_count'), jepa_stats['target_polygon_count'], prog_bar=False, on_step=on_step, on_epoch=on_epoch, batch_size=1, sync_dist=sync_dist)
+        self.log(name('student_agent_future_visible_fraction'), jepa_stats['student_agent_future_visible_fraction'], prog_bar=False, on_step=on_step, on_epoch=on_epoch, batch_size=1, sync_dist=sync_dist)
         self.log(name('masked_agent_history_visible_fraction'), jepa_stats['masked_agent_history_visible_fraction'], prog_bar=False, on_step=on_step, on_epoch=on_epoch, batch_size=1, sync_dist=sync_dist)
         self.log(name('masked_agent_history_visible_tokens'), jepa_stats['masked_agent_history_visible_tokens'], prog_bar=False, on_step=on_step, on_epoch=on_epoch, batch_size=1, sync_dist=sync_dist)
         self.log(name('masked_agent_history_total_tokens'), jepa_stats['masked_agent_history_total_tokens'], prog_bar=False, on_step=on_step, on_epoch=on_epoch, batch_size=1, sync_dist=sync_dist)
@@ -357,6 +394,154 @@ class SMARTJEPA(SMART):
             self.num_future_chunks,
             self.future_chunk_steps,
         ).all(dim=-1)
+
+    def _build_jepa_masks(
+        self,
+        data: HeteroData,
+        agent_chunk_mask: torch.Tensor,
+        agent_graph_index: torch.Tensor,
+    ) -> Dict[str, Optional[torch.Tensor]]:
+        device = agent_chunk_mask.device
+        num_polygons = int(data['map_polygon']['num_nodes'])
+        zero_map_mask = torch.zeros(num_polygons, dtype=torch.bool, device=device)
+        map_enabled = self.predict_map_latent and self.joint_predictor
+
+        if self._uses_forecast_aligned_pretrain_objective():
+            (
+                target_agent_mask,
+                agent_loss_mask,
+                target_polygon_mask,
+                map_visible_mask,
+            ) = self._build_forecast_aligned_ego30_masks(
+                data=data,
+                agent_chunk_mask=agent_chunk_mask,
+                agent_graph_index=agent_graph_index,
+            )
+            return {
+                'target_agent_mask': target_agent_mask,
+                'agent_include_mask': agent_loss_mask.clone(),
+                'agent_input_hidden_mask': agent_loss_mask.clone(),
+                'agent_loss_mask': agent_loss_mask,
+                'target_polygon_mask': target_polygon_mask,
+                'map_include_mask': torch.ones(num_polygons, dtype=torch.bool, device=device) if map_enabled else zero_map_mask,
+                'map_input_hidden_mask': target_polygon_mask.clone() if map_enabled else zero_map_mask,
+                'map_loss_mask': target_polygon_mask.clone() if map_enabled else zero_map_mask,
+                'map_visible_mask': map_visible_mask if map_enabled else None,
+            }
+
+        if self.mask_strategy == 'interaction_multiblock':
+            agent_loss_mask, target_polygon_mask, map_visible_mask = self._build_interaction_joint_masks(
+                data,
+                agent_chunk_mask,
+                agent_graph_index,
+            )
+        elif self.mask_strategy == 'random_chunk':
+            agent_loss_mask = self._build_random_chunk_mask(agent_chunk_mask, agent_graph_index)
+            target_polygon_mask = zero_map_mask
+            map_visible_mask = None
+        else:
+            raise ValueError(f"Unsupported jepa.mask_strategy: {self.mask_strategy}")
+
+        if not map_enabled:
+            target_polygon_mask = zero_map_mask
+            map_visible_mask = None
+
+        return {
+            'target_agent_mask': agent_loss_mask.any(dim=-1),
+            'agent_include_mask': agent_chunk_mask.clone(),
+            'agent_input_hidden_mask': agent_loss_mask.clone(),
+            'agent_loss_mask': agent_loss_mask,
+            'target_polygon_mask': target_polygon_mask,
+            'map_include_mask': torch.ones(num_polygons, dtype=torch.bool, device=device) if map_enabled else zero_map_mask,
+            'map_input_hidden_mask': target_polygon_mask.clone() if map_enabled else zero_map_mask,
+            'map_loss_mask': target_polygon_mask.clone() if map_enabled else zero_map_mask,
+            'map_visible_mask': map_visible_mask if map_enabled else None,
+        }
+
+    def _build_forecast_aligned_ego30_masks(
+        self,
+        data: HeteroData,
+        agent_chunk_mask: torch.Tensor,
+        agent_graph_index: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        device = agent_chunk_mask.device
+        num_agents = agent_chunk_mask.shape[0]
+        num_polygons = int(data['map_polygon']['num_nodes'])
+        history_step = self.num_historical_steps - 1
+        history_pos = data['agent']['position'][:, history_step, :2].float()
+        history_valid = data['agent']['valid_mask'][:, history_step].bool()
+        non_background = data['agent']['type'] != 3
+
+        target_agent_mask = torch.zeros(num_agents, dtype=torch.bool, device=device)
+        agent_loss_mask = torch.zeros_like(agent_chunk_mask)
+        target_polygon_mask = torch.zeros(num_polygons, dtype=torch.bool, device=device)
+        polygon_centers, polygon_valid_mask, polygon_graph_index = self._compute_polygon_centers(data)
+        map_visible_mask = torch.ones(num_polygons, dtype=torch.bool, device=device)
+
+        num_graphs = int(agent_graph_index.max().item()) + 1 if agent_graph_index.numel() > 0 else 1
+        ego_indices = self._get_ego_indices(data, num_graphs)
+        for graph_id in range(num_graphs):
+            graph_agent_indices = torch.nonzero(agent_graph_index == graph_id, as_tuple=False).squeeze(-1)
+            if graph_agent_indices.numel() == 0:
+                continue
+
+            ego_index = int(ego_indices[graph_id].item())
+            if ego_index < 0 or ego_index >= num_agents:
+                continue
+            ego_position = history_pos[ego_index]
+            candidate_mask = (
+                (agent_graph_index == graph_id)
+                & history_valid
+                & non_background
+            )
+            candidate_indices = torch.nonzero(candidate_mask, as_tuple=False).squeeze(-1)
+            if candidate_indices.numel() > 0:
+                candidate_distance = torch.norm(history_pos[candidate_indices] - ego_position.unsqueeze(0), dim=-1)
+                region_agent_indices = candidate_indices[candidate_distance <= self.forecast_aligned_agent_region_radius]
+            else:
+                region_agent_indices = candidate_indices
+
+            target_agent_mask[region_agent_indices] = True
+            target_agent_mask[ego_index] = True
+            if region_agent_indices.numel() == 0:
+                region_agent_indices = ego_indices[graph_id].view(1)
+
+            agent_loss_mask[region_agent_indices] = agent_chunk_mask[region_agent_indices]
+
+            graph_polygon_indices = torch.nonzero(
+                (polygon_graph_index == graph_id) & polygon_valid_mask,
+                as_tuple=False,
+            ).squeeze(-1)
+            if graph_polygon_indices.numel() == 0:
+                continue
+
+            polygon_distance = torch.norm(
+                polygon_centers[graph_polygon_indices] - ego_position.unsqueeze(0),
+                dim=-1,
+            )
+            region_polygon_indices = graph_polygon_indices[
+                polygon_distance <= self.forecast_aligned_map_region_radius
+            ]
+            if region_polygon_indices.numel() == 0:
+                region_polygon_indices = graph_polygon_indices[polygon_distance.argmin()].view(1)
+            target_polygon_mask[region_polygon_indices] = True
+
+        map_visible_mask[target_polygon_mask] = False
+        return target_agent_mask, agent_loss_mask, target_polygon_mask, map_visible_mask
+
+    def _get_ego_indices(
+        self,
+        data: HeteroData,
+        num_graphs: int,
+    ) -> torch.Tensor:
+        av_index = data['agent']['av_index']
+        device = data['agent']['position'].device
+        if torch.is_tensor(av_index):
+            ego_indices = av_index.to(device=device, dtype=torch.long).reshape(-1)
+            if ego_indices.numel() == 1 and num_graphs > 1:
+                ego_indices = ego_indices.expand(num_graphs)
+            return ego_indices
+        return torch.full((num_graphs,), int(av_index), dtype=torch.long, device=device)
 
     def _build_random_chunk_mask(
         self,
@@ -472,12 +657,18 @@ class SMARTJEPA(SMART):
     def _build_masked_agent_history_context_mask(
         self,
         data: HeteroData,
-        agent_prediction_mask: torch.Tensor,
+        masked_agent_selector: torch.Tensor,
+        history_mode: Optional[str] = None,
     ) -> Tuple[Optional[torch.Tensor], Dict[str, torch.Tensor]]:
         base_history_mask = data['agent']['agent_valid_mask'].bool().clone()
         history_token_steps = max(1, (self.num_historical_steps - 1) // self.encoder.agent_encoder.shift)
         base_history_mask[:, history_token_steps:] = False
-        masked_agents = agent_prediction_mask.any(dim=-1)
+        masked_agents = (
+            masked_agent_selector.any(dim=-1)
+            if masked_agent_selector.dim() > 1
+            else masked_agent_selector.bool()
+        )
+        history_mode = self.masked_agent_history_mode if history_mode is None else history_mode
 
         masked_agent_history_mask = base_history_mask & masked_agents.unsqueeze(-1)
         total_history_tokens = masked_agent_history_mask.sum()
@@ -490,16 +681,16 @@ class SMARTJEPA(SMART):
         if total_history_tokens.item() == 0:
             return None, stats
 
-        if self.masked_agent_history_mode == 'visible':
+        if history_mode == 'visible':
             stats['masked_agent_history_visible_fraction'] = base_history_mask.new_tensor(1.0, dtype=torch.float32)
             return None, stats
 
         history_context_mask = base_history_mask.clone()
         masked_agent_indices = torch.nonzero(masked_agents, as_tuple=False).squeeze(-1)
 
-        if self.masked_agent_history_mode == 'hidden':
+        if history_mode == 'hidden':
             history_context_mask[masked_agent_indices] = False
-        elif self.masked_agent_history_mode == 'partial_dropout':
+        elif history_mode == 'partial_dropout':
             keep_ratio = max(0.0, min(1.0, 1.0 - self.masked_agent_history_dropout_ratio))
             for agent_index in masked_agent_indices.tolist():
                 valid_steps = torch.nonzero(base_history_mask[agent_index], as_tuple=False).squeeze(-1)

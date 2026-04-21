@@ -46,6 +46,8 @@ def load_dataset(config, split):
         raw_dir=raw_dir,
         processed_dir=processed_dir,
         transform=WaymoTargetBuilder(config.Model.num_historical_steps, config.Model.decoder.num_future_steps),
+        use_intention=bool(getattr(config.Dataset, "use_intention", False)),
+        token_size=int(getattr(config.Dataset, "token_size", getattr(config.Model, "token_size", 512))),
     )
 
 
@@ -66,29 +68,35 @@ def prepare_sample(model, graph):
     future_states, future_mask, valid_agents = model._build_future_targets(data)
     agent_chunk_mask = model._build_agent_chunk_mask(valid_agents, future_mask)
     agent_graph_index = model._get_node_batch(data, "agent")
-    if model.mask_strategy == "interaction_multiblock":
-        agent_prediction_mask, map_prediction_mask, map_visible_mask = model._build_interaction_joint_masks(
-            data,
-            agent_chunk_mask,
-            agent_graph_index,
-        )
-    else:
-        agent_prediction_mask = model._build_random_chunk_mask(agent_chunk_mask, agent_graph_index)
-        map_prediction_mask = torch.zeros(int(data["map_polygon"]["num_nodes"]), dtype=torch.bool, device=agent_chunk_mask.device)
-        map_visible_mask = None
-    _agent_history_mask, history_stats = model._build_masked_agent_history_context_mask(data, agent_prediction_mask)
+    jepa_masks = model._build_jepa_masks(data, agent_chunk_mask, agent_graph_index)
+    _agent_history_mask, history_stats = model._build_masked_agent_history_context_mask(
+        data,
+        jepa_masks["target_agent_mask"],
+        history_mode=model._get_effective_masked_agent_history_mode(),
+    )
     polygon_centers, polygon_valid_mask, _ = model._compute_polygon_centers(data)
     return {
         "data": data.cpu(),
-        "agent_prediction_mask": agent_prediction_mask.cpu(),
+        "agent_prediction_mask": jepa_masks["agent_loss_mask"].cpu(),
+        "target_agent_mask": jepa_masks["target_agent_mask"].cpu(),
         "agent_chunk_mask": agent_chunk_mask.cpu(),
         "future_mask": future_mask.cpu(),
-        "map_prediction_mask": map_prediction_mask.cpu(),
-        "map_visible_mask": None if map_visible_mask is None else map_visible_mask.cpu(),
+        "map_prediction_mask": jepa_masks["target_polygon_mask"].cpu(),
+        "map_visible_mask": None if jepa_masks["map_visible_mask"] is None else jepa_masks["map_visible_mask"].cpu(),
         "polygon_centers": polygon_centers.cpu(),
         "polygon_valid_mask": polygon_valid_mask.cpu(),
-        "history_mode": model.masked_agent_history_mode,
+        "history_mode": model._get_effective_masked_agent_history_mode(),
         "history_visible_fraction": float(history_stats["masked_agent_history_visible_fraction"]),
+        "target_agent_count": int(jepa_masks["target_agent_mask"].sum().item()),
+        "target_polygon_count": int(jepa_masks["target_polygon_mask"].sum().item()),
+        "student_agent_future_visible_fraction": float(
+            ((jepa_masks["agent_include_mask"] & ~jepa_masks["agent_input_hidden_mask"]).sum().float()
+            / jepa_masks["agent_include_mask"].sum().clamp_min(1).float()).item()
+        ),
+        "pretrain_objective": model.pretrain_objective,
+        "agent_region_radius": model._get_effective_agent_region_radius(),
+        "map_region_radius": model._get_effective_map_region_radius(),
+        "future_chunk_steps": int(model.future_chunk_steps),
     }
 
 
@@ -212,13 +220,13 @@ def draw_agents(ax, sample, agent_indices, av_index, radius):
     step_prediction_mask = chunk_mask_to_step_mask(
         sample["agent_prediction_mask"],
         sample["future_mask"],
-        future_chunk_steps=5,
+        future_chunk_steps=int(sample["future_chunk_steps"]),
     )
 
     anchor = data["agent"]["position"][av_index, current_step, :2]
     for agent_index in agent_indices.tolist():
         is_ego = agent_index == av_index
-        is_masked = bool(sample["agent_prediction_mask"][agent_index].any())
+        is_masked = bool(sample["target_agent_mask"][agent_index])
         history_color = "#7a4bc2" if is_ego else "#9ec5fe"
         future_color = "#9e9e9e"
         masked_color = "#e15759"
@@ -249,6 +257,38 @@ def draw_agents(ax, sample, agent_indices, av_index, radius):
     ax.set_ylim(float(anchor[1].item() - radius), float(anchor[1].item() + radius))
 
 
+def draw_ego_regions(ax, data, av_index, hist_index, sample):
+    center_xy = data["agent"]["position"][av_index, hist_index, :2]
+    map_radius = float(sample.get("map_region_radius", 0.0))
+    agent_radius = float(sample.get("agent_region_radius", 0.0))
+
+    if map_radius > 0.0:
+        map_circle = Circle(
+            (center_xy[0].item(), center_xy[1].item()),
+            radius=map_radius,
+            facecolor="none",
+            edgecolor="#f28e2b",
+            linewidth=1.2,
+            linestyle="-.",
+            alpha=0.85,
+            zorder=2,
+        )
+        ax.add_patch(map_circle)
+
+    if agent_radius > 0.0:
+        agent_circle = Circle(
+            (center_xy[0].item(), center_xy[1].item()),
+            radius=agent_radius,
+            facecolor="none",
+            edgecolor="#2ca02c",
+            linewidth=1.2,
+            linestyle="--",
+            alpha=0.85,
+            zorder=2,
+        )
+        ax.add_patch(agent_circle)
+
+
 def render_single(sample, title, output_path, max_agents, radius, dpi):
     data = sample["data"]
     agent_indices, av_index = pick_agent_indices(data, max_agents)
@@ -257,6 +297,8 @@ def render_single(sample, title, output_path, max_agents, radius, dpi):
     fig, ax = plt.subplots(figsize=(9, 9))
     draw_map(ax, data, masked_polygon_ids)
     draw_agents(ax, sample, agent_indices, av_index, radius)
+    hist_index = data["agent"]["valid_mask"].shape[1] - sample["future_mask"].shape[1] - 1
+    draw_ego_regions(ax, data, av_index, hist_index, sample)
     ax.set_aspect("equal", adjustable="box")
     ax.grid(False)
     ax.set_xticks([])
@@ -266,8 +308,9 @@ def render_single(sample, title, output_path, max_agents, radius, dpi):
         0.02,
         0.98,
         " | ".join([
-            f"masked agents={int(sample['agent_prediction_mask'].any(dim=-1).sum())}",
-            f"masked polygons={int(sample['map_prediction_mask'].sum())}",
+            f"target agents={int(sample['target_agent_count'])}",
+            f"target polygons={int(sample['target_polygon_count'])}",
+            f"student future vis={sample['student_agent_future_visible_fraction']:.2f}",
             f"history={sample['history_mode']}",
             f"hist vis={sample['history_visible_fraction']:.2f}",
         ]),
@@ -298,6 +341,8 @@ def render_gallery(samples, titles, output_path, max_agents, radius, dpi):
         masked_polygon_ids = torch.nonzero(sample["map_prediction_mask"], as_tuple=False).squeeze(-1)
         draw_map(ax, data, masked_polygon_ids)
         draw_agents(ax, sample, agent_indices, av_index, radius)
+        hist_index = data["agent"]["valid_mask"].shape[1] - sample["future_mask"].shape[1] - 1
+        draw_ego_regions(ax, data, av_index, hist_index, sample)
         ax.set_aspect("equal", adjustable="box")
         ax.grid(False)
         ax.set_xticks([])
@@ -307,8 +352,9 @@ def render_gallery(samples, titles, output_path, max_agents, radius, dpi):
             0.02,
             0.98,
             " | ".join([
-                f"agents={int(sample['agent_prediction_mask'].any(dim=-1).sum())}",
-                f"polygons={int(sample['map_prediction_mask'].sum())}",
+                f"agents={int(sample['target_agent_count'])}",
+                f"polygons={int(sample['target_polygon_count'])}",
+                f"student vis={sample['student_agent_future_visible_fraction']:.2f}",
                 f"history={sample['history_mode']}",
                 f"hist vis={sample['history_visible_fraction']:.2f}",
             ]),
@@ -335,13 +381,15 @@ def render_gallery(samples, titles, output_path, max_agents, radius, dpi):
 def legend_handles():
     return [
         Line2D([0], [0], color="#c7c7c7", lw=1.2, label="Visible Map"),
-        Line2D([0], [0], color="#f28e2b", lw=2.8, label="Masked Map"),
+        Line2D([0], [0], color="#f28e2b", lw=2.8, label="Target Map"),
+        Line2D([0], [0], color="#2ca02c", lw=1.2, linestyle="--", label="Ego Agent Region"),
+        Line2D([0], [0], color="#f28e2b", lw=1.2, linestyle="-.", label="Ego Map Region"),
         Line2D([0], [0], color="#9e9e9e", lw=1.2, label="Visible Future"),
-        Line2D([0], [0], color="#e15759", lw=2.6, label="Masked Agent Future"),
+        Line2D([0], [0], color="#e15759", lw=2.6, label="Target Agent Future"),
         Line2D([0], [0], color="#7a4bc2", lw=1.8, linestyle=":", label="Ego History"),
         Line2D([0], [0], color="#9ec5fe", lw=1.8, linestyle=":", label="Other History"),
         Line2D([0], [0], marker="s", color="w", markerfacecolor="#8f63d2", markeredgecolor="#7a4bc2", markersize=9, label="Ego"),
-        Line2D([0], [0], marker="s", color="w", markerfacecolor="#f6b5ae", markeredgecolor="#e15759", markersize=9, label="Masked Agent"),
+        Line2D([0], [0], marker="s", color="w", markerfacecolor="#f6b5ae", markeredgecolor="#e15759", markersize=9, label="Target Agent"),
         Line2D([0], [0], marker="s", color="w", markerfacecolor="#dcecff", markeredgecolor="#000000", markersize=9, label="Other Agent"),
     ]
 

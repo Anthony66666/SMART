@@ -90,7 +90,7 @@ class ValidationVisualizationCallback(pl.Callback):
             "_build_future_targets",
             "_build_agent_chunk_mask",
             "_get_node_batch",
-            "_build_random_chunk_mask",
+            "_build_jepa_masks",
             "_build_masked_agent_history_context_mask",
         ]
         if not all(hasattr(pl_module, attr) for attr in required_attrs):
@@ -100,38 +100,30 @@ class ValidationVisualizationCallback(pl.Callback):
         del future_states
         agent_chunk_mask = pl_module._build_agent_chunk_mask(valid_agents, future_mask)
         agent_graph_index = pl_module._get_node_batch(data, "agent")
-
-        if getattr(pl_module, "mask_strategy", "random_chunk") == "interaction_multiblock" and hasattr(
-            pl_module, "_build_interaction_joint_masks"
-        ):
-            agent_prediction_mask, map_prediction_mask, _map_visible_mask = pl_module._build_interaction_joint_masks(
-                data,
-                agent_chunk_mask,
-                agent_graph_index,
-            )
-        else:
-            agent_prediction_mask = pl_module._build_random_chunk_mask(agent_chunk_mask, agent_graph_index)
-            map_prediction_mask = torch.zeros(
-                int(data["map_polygon"]["num_nodes"]),
-                dtype=torch.bool,
-                device=agent_prediction_mask.device,
-            )
-
-        if not getattr(pl_module, "predict_map_latent", False) or not getattr(pl_module, "joint_predictor", False):
-            map_prediction_mask = torch.zeros_like(map_prediction_mask)
-
+        jepa_masks = pl_module._build_jepa_masks(data, agent_chunk_mask, agent_graph_index)
         _agent_history_mask, history_stats = pl_module._build_masked_agent_history_context_mask(
             data,
-            agent_prediction_mask,
+            jepa_masks["target_agent_mask"],
+            history_mode=pl_module._get_effective_masked_agent_history_mode(),
         )
 
         return {
             "future_mask": future_mask.cpu(),
-            "agent_prediction_mask": agent_prediction_mask.cpu(),
-            "map_prediction_mask": map_prediction_mask.cpu(),
+            "agent_prediction_mask": jepa_masks["agent_loss_mask"].cpu(),
+            "target_agent_mask": jepa_masks["target_agent_mask"].cpu(),
+            "map_prediction_mask": jepa_masks["target_polygon_mask"].cpu(),
             "future_chunk_steps": int(getattr(pl_module, "future_chunk_steps", 5)),
-            "history_mode": str(getattr(pl_module, "masked_agent_history_mode", "visible")),
+            "history_mode": str(pl_module._get_effective_masked_agent_history_mode()),
             "history_visible_fraction": float(history_stats["masked_agent_history_visible_fraction"]),
+            "target_agent_count": int(jepa_masks["target_agent_mask"].sum().item()),
+            "target_polygon_count": int(jepa_masks["target_polygon_mask"].sum().item()),
+            "student_agent_future_visible_fraction": float(
+                ((jepa_masks["agent_include_mask"] & ~jepa_masks["agent_input_hidden_mask"]).sum().float()
+                / jepa_masks["agent_include_mask"].sum().clamp_min(1).float()).item()
+            ),
+            "pretrain_objective": str(getattr(pl_module, "pretrain_objective", "legacy")),
+            "agent_region_radius": float(pl_module._get_effective_agent_region_radius()),
+            "map_region_radius": float(pl_module._get_effective_map_region_radius()),
         }
 
 
@@ -175,6 +167,8 @@ def save_validation_visualization(
 
     _draw_map(ax, data, jepa_overlay)
     _draw_agents(ax, data, prediction, agent_indices, current_step, hist_steps, av_index, Polygon, Circle, jepa_overlay)
+    if jepa_overlay is not None:
+        _draw_ego_region(ax, data, av_index, current_step, Circle, jepa_overlay)
 
     ax.set_aspect("equal", adjustable="box")
     ax.grid(True, linestyle=":", alpha=0.25)
@@ -186,8 +180,9 @@ def save_validation_visualization(
             0.98,
             " | ".join(
                 [
-                    f"masked agents={int(jepa_overlay['agent_prediction_mask'].any(dim=-1).sum())}",
-                    f"masked polygons={int(jepa_overlay['map_prediction_mask'].sum())}",
+                    f"target agents={int(jepa_overlay['target_agent_count'])}",
+                    f"target polygons={int(jepa_overlay['target_polygon_count'])}",
+                    f"student future vis={float(jepa_overlay['student_agent_future_visible_fraction']):.2f}",
                     f"history={jepa_overlay['history_mode']}",
                     f"hist vis={float(jepa_overlay['history_visible_fraction']):.2f}",
                 ]
@@ -229,6 +224,38 @@ def _draw_map(ax, data, jepa_overlay: Optional[Dict[str, object]] = None) -> Non
         )
 
 
+def _draw_ego_region(ax, data, av_index: int, current_step: int, circle_cls, jepa_overlay: Dict[str, object]) -> None:
+    agent_radius = float(jepa_overlay.get("agent_region_radius", 0.0))
+    map_radius = float(jepa_overlay.get("map_region_radius", 0.0))
+    center_xy = data["agent"]["position"][av_index, current_step, :2]
+
+    if map_radius > 0.0:
+        map_circle = circle_cls(
+            (center_xy[0].item(), center_xy[1].item()),
+            radius=map_radius,
+            facecolor="none",
+            edgecolor="#f28e2b",
+            linewidth=1.2,
+            linestyle="-.",
+            alpha=0.85,
+            zorder=2,
+        )
+        ax.add_patch(map_circle)
+
+    if agent_radius > 0.0:
+        agent_circle = circle_cls(
+            (center_xy[0].item(), center_xy[1].item()),
+            radius=agent_radius,
+            facecolor="none",
+            edgecolor="#2ca02c",
+            linewidth=1.2,
+            linestyle="--",
+            alpha=0.85,
+            zorder=2,
+        )
+        ax.add_patch(agent_circle)
+
+
 def _draw_agents(
     ax,
     data,
@@ -249,7 +276,7 @@ def _draw_agents(
             jepa_overlay["future_mask"],
             int(jepa_overlay["future_chunk_steps"]),
         )
-        masked_agent_mask = jepa_overlay["agent_prediction_mask"].any(dim=-1)
+        masked_agent_mask = jepa_overlay.get("target_agent_mask", jepa_overlay["agent_prediction_mask"].any(dim=-1))
 
     for agent_index in agent_indices.tolist():
         is_ego = agent_index == av_index
@@ -375,11 +402,13 @@ def _legend_handles(line_cls, show_jepa_overlay: bool):
     if show_jepa_overlay:
         handles = [
             line_cls([0], [0], color="#c7c7c7", lw=1.2, label="Visible Map"),
-            line_cls([0], [0], color="#f28e2b", lw=2.8, label="Masked Map"),
+            line_cls([0], [0], color="#f28e2b", lw=2.8, label="Target Map"),
+            line_cls([0], [0], color="#2ca02c", lw=1.2, linestyle="--", label="Ego Agent Region"),
+            line_cls([0], [0], color="#f28e2b", lw=1.2, linestyle="-.", label="Ego Map Region"),
             line_cls([0], [0], color="#8f63d2", lw=1.8, linestyle=":", label="Ego History"),
             line_cls([0], [0], color="#a9d2ff", lw=1.8, linestyle=":", label="Other History"),
             line_cls([0], [0], color="#8f63d2", lw=1.8, linestyle="-", label="Visible GT Future"),
-            line_cls([0], [0], color="#2ca02c", lw=2.4, linestyle="-", label="Masked GT Future"),
+            line_cls([0], [0], color="#2ca02c", lw=2.4, linestyle="-", label="Target GT Future"),
             line_cls([0], [0], color="#e15759", lw=1.8, linestyle="-", label="Pred Future"),
         ]
     return handles
