@@ -1,5 +1,5 @@
 import os.path
-from typing import Dict
+from typing import Dict, Optional
 import torch
 import torch.nn as nn
 from torch_cluster import radius_graph
@@ -73,11 +73,15 @@ class SMARTMapDecoder(nn.Module):
     def maybe_autocast(self, dtype=torch.float32):
         return torch.cuda.amp.autocast(dtype=dtype)
 
-    def forward(self, data: HeteroData) -> Dict[str, torch.Tensor]:
+    def forward(
+        self,
+        data: HeteroData,
+        polygon_visible_mask: Optional[torch.Tensor] = None,
+        disable_prediction: bool = False,
+    ) -> Dict[str, torch.Tensor]:
         pt_valid_mask = data['pt_token']['pt_valid_mask']
         pt_pred_mask = data['pt_token']['pt_pred_mask']
         pt_target_mask = data['pt_token']['pt_target_mask']
-        mask_s = pt_valid_mask
 
         pos_pt = data['pt_token']['position'][:, :self.input_dim].contiguous()
         orient_pt = data['pt_token']['orientation'].contiguous()
@@ -94,15 +98,30 @@ class SMARTMapDecoder(nn.Module):
             raise ValueError('{} is not a valid dimension'.format(self.input_dim))
 
         token2pl = data[('pt_token', 'to', 'map_polygon')]['edge_index']
+        has_polygon_mask = polygon_visible_mask is not None
+        if polygon_visible_mask is None:
+            polygon_visible_mask = torch.ones(
+                int(data['map_polygon']['num_nodes']),
+                dtype=torch.bool,
+                device=pos_pt.device,
+            )
+        else:
+            polygon_visible_mask = polygon_visible_mask.to(device=pos_pt.device, dtype=torch.bool)
+        pt_visible_mask = polygon_visible_mask[token2pl[1].long()]
+        mask_s = pt_visible_mask
+        if self.mask_pt:
+            mask_s = mask_s & pt_valid_mask
         token_light_type = data['map_polygon']['light_type'][token2pl[1]]
         x_pt_categorical_embs = [self.type_pt_emb(data['pt_token']['type'].long()),
                                  self.polygon_type_emb(data['pt_token']['pl_type'].long()),
                                  self.light_pl_emb(token_light_type.long()),]
         x_pt = x_pt + torch.stack(x_pt_categorical_embs).sum(dim=0)
+        if has_polygon_mask:
+            x_pt = x_pt.masked_fill(~pt_visible_mask.unsqueeze(-1), 0.0)
         edge_index_pt2pt = radius_graph(x=pos_pt[:, :2], r=self.pl2pl_radius,
                                         batch=data['pt_token']['batch'] if isinstance(data, Batch) else None,
                                         loop=False, max_num_neighbors=100)
-        if self.mask_pt:
+        if self.mask_pt or has_polygon_mask:
             edge_index_pt2pt = subgraph(subset=mask_s, edge_index=edge_index_pt2pt)[0]
         rel_pos_pt2pt = pos_pt[edge_index_pt2pt[0]] - pos_pt[edge_index_pt2pt[1]]
         rel_orient_pt2pt = wrap_angle(orient_pt[edge_index_pt2pt[0]] - orient_pt[edge_index_pt2pt[1]])
@@ -124,16 +143,25 @@ class SMARTMapDecoder(nn.Module):
         r_pt2pt = self.r_pt2pt_emb(continuous_inputs=r_pt2pt, categorical_embs=None)
         for i in range(self.num_layers):
             x_pt = self.pt2pt_layers[i](x_pt, r_pt2pt, edge_index_pt2pt)
+            if has_polygon_mask:
+                x_pt = x_pt.masked_fill(~pt_visible_mask.unsqueeze(-1), 0.0)
 
-        next_token_prob = self.token_predict_head(x_pt[pt_pred_mask])
-        next_token_prob_softmax = torch.softmax(next_token_prob, dim=-1)
-        _, next_token_idx = torch.topk(next_token_prob_softmax, k=10, dim=-1)
-        next_token_index_gt = data['pt_token']['token_idx'][pt_target_mask]
+        if disable_prediction:
+            next_token_prob = x_pt.new_zeros((0, self.token_size))
+            next_token_idx = torch.empty((0, 10), dtype=torch.long, device=x_pt.device)
+            next_token_index_gt = torch.empty((0,), dtype=torch.long, device=x_pt.device)
+        else:
+            next_token_prob = self.token_predict_head(x_pt[pt_pred_mask])
+            next_token_prob_softmax = torch.softmax(next_token_prob, dim=-1)
+            _, next_token_idx = torch.topk(next_token_prob_softmax, k=10, dim=-1)
+            next_token_index_gt = data['pt_token']['token_idx'][pt_target_mask]
 
         return {
             'x_pt': x_pt,
             'map_next_token_idx': next_token_idx,
             'map_next_token_prob': next_token_prob,
             'map_next_token_idx_gt': next_token_index_gt,
-            'map_next_token_eval_mask': pt_pred_mask[pt_pred_mask]
+            'map_next_token_eval_mask': pt_pred_mask[pt_pred_mask],
+            'pt_visibility_mask': pt_visible_mask,
+            'polygon_visible_mask': polygon_visible_mask,
         }

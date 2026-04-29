@@ -15,6 +15,7 @@ import pickle
 from collections import defaultdict
 import os
 from waymo_open_dataset.protos import sim_agents_submission_pb2
+from smart.utils.torch_compat import torch_load_compat
 
 
 def cal_polygon_contour(x, y, theta, width, length):
@@ -100,8 +101,8 @@ class SMART(pl.LightningModule):
         self.test_predictions = dict()
         self.cls_loss = nn.CrossEntropyLoss(label_smoothing=0.1)
         self.map_cls_loss = nn.CrossEntropyLoss(label_smoothing=0.1)
-        self.inference_token = False
-        self.rollout_num = 1
+        self.inference_token = bool(getattr(model_config, "inference_token", False))
+        self.rollout_num = int(getattr(model_config, "rollout_num", 1))
 
     def get_trajectory_token(self):
         token_data = pickle.load(open(self.token_path, 'rb'))
@@ -208,8 +209,16 @@ class SMART(pl.LightningModule):
         def lr_lambda(current_step):
             if current_step + 1 < self.warmup_steps:
                 return float(current_step + 1) / float(max(1, self.warmup_steps))
+            if current_step >= self.total_steps:
+                return 0.0
             return max(
-                0.0, 0.5 * (1.0 + math.cos(math.pi * (current_step - self.warmup_steps) / float(max(1, self.total_steps - self.warmup_steps))))
+                0.0,
+                0.5 * (
+                    1.0 + math.cos(
+                        math.pi * (current_step - self.warmup_steps)
+                        / float(max(1, self.total_steps - self.warmup_steps))
+                    )
+                ),
             )
 
         lr_scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
@@ -221,7 +230,7 @@ class SMART(pl.LightningModule):
 
         logger.info('==> Loading parameters from checkpoint %s to %s' % (filename, 'CPU' if to_cpu else 'GPU'))
         loc_type = torch.device('cpu') if to_cpu else None
-        checkpoint = torch.load(filename, map_location=loc_type)
+        checkpoint = torch_load_compat(filename, map_location=loc_type, weights_only=False)
         model_state_disk = checkpoint['state_dict']
 
         version = checkpoint.get("version", None)
