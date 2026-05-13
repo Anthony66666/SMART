@@ -219,11 +219,10 @@ class SMARTDiffusion(SMART):
         node_types = getattr(data, 'node_types', [])
         if (
             not self.use_map_context
-            or self.max_map_tokens <= 0
             or 'x_pt' not in ctx
             or 'pt_token' not in node_types
         ):
-            return None, None, None
+            return None, None, None, None
 
         map_features = ctx['x_pt']
         map_positions = data['pt_token']['position'][:, :2].float()
@@ -235,30 +234,34 @@ class SMARTDiffusion(SMART):
         else:
             map_visible = map_visible.to(device=map_features.device, dtype=torch.bool)
 
-        B = len(packed['agent_maps'])
-        D = map_features.shape[-1]
-        device = map_features.device
-        map_context = map_features.new_zeros((B, self.max_map_tokens, D))
-        packed_map_positions = map_positions.new_zeros((B, self.max_map_tokens, 2))
-        packed_map_orientations = map_orientation.new_zeros((B, self.max_map_tokens))
-        map_valid_mask = torch.zeros(B, self.max_map_tokens, dtype=torch.bool, device=device)
-
-        for seq_idx, (scene_idx, _packed_seq_idx, agent_indices) in enumerate(packed['agent_maps']):
+        per_scene_candidates = []
+        for scene_idx, _packed_seq_idx, agent_indices in packed['agent_maps']:
             candidates = torch.nonzero(
                 (map_batch == scene_idx) & map_visible,
                 as_tuple=False,
             ).squeeze(-1)
-            if candidates.numel() == 0:
-                continue
-
-            scene_agent_pos = agent_positions[agent_indices]
-            if scene_agent_pos.numel() > 0:
+            if candidates.numel() > 0 and self.max_map_tokens > 0:
+                scene_agent_pos = agent_positions[agent_indices]
                 dist = torch.cdist(map_positions[candidates], scene_agent_pos)
                 nearest_dist = dist.min(dim=1).values
                 order = torch.argsort(nearest_dist)
                 candidates = candidates[order]
+                candidates = candidates[:self.max_map_tokens]
+            per_scene_candidates.append(candidates)
 
-            keep = candidates[:self.max_map_tokens]
+        max_scene_tokens = max((int(c.numel()) for c in per_scene_candidates), default=0)
+        if max_scene_tokens == 0:
+            return None, None, None, None
+
+        B = len(per_scene_candidates)
+        D = map_features.shape[-1]
+        device = map_features.device
+        map_context = map_features.new_zeros((B, max_scene_tokens, D))
+        packed_map_positions = map_positions.new_zeros((B, max_scene_tokens, 2))
+        packed_map_orientations = map_orientation.new_zeros((B, max_scene_tokens))
+        map_valid_mask = torch.zeros(B, max_scene_tokens, dtype=torch.bool, device=device)
+
+        for seq_idx, keep in enumerate(per_scene_candidates):
             keep_count = int(keep.numel())
             if keep_count == 0:
                 continue

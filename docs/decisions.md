@@ -40,7 +40,7 @@
 - Context: Raw world coordinates and indirect map conditioning made diffusion training noisy and weakly grounded.
 - Decision: Use explicit future-token and map-to-future graph edges with edge-relative Fourier embeddings; raw coordinates are only used for `radius` / `radius_graph` neighbor construction. Include selected visible map token features in the diffusion graph and normalize diffusion NLL over valid tokens instead of masked-token mean.
 - Why: This more directly reuses the original SMART/QCNet geometry style than scene-centering, avoids scene-global coordinate scale issues, and reduces small-t gradient variance.
-- Impact: Diffusion configs include `use_map_context` and `max_map_tokens`; validation should inspect graph edge construction, `map_context`, and loss stability during local/server runs.
+- Impact: Diffusion configs include `use_map_context` and `max_map_tokens`; `max_map_tokens <= 0` disables scene-level map truncation so SMART's radius map-agent edge builder controls map access. Validation should inspect graph edge construction, `map_context`, and loss stability during local/server runs.
 
 ## Decision: Reuse SMART physical token embeddings for diffusion tokens
 - Date: 2026-05-12

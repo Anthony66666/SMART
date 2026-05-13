@@ -17,6 +17,7 @@
 - Validate the selected diffusion checkpoint with `configs/validation/validation_scalable_diffusion.yaml`.
 - Track `train_empty_diffusion_batch`, `val_empty_diffusion_batch`, `val_loss`, `val_diffusion_loss`, `val_ntp_loss`, `val_mask_acc`, `val_minADE`, `val_minFDE`, `val_conflict_rate`, and `val_interaction_consistency`.
 - Confirm future-token, temporal, and map-to-future edge counts are nonzero on typical batches, and `map_valid_mask.sum()` remains nonzero.
+- Watch GPU memory and step time after disabling scene-level map truncation; reintroduce a cap only if server memory requires it.
 - Watch whether type-specific physical token embeddings reduce early straight-line collapse compared with the previous random token-id embedding run.
 - Regenerate the step visualization at the next interval and confirm predicted trajectories use `pred_valid_mask` with no `(0,0)` artifacts.
 - If local metrics/visualizations look sane, run the server config `configs/train/train_scalable_diffusion.yaml` with the full training and validation data paths.

@@ -1,6 +1,12 @@
 # Progress
 
 ## 2026-05-12 CST
+- Task: Changed SMART-Diffusion map context to directly reuse SMART-style radius map selection.
+- Result: `max_map_tokens <= 0` now means no scene-level map-token truncation; diffusion packs all visible map tokens for each scene and relies on the shared SMART radius map-agent edge builder to select per-token map neighbors. Diffusion train/validation configs now set `max_map_tokens: 0`.
+- Files: `smart/model/smart_diffusion.py`, `configs/train/train_scalable_diffusion.yaml`, `configs/train/train_scalable_diffusion_local.yaml`, `configs/validation/validation_scalable_diffusion.yaml`
+- Validation: `py_compile` passed; local validation sample packed `map_context=(1,2328,128)` with `map_valid_count=2328`, matching the visible map token count, and diffusion loss/inference remained finite with `pred_traj=(73,80,2)`, `next_token_idx=(73,16)`.
+- Next: Monitor server memory/throughput with full visible map tokens; if needed, cap `max_map_tokens` only as a resource fallback.
+
 - Task: Reused SMART edge builders and physical token embeddings in SMART-Diffusion.
 - Result: Edge construction was moved into `smart/modules/smart_edge_builder.py`; original `SMARTAgentDecoder` methods now wrap the shared builders, and `DiffusionDecoder` uses the same temporal, agent-agent, and map-agent raw relation builders with its own relation embeddings. Diffusion token inputs now use SMART's type-specific physical trajectory token MLPs for visible token ids and the learned mask token only for masked ids.
 - Files: `smart/modules/smart_edge_builder.py`, `smart/modules/agent_decoder.py`, `smart/modules/diffusion_decoder.py`, `smart/model/smart_diffusion.py`
