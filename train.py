@@ -5,10 +5,11 @@ from pytorch_lightning.callbacks import LearningRateMonitor
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.strategies import DDPStrategy
 from smart.callbacks import ValidationVisualizationCallback
+from smart.callbacks.step_visualization import StepVisualizationCallback
 from smart.utils.config import load_config_act
 from smart.datamodules import MultiDataModule
 from smart.model import SMART
-from smart.model import SMARTJEPA
+from smart.model import SMARTDiffusion
 from smart.utils.log import Logging
 from smart.utils.torch_compat import register_checkpoint_safe_globals
 
@@ -19,7 +20,7 @@ if __name__ == '__main__':
     parser = ArgumentParser()
     Predictor_hash = {
         "smart": SMART,
-        "smart_jepa": SMARTJEPA,
+        "smart_diffusion": SMARTDiffusion,
     }
     parser.add_argument('--config', type=str, default='configs/train/train_scalable.yaml')
     parser.add_argument('--pretrain_ckpt', type=str, default="")
@@ -61,6 +62,17 @@ if __name__ == '__main__':
                 max_agents=getattr(visualization_config, 'max_agents', 0),
             )
         )
+        step_viz_cfg = getattr(visualization_config, 'step_viz', None)
+        if step_viz_cfg is not None and getattr(step_viz_cfg, 'enabled', False):
+            callbacks.append(
+                StepVisualizationCallback(
+                    interval_steps=getattr(step_viz_cfg, 'interval_steps', 2000),
+                    sample_indices=getattr(step_viz_cfg, 'sample_indices',
+                                           getattr(visualization_config, 'sample_indices', [0])),
+                    output_dir=getattr(step_viz_cfg, 'output_dir', 'outputs/step_visualizations'),
+                    max_agents=getattr(visualization_config, 'max_agents', 0),
+                )
+            )
     trainer = pl.Trainer(accelerator=trainer_config.accelerator, devices=trainer_config.devices,
                          strategy=strategy,
                          accumulate_grad_batches=trainer_config.accumulate_grad_batches,

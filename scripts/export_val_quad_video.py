@@ -20,7 +20,7 @@ import torch
 from torch_geometric.data import Batch
 
 from smart.datasets.scalable_dataset import MultiDataset
-from smart.model import SMART, SMARTJEPA
+from smart.model import SMART, SMARTDiffusion
 from smart.transforms import WaymoTargetBuilder
 from smart.utils.config import load_config_act
 from smart.utils.log import Logging
@@ -29,7 +29,7 @@ from smart.utils.torch_compat import register_checkpoint_safe_globals
 
 PREDICTORS = {
     "smart": SMART,
-    "smart_jepa": SMARTJEPA,
+    "smart_diffusion": SMARTDiffusion,
 }
 
 SHIFT = 5
@@ -73,6 +73,7 @@ def load_dataset(config):
         raw_dir=config.Dataset.val_raw_dir,
         processed_dir=config.Dataset.val_processed_dir,
         transform=WaymoTargetBuilder(config.Model.num_historical_steps, config.Model.decoder.num_future_steps),
+        token_size=int(getattr(config.Dataset, "token_size", getattr(config.Model.decoder, "token_size", 512))),
     )
 
 
@@ -165,6 +166,8 @@ def extend_graph_for_rollout(graph, target_future_steps, hist_steps):
 
 def prepare_batch(model, graph):
     batch = Batch.from_data_list([graph]).to(model.device)
+    if hasattr(model, "_prepare_batch"):
+        return model._prepare_batch(batch)
     data = model.match_token_map(batch)
     data = model.sample_pt_pred(data)
     if isinstance(data, Batch):

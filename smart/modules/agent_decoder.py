@@ -5,10 +5,13 @@ import torch.nn as nn
 from smart.layers import MLPLayer
 from smart.layers.attention_layer import AttentionLayer
 from smart.layers.fourier_embedding import FourierEmbedding, MLPEmbedding
-from torch_cluster import radius, radius_graph
 from torch_geometric.data import Batch, HeteroData
-from torch_geometric.utils import dense_to_sparse, subgraph
-from smart.utils import angle_between_2d_vectors, weight_init, wrap_angle
+from smart.modules.smart_edge_builder import (
+    build_interaction_edges,
+    build_map2agent_edges,
+    build_temporal_edges,
+)
+from smart.utils import angle_between_2d_vectors, weight_init
 import math
 
 
@@ -201,46 +204,34 @@ class SMARTAgentDecoder(nn.Module):
 
     def build_temporal_edge(self, pos_a, head_a, head_vector_a, num_agent, mask, inference_mask=None,
                             apply_random_hist_mask=True):
-        pos_t = pos_a.reshape(-1, self.input_dim)
-        head_t = head_a.reshape(-1)
-        head_vector_t = head_vector_a.reshape(-1, 2)
         hist_mask = mask.clone()
 
         if self.hist_mask and self.training and apply_random_hist_mask:
             hist_mask[
                 torch.arange(mask.shape[0]).unsqueeze(1), torch.randint(0, mask.shape[1], (num_agent, 10))] = False
-            mask_t = hist_mask.unsqueeze(2) & hist_mask.unsqueeze(1)
-        elif inference_mask is not None:
-            mask_t = hist_mask.unsqueeze(2) & inference_mask.unsqueeze(1)
-        else:
-            mask_t = hist_mask.unsqueeze(2) & hist_mask.unsqueeze(1)
+        target_mask = hist_mask if inference_mask is None else inference_mask.bool()
 
-        edge_index_t = dense_to_sparse(mask_t)[0]
-        edge_index_t = edge_index_t[:, edge_index_t[1] > edge_index_t[0]]
-        edge_index_t = edge_index_t[:, edge_index_t[1] - edge_index_t[0] <= self.time_span / self.shift]
-        rel_pos_t = pos_t[edge_index_t[0]] - pos_t[edge_index_t[1]]
-        rel_head_t = wrap_angle(head_t[edge_index_t[0]] - head_t[edge_index_t[1]])
-        r_t = torch.stack(
-            [torch.norm(rel_pos_t[:, :2], p=2, dim=-1),
-             angle_between_2d_vectors(ctr_vector=head_vector_t[edge_index_t[1]], nbr_vector=rel_pos_t[:, :2]),
-             rel_head_t,
-             edge_index_t[0] - edge_index_t[1]], dim=-1)
+        edge_index_t, r_t = build_temporal_edges(
+            pos_a=pos_a,
+            head_a=head_a,
+            head_vector_a=head_vector_a,
+            mask=hist_mask,
+            max_step_delta=int(self.time_span / self.shift),
+            causal=True,
+            target_mask=target_mask,
+        )
         r_t = self.r_t_emb(continuous_inputs=r_t, categorical_embs=None)
         return edge_index_t, r_t
 
     def build_interaction_edge(self, pos_a, head_a, head_vector_a, batch_s, mask_s):
-        pos_s = pos_a.transpose(0, 1).reshape(-1, self.input_dim)
-        head_s = head_a.transpose(0, 1).reshape(-1)
-        head_vector_s = head_vector_a.transpose(0, 1).reshape(-1, 2)
-        edge_index_a2a = radius_graph(x=pos_s[:, :2], r=self.a2a_radius, batch=batch_s, loop=False,
-                                      max_num_neighbors=300)
-        edge_index_a2a = subgraph(subset=mask_s, edge_index=edge_index_a2a)[0]
-        rel_pos_a2a = pos_s[edge_index_a2a[0]] - pos_s[edge_index_a2a[1]]
-        rel_head_a2a = wrap_angle(head_s[edge_index_a2a[0]] - head_s[edge_index_a2a[1]])
-        r_a2a = torch.stack(
-            [torch.norm(rel_pos_a2a[:, :2], p=2, dim=-1),
-             angle_between_2d_vectors(ctr_vector=head_vector_s[edge_index_a2a[1]], nbr_vector=rel_pos_a2a[:, :2]),
-             rel_head_a2a], dim=-1)
+        edge_index_a2a, r_a2a = build_interaction_edges(
+            pos_a=pos_a,
+            head_a=head_a,
+            head_vector_a=head_vector_a,
+            batch_s=batch_s,
+            mask_s=mask_s,
+            radius_m=self.a2a_radius,
+        )
         r_a2a = self.r_a2a_emb(continuous_inputs=r_a2a, categorical_embs=None)
         return edge_index_a2a, r_a2a
 
@@ -323,28 +314,20 @@ class SMARTAgentDecoder(nn.Module):
 
     def build_map2agent_edge(self, data, num_step, agent_category, pos_a, head_a, head_vector_a, mask,
                              batch_s, batch_pl, map_token_visible_mask=None):
-        mask_pl2a = mask.clone()
-        mask_pl2a = mask_pl2a.transpose(0, 1).reshape(-1)
-        pos_s = pos_a.transpose(0, 1).reshape(-1, self.input_dim)
-        head_s = head_a.transpose(0, 1).reshape(-1)
-        head_vector_s = head_vector_a.transpose(0, 1).reshape(-1, 2)
         pos_pl = data['pt_token']['position'][:, :self.input_dim].contiguous()
         orient_pl = data['pt_token']['orientation'].contiguous()
-        pos_pl = pos_pl.repeat(num_step, 1)
-        orient_pl = orient_pl.repeat(num_step)
-        edge_index_pl2a = radius(x=pos_s[:, :2], y=pos_pl[:, :2], r=self.pl2a_radius,
-                                 batch_x=batch_s, batch_y=batch_pl, max_num_neighbors=300)
-        edge_keep_mask = mask_pl2a[edge_index_pl2a[1]]
-        if map_token_visible_mask is not None:
-            expanded_map_visible_mask = map_token_visible_mask.bool().repeat(num_step)
-            edge_keep_mask = edge_keep_mask & expanded_map_visible_mask[edge_index_pl2a[0]]
-        edge_index_pl2a = edge_index_pl2a[:, edge_keep_mask]
-        rel_pos_pl2a = pos_pl[edge_index_pl2a[0]] - pos_s[edge_index_pl2a[1]]
-        rel_orient_pl2a = wrap_angle(orient_pl[edge_index_pl2a[0]] - head_s[edge_index_pl2a[1]])
-        r_pl2a = torch.stack(
-            [torch.norm(rel_pos_pl2a[:, :2], p=2, dim=-1),
-             angle_between_2d_vectors(ctr_vector=head_vector_s[edge_index_pl2a[1]], nbr_vector=rel_pos_pl2a[:, :2]),
-             rel_orient_pl2a], dim=-1)
+        edge_index_pl2a, r_pl2a = build_map2agent_edges(
+            pos_a=pos_a,
+            head_a=head_a,
+            head_vector_a=head_vector_a,
+            pos_pl=pos_pl,
+            orient_pl=orient_pl,
+            batch_s=batch_s,
+            batch_pl=batch_pl,
+            mask=mask,
+            radius_m=self.pl2a_radius,
+            map_token_visible_mask=map_token_visible_mask,
+        )
         r_pl2a = self.r_pt2a_emb(continuous_inputs=r_pl2a, categorical_embs=None)
         return edge_index_pl2a, r_pl2a
 

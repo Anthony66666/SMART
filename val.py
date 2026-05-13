@@ -4,7 +4,7 @@ import pytorch_lightning as pl
 from torch_geometric.loader import DataLoader
 from smart.datasets.scalable_dataset import MultiDataset
 from smart.model import SMART
-from smart.model import SMARTJEPA
+from smart.model import SMARTDiffusion
 from smart.transforms import WaymoTargetBuilder
 from smart.utils.config import load_config_act
 from smart.utils.log import Logging
@@ -23,7 +23,7 @@ if __name__ == '__main__':
     config = load_config_act(args.config)
     Predictor_hash = {
         "smart": SMART,
-        "smart_jepa": SMARTJEPA,
+        "smart_diffusion": SMARTDiffusion,
     }
 
     data_config = config.Dataset
@@ -32,8 +32,10 @@ if __name__ == '__main__':
     }[data_config.dataset](root=data_config.root, split='val',
                            raw_dir=data_config.val_raw_dir,
                            processed_dir=data_config.val_processed_dir,
-                           transform=WaymoTargetBuilder(config.Model.num_historical_steps, config.Model.decoder.num_future_steps))
-    dataloader = DataLoader(val_dataset, batch_size=data_config.batch_size, shuffle=False, num_workers=data_config.num_workers,
+                           transform=WaymoTargetBuilder(config.Model.num_historical_steps, config.Model.decoder.num_future_steps),
+                           token_size=int(getattr(data_config, "token_size", getattr(config.Model.decoder, "token_size", 512))))
+    batch_size = int(getattr(data_config, "batch_size", getattr(data_config, "val_batch_size", 1)))
+    dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=data_config.num_workers,
                             pin_memory=data_config.pin_memory, persistent_workers=True if data_config.num_workers > 0 else False)
     Predictor = Predictor_hash[config.Model.predictor]
     if args.pretrain_ckpt == "":
