@@ -16,6 +16,17 @@ from smart.utils.torch_compat import register_checkpoint_safe_globals
 register_checkpoint_safe_globals()
 
 
+def build_strategy(trainer_config):
+    strategy_name = getattr(trainer_config, 'strategy', None)
+    if strategy_name in (None, "", "auto"):
+        return "auto"
+    if strategy_name == "ddp_find_unused_parameters_false":
+        return DDPStrategy(find_unused_parameters=False, gradient_as_bucket_view=True)
+    if strategy_name == "ddp_find_unused_parameters_true":
+        return DDPStrategy(find_unused_parameters=True, gradient_as_bucket_view=True)
+    return strategy_name
+
+
 if __name__ == '__main__':
     parser = ArgumentParser()
     Predictor_hash = {
@@ -29,7 +40,6 @@ if __name__ == '__main__':
     args = parser.parse_args()
     config = load_config_act(args.config)
     Predictor = Predictor_hash[config.Model.predictor]
-    strategy = DDPStrategy(find_unused_parameters=True, gradient_as_bucket_view=True)
     Data_config = config.Dataset
     datamodule = MultiDataModule(**vars(Data_config))
 
@@ -41,6 +51,7 @@ if __name__ == '__main__':
         model.load_params_from_file(filename=args.pretrain_ckpt,
                                     logger=logger)
     trainer_config = config.Trainer
+    strategy = build_strategy(trainer_config)
     monitor_metric = getattr(trainer_config, 'monitor_metric', 'val_cls_acc')
     monitor_mode = getattr(trainer_config, 'monitor_mode', 'max')
     model_checkpoint = ModelCheckpoint(dirpath=args.save_ckpt_path,
@@ -77,6 +88,7 @@ if __name__ == '__main__':
                          strategy=strategy,
                          accumulate_grad_batches=trainer_config.accumulate_grad_batches,
                          num_nodes=trainer_config.num_nodes,
+                         precision=getattr(trainer_config, 'precision', 32),
                          callbacks=callbacks,
                          max_epochs=trainer_config.max_epochs,
                          num_sanity_val_steps=0,

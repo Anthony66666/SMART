@@ -48,3 +48,10 @@
 - Decision: Embed non-mask diffusion token ids with the original SMART type-specific trajectory token MLPs (`veh` / `ped` / `cyc`) and keep the learned mask token only for masked positions.
 - Why: This gives diffusion direct access to the token codebook's physical trajectory shape semantics and keeps NTP and diffusion aligned around the same token representation.
 - Impact: Diffusion gradients now update SMART's type-specific token embedding MLPs unless the encoder is frozen.
+
+## Decision: SMART-Diffusion graph geometry is diffusion-state dependent
+- Date: 2026-05-13
+- Context: Repeating every future-token node at the historical pose made map and interaction edges blind to the already released token chain.
+- Decision: Refresh future-token graph positions/headings from currently unmasked tokens during both training and sampling; masked chunks fall back to the most recent available pose. Represent map context as flat/ragged tensors with packed-scene batch ids, and skip NTP forward entirely when `ntp_aux_loss_weight <= 0`.
+- Why: This keeps graph edges aligned with the denoising state, avoids padded map memory blowups, and removes unnecessary auxiliary compute when NTP is disabled.
+- Impact: Diffusion graph construction now depends on the current noisy token state; `pred_prob` reports token-level diffusion selection confidence rather than a SMART autoregressive probability.

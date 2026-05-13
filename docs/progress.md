@@ -1,5 +1,12 @@
 # Progress
 
+## 2026-05-13 CST
+- Task: Implemented SMART-Diffusion audit fixes for training speed, map memory, dynamic geometry, trainer config handling, and diagnostics.
+- Result: `ntp_aux_loss_weight <= 0` now skips the NTP forward pass; diffusion map context is flat/ragged with packed-scene batch ids; future-token positions/headings refresh from currently unmasked tokens during training and sampling; token conditioning includes SMART agent shape embeddings; `train.py`/`val.py` respect yaml strategy and precision; `ConflictRate` bbox rotation now matches SMART decode; `pred_prob` now carries token-level diffusion selection confidence.
+- Files: `smart/model/smart_diffusion.py`, `smart/modules/diffusion_decoder.py`, `train.py`, `val.py`, `smart/metrics/joint_consistency.py`
+- Validation: `py_compile` passed; decoder toy forward passed with flat map context and no-map paths; local real-batch smoke confirmed NTP forward is skipped at weight 0 with finite loss; real-batch map/geometry check confirmed flat `map_context` and nonzero dynamic geometry change.
+- Next: Run a longer GPU training smoke and inspect step visualizations for reduced straight-line collapse.
+
 ## 2026-05-12 CST
 - Task: Changed SMART-Diffusion map context to directly reuse SMART-style radius map selection.
 - Result: `max_map_tokens <= 0` now means no scene-level map-token truncation; diffusion packs all visible map tokens for each scene and relies on the shared SMART radius map-agent edge builder to select per-token map neighbors. Diffusion train/validation configs now set `max_map_tokens: 0`.

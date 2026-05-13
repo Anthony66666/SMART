@@ -222,7 +222,7 @@ class SMARTDiffusion(SMART):
             or 'x_pt' not in ctx
             or 'pt_token' not in node_types
         ):
-            return None, None, None, None
+            return None, None, None, None, None
 
         map_features = ctx['x_pt']
         map_positions = data['pt_token']['position'][:, :2].float()
@@ -234,8 +234,11 @@ class SMARTDiffusion(SMART):
         else:
             map_visible = map_visible.to(device=map_features.device, dtype=torch.bool)
 
-        per_scene_candidates = []
-        for scene_idx, _packed_seq_idx, agent_indices in packed['agent_maps']:
+        kept_context = []
+        kept_positions = []
+        kept_orientations = []
+        kept_batch = []
+        for seq_idx, (scene_idx, _packed_seq_idx, agent_indices) in enumerate(packed['agent_maps']):
             candidates = torch.nonzero(
                 (map_batch == scene_idx) & map_visible,
                 as_tuple=False,
@@ -247,31 +250,101 @@ class SMARTDiffusion(SMART):
                 order = torch.argsort(nearest_dist)
                 candidates = candidates[order]
                 candidates = candidates[:self.max_map_tokens]
-            per_scene_candidates.append(candidates)
-
-        max_scene_tokens = max((int(c.numel()) for c in per_scene_candidates), default=0)
-        if max_scene_tokens == 0:
-            return None, None, None, None
-
-        B = len(per_scene_candidates)
-        D = map_features.shape[-1]
-        device = map_features.device
-        map_context = map_features.new_zeros((B, max_scene_tokens, D))
-        packed_map_positions = map_positions.new_zeros((B, max_scene_tokens, 2))
-        packed_map_orientations = map_orientation.new_zeros((B, max_scene_tokens))
-        map_valid_mask = torch.zeros(B, max_scene_tokens, dtype=torch.bool, device=device)
-
-        for seq_idx, keep in enumerate(per_scene_candidates):
-            keep_count = int(keep.numel())
-            if keep_count == 0:
+            if candidates.numel() == 0:
                 continue
 
-            map_context[seq_idx, :keep_count] = map_features[keep]
-            packed_map_positions[seq_idx, :keep_count] = map_positions[keep]
-            packed_map_orientations[seq_idx, :keep_count] = map_orientation[keep]
-            map_valid_mask[seq_idx, :keep_count] = True
+            kept_context.append(map_features[candidates])
+            kept_positions.append(map_positions[candidates])
+            kept_orientations.append(map_orientation[candidates])
+            kept_batch.append(torch.full(
+                (int(candidates.numel()),),
+                seq_idx,
+                dtype=torch.long,
+                device=map_features.device,
+            ))
 
-        return map_context, packed_map_positions, packed_map_orientations, map_valid_mask
+        if not kept_context:
+            return None, None, None, None, None
+
+        map_context = torch.cat(kept_context, dim=0)
+        packed_map_positions = torch.cat(kept_positions, dim=0)
+        packed_map_orientations = torch.cat(kept_orientations, dim=0)
+        packed_map_batch = torch.cat(kept_batch, dim=0)
+        map_valid_mask = torch.ones(
+            map_context.shape[0],
+            dtype=torch.bool,
+            device=map_features.device,
+        )
+        return map_context, packed_map_positions, packed_map_orientations, packed_map_batch, map_valid_mask
+
+    def _token_chunk_world(self, token_ids, agent_types, positions, headings):
+        traj = _lookup_token_trajectories(token_ids, self.token_vocab, agent_types)
+        local_corners = traj[:, 1:1 + self.future_chunk_steps, :, :]
+        cos, sin = headings.cos(), headings.sin()
+        num_tokens = int(token_ids.shape[0])
+        rot = torch.zeros(num_tokens, 2, 2, device=positions.device)
+        rot[:, 0, 0] = cos
+        rot[:, 0, 1] = sin
+        rot[:, 1, 0] = -sin
+        rot[:, 1, 1] = cos
+        world_corners = torch.bmm(local_corners.reshape(num_tokens, -1, 2), rot)
+        world_corners = (
+            world_corners.reshape(num_tokens, self.future_chunk_steps, 4, 2)
+            + positions[:, None, None, :]
+        )
+        world = world_corners.mean(dim=2)
+        diff_xy = world_corners[:, :, 0, :] - world_corners[:, :, 3, :]
+        chunk_heading = torch.atan2(diff_xy[:, :, 1], diff_xy[:, :, 0])
+        return world, chunk_heading
+
+    def _refresh_token_geometry(self, token_ids, packed):
+        """Estimate each future-token node pose from currently unmasked tokens."""
+        positions = packed['token_positions'].clone()
+        headings = packed['token_headings'].clone()
+        C = self.num_future_chunks
+        agent_start_positions = packed['agent_start_positions']
+        agent_start_headings = packed['agent_start_headings']
+        agent_types = packed['agent_types_global']
+
+        for _scene_idx, seq_idx, agent_indices in packed['agent_maps']:
+            num_scene_agents = int(agent_indices.numel())
+            if num_scene_agents == 0:
+                continue
+            offsets = (
+                torch.arange(num_scene_agents, device=token_ids.device).unsqueeze(1) * C
+                + torch.arange(C, device=token_ids.device).unsqueeze(0)
+            )
+            cur_pos = agent_start_positions[agent_indices].clone()
+            cur_heading = agent_start_headings[agent_indices].clone()
+            cur_types = agent_types[agent_indices]
+
+            for chunk_idx in range(C):
+                node_idx = offsets[:, chunk_idx]
+                node_valid = packed['valid_mask'][seq_idx, node_idx]
+                if node_valid.any():
+                    positions[seq_idx, node_idx[node_valid]] = cur_pos[node_valid]
+                    headings[seq_idx, node_idx[node_valid]] = cur_heading[node_valid]
+
+                chunk_tokens = token_ids[seq_idx, node_idx]
+                known = (
+                    node_valid
+                    & (chunk_tokens >= 0)
+                    & (chunk_tokens < self.token_size)
+                    & (chunk_tokens != self.mask_token_id)
+                )
+                if not known.any():
+                    continue
+
+                world, chunk_heading = self._token_chunk_world(
+                    chunk_tokens[known],
+                    cur_types[known],
+                    cur_pos[known],
+                    cur_heading[known],
+                )
+                cur_pos[known] = world[:, -1]
+                cur_heading[known] = chunk_heading[:, -1]
+
+        return positions, headings
 
     # -- future token targets ----------------------------------------------
 
@@ -297,7 +370,8 @@ class SMARTDiffusion(SMART):
     # -- per-scene packing -------------------------------------------------
 
     def _pack_diffusion_sequence(self, tokens, valid, agents_ok, agent_batch,
-                                 agent_positions, agent_headings, agent_context, agent_types):
+                                 agent_positions, agent_headings, agent_context,
+                                 agent_types, agent_shape_embeddings):
         """Pack per-agent future tokens into per-scene padded sequences.
 
         Returns dict with keys: token_ids [B,L], token_positions [B,L,2],
@@ -314,6 +388,7 @@ class SMARTDiffusion(SMART):
         seq_chunk = []
         seq_valid = []
         seq_context = []
+        seq_shape = []
         seq_type = []
         agent_maps = []  # list of (scene_id, start_pos, agent_indices_tensor)
 
@@ -327,6 +402,7 @@ class SMARTDiffusion(SMART):
             gp = agent_positions[ga]  # [n_agents, 2]
             gh = agent_headings[ga]  # [n_agents]
             gc = agent_context[ga]  # [n_agents, D]
+            gs = agent_shape_embeddings[ga]  # [n_agents, D]
             gtype = agent_types[ga].long().clamp(min=0, max=3)
 
             flat_t = gt.reshape(-1)                        # [n_agents*C]
@@ -334,6 +410,7 @@ class SMARTDiffusion(SMART):
             flat_pos = gp.unsqueeze(1).expand(-1, C, -1).reshape(-1, 2)
             flat_head = gh.unsqueeze(1).expand(-1, C).reshape(-1)
             flat_context = gc.unsqueeze(1).expand(-1, C, -1).reshape(-1, gc.shape[-1])
+            flat_shape = gs.unsqueeze(1).expand(-1, C, -1).reshape(-1, gs.shape[-1])
             flat_type = gtype.unsqueeze(1).expand(-1, C).reshape(-1)
             flat_agent = ga.unsqueeze(1).expand(-1, C).reshape(-1)
             cids = torch.arange(C, device=device).unsqueeze(0).expand(
@@ -344,6 +421,7 @@ class SMARTDiffusion(SMART):
             seq_chunk.append(cids)
             seq_valid.append(flat_v)
             seq_context.append(flat_context)
+            seq_shape.append(flat_shape)
             seq_type.append(flat_type)
             agent_maps.append((g, len(seq_tokens) - 1, ga))
 
@@ -365,6 +443,11 @@ class SMARTDiffusion(SMART):
                 dtype=agent_context.dtype,
                 device=device,
             ),
+            'agent_shape_embeddings': torch.zeros(
+                B, max_len, agent_shape_embeddings.shape[-1],
+                dtype=agent_shape_embeddings.dtype,
+                device=device,
+            ),
             'agent_type_ids': torch.zeros(B, max_len, dtype=torch.long, device=device),
         }
         for i in range(B):
@@ -376,10 +459,14 @@ class SMARTDiffusion(SMART):
             packed['chunk_ids'][i, :L] = seq_chunk[i]
             packed['valid_mask'][i, :L] = seq_valid[i]
             packed['agent_context'][i, :L] = seq_context[i]
+            packed['agent_shape_embeddings'][i, :L] = seq_shape[i]
             packed['agent_type_ids'][i, :L] = seq_type[i]
 
         # agent_maps: list of (scene_idx, packed_seq_idx, agent_indices)
         packed['agent_maps'] = agent_maps
+        packed['agent_start_positions'] = agent_positions
+        packed['agent_start_headings'] = agent_headings
+        packed['agent_types_global'] = agent_types.long().clamp(min=0, max=3)
         return packed
 
     # -- training / validation ---------------------------------------------
@@ -405,12 +492,21 @@ class SMARTDiffusion(SMART):
             next_token_idx_gt[next_token_eval_mask],
         )
 
+    def _compute_optional_ntp_loss(self, data, ref_tensor):
+        if self.ntp_aux_loss_weight <= 0.0:
+            return ref_tensor.new_zeros(())
+        return self._compute_ntp_loss(self(data))
+
     def _build_diffusion_inputs(self, data):
         ctx = self.encoder.encode_history_context(data)
         ft, fv, agents_ok = self._build_future_token_targets(data)
         agent_batch = self._get_agent_batch(data)
         agent_pos = data['agent']['position'][:, self.num_historical_steps - 1, :2].float()
         agent_heading = data['agent']['heading'][:, self.num_historical_steps - 1].float()
+        agent_shape = data['agent']['shape']
+        if agent_shape.dim() == 3:
+            agent_shape = agent_shape[:, self.num_historical_steps - 1, :]
+        agent_shape_embeddings = self.encoder.agent_encoder.shape_emb(agent_shape.float())
         agent_context = self._pool_agent_context(
             ctx['x_a_history'],
             ctx['history_token_mask'],
@@ -425,6 +521,7 @@ class SMARTDiffusion(SMART):
             agent_heading,
             agent_context,
             data['agent']['type'],
+            agent_shape_embeddings,
         )
         if packed is None:
             return None, None, ft, fv, agents_ok, agent_batch
@@ -434,7 +531,7 @@ class SMARTDiffusion(SMART):
 
         packed_graph_ids = [m[0] for m in packed['agent_maps']]
         summary = summary[packed_graph_ids]
-        map_context, map_positions, map_orientations, map_valid_mask = self._pack_map_context(
+        map_context, map_positions, map_orientations, map_batch, map_valid_mask = self._pack_map_context(
             data,
             ctx,
             packed,
@@ -443,6 +540,7 @@ class SMARTDiffusion(SMART):
         packed['map_context'] = map_context
         packed['map_positions'] = map_positions
         packed['map_orientations'] = map_orientations
+        packed['map_batch'] = map_batch
         packed['map_valid_mask'] = map_valid_mask
         return packed, summary, ft, fv, agents_ok, agent_batch
 
@@ -455,20 +553,23 @@ class SMARTDiffusion(SMART):
         mask = (torch.rand_like(gt.float()) < mask_prob.unsqueeze(-1)) & packed['valid_mask']
         noisy = gt.clone()
         noisy[mask] = self.mask_token_id
+        token_positions, token_headings = self._refresh_token_geometry(noisy, packed)
 
         logits = self.diffusion_decoder(
             noisy_token_ids=noisy,
-            token_positions=packed['token_positions'],
-            token_headings=packed['token_headings'],
+            token_positions=token_positions,
+            token_headings=token_headings,
             token_agent_ids=packed['token_agent_ids'],
             noisy_token_chunk_ids=packed['chunk_ids'], scene_summary=summary,
             t=t, valid_mask=packed['valid_mask'],
             agent_context=packed['agent_context'],
             agent_type_ids=packed['agent_type_ids'],
+            agent_shape_embeddings=packed['agent_shape_embeddings'],
             physical_token_embeddings=self._physical_token_embeddings(noisy, packed['agent_type_ids']),
             map_context=packed.get('map_context'),
             map_positions=packed.get('map_positions'),
             map_orientations=packed.get('map_orientations'),
+            map_batch=packed.get('map_batch'),
             map_valid_mask=packed.get('map_valid_mask'),
         )
 
@@ -494,8 +595,7 @@ class SMARTDiffusion(SMART):
             return zero_loss
 
         diffusion_loss, mask_acc = self._compute_diffusion_loss(packed, summary)
-        ntp_pred = self(data)
-        ntp_loss = self._compute_ntp_loss(ntp_pred)
+        ntp_loss = self._compute_optional_ntp_loss(data, diffusion_loss)
         loss = diffusion_loss + self.ntp_aux_loss_weight * ntp_loss
 
         self.log('train_empty_diffusion_batch', loss.new_zeros(()),
@@ -521,8 +621,7 @@ class SMARTDiffusion(SMART):
             return
 
         diffusion_loss, mask_acc = self._compute_diffusion_loss(packed, summary)
-        ntp_pred = self(data)
-        ntp_loss = self._compute_ntp_loss(ntp_pred)
+        ntp_loss = self._compute_optional_ntp_loss(data, diffusion_loss)
         total_loss = diffusion_loss + self.ntp_aux_loss_weight * ntp_loss
 
         self.log('val_empty_diffusion_batch', total_loss.new_zeros(()),
@@ -587,10 +686,11 @@ class SMARTDiffusion(SMART):
     def _diffusion_sample(self, summary, token_positions, token_headings, token_agent_ids,
                           chunk_ids, valid_mask, agent_context, agent_type_ids,
                           map_context=None, map_positions=None, map_orientations=None,
-                          map_valid_mask=None):
+                          map_batch=None, map_valid_mask=None, agent_shape_embeddings=None,
+                          packed=None):
         """Iteratively denoise masked future tokens (MDLM-style).
 
-        Returns: [B, L] long, sampled token IDs.
+        Returns: ([B, L] long sampled token IDs, [B, L] token confidence).
         """
         B, L = valid_mask.shape
         device = summary.device
@@ -598,11 +698,14 @@ class SMARTDiffusion(SMART):
 
         x = torch.full((B, L), self.mask_token_id, dtype=torch.long, device=device)
         mask = valid_mask.clone()
+        confidence_out = summary.new_zeros((B, L))
 
         for step in range(S):
             t_cur = max(1.0 - step / S, self.min_t)
             t_next = max(1.0 - (step + 1) / S, self.min_t)
             t_batch = torch.full((B,), t_cur, device=device)
+            if packed is not None:
+                token_positions, token_headings = self._refresh_token_geometry(x, packed)
 
             logits = self.diffusion_decoder(
                 noisy_token_ids=x,
@@ -613,17 +716,21 @@ class SMARTDiffusion(SMART):
                 t=t_batch, valid_mask=valid_mask,
                 agent_context=agent_context,
                 agent_type_ids=agent_type_ids,
+                agent_shape_embeddings=agent_shape_embeddings,
                 physical_token_embeddings=self._physical_token_embeddings(x, agent_type_ids),
                 map_context=map_context,
                 map_positions=map_positions,
                 map_orientations=map_orientations,
+                map_batch=map_batch,
                 map_valid_mask=map_valid_mask,
             )
             probs = F.softmax(logits, dim=-1)
 
             if step == S - 1 or t_next <= self.min_t:
                 if mask.any():
-                    x[mask] = logits[mask].argmax(dim=-1)
+                    final_prob, final_ids = probs[mask].max(dim=-1)
+                    x[mask] = final_ids
+                    confidence_out[mask] = final_prob
                 mask.zero_()
             else:
                 _, p_next, _ = self.noise_schedule(torch.tensor(t_next, device=device))
@@ -650,9 +757,14 @@ class SMARTDiffusion(SMART):
                         1,
                     ).squeeze(-1)
                     x[batch_idx, selected] = sampled
+                    selected_prob = probs[batch_idx, selected].gather(
+                        -1,
+                        sampled.unsqueeze(-1),
+                    ).squeeze(-1)
+                    confidence_out[batch_idx, selected] = selected_prob
                     mask[batch_idx, selected] = False
 
-        return x.masked_fill(~valid_mask, 0)
+        return x.masked_fill(~valid_mask, 0), confidence_out.masked_fill(~valid_mask, 0.0)
 
     # -- full inference ----------------------------------------------------
 
@@ -664,7 +776,7 @@ class SMARTDiffusion(SMART):
         if packed is None:
             return None
 
-        sampled_ids = self._diffusion_sample(
+        sampled_ids, sampled_confidence = self._diffusion_sample(
             summary=summary,
             token_positions=packed['token_positions'],
             token_headings=packed['token_headings'],
@@ -672,18 +784,21 @@ class SMARTDiffusion(SMART):
             chunk_ids=packed['chunk_ids'], valid_mask=packed['valid_mask'],
             agent_context=packed['agent_context'],
             agent_type_ids=packed['agent_type_ids'],
+            agent_shape_embeddings=packed['agent_shape_embeddings'],
             map_context=packed.get('map_context'),
             map_positions=packed.get('map_positions'),
             map_orientations=packed.get('map_orientations'),
+            map_batch=packed.get('map_batch'),
             map_valid_mask=packed.get('map_valid_mask'),
+            packed=packed,
         )
 
         return self._decode_trajectories(data, sampled_ids, packed, agents_ok,
-                                         agent_batch, ft, fv)
+                                         agent_batch, ft, fv, sampled_confidence)
 
     @torch.no_grad()
     def _decode_trajectories(self, data, sampled_ids, packed, agents_ok,
-                             agent_batch, gt_tokens, gt_valid):
+                             agent_batch, gt_tokens, gt_valid, sampled_confidence=None):
         """Unpack per-scene tokens → per-agent trajectories via chain decode."""
         device = sampled_ids.device
         C = self.num_future_chunks
@@ -693,13 +808,17 @@ class SMARTDiffusion(SMART):
 
         # Unpack: for each scene, map sequence positions back to agent indices
         per_agent_tokens = torch.full((num_agents, C), -1, dtype=torch.long, device=device)
-        for g, seq_idx, ag_indices in packed['agent_maps']:
+        per_agent_confidence = torch.zeros(num_agents, C, device=device)
+        for _g, seq_idx, ag_indices in packed['agent_maps']:
             seq = sampled_ids[seq_idx]      # [L]
+            seq_confidence = None if sampled_confidence is None else sampled_confidence[seq_idx]
             for ai_local, ag_idx in enumerate(ag_indices.tolist()):
                 start = ai_local * C
                 end = start + C
                 token_slice = seq[start:end]
                 per_agent_tokens[ag_idx] = token_slice
+                if seq_confidence is not None:
+                    per_agent_confidence[ag_idx] = seq_confidence[start:end]
 
         # Chain decode: for each future chunk, apply token trajectory
         # relative to agent's current pose, then advance pose
@@ -714,7 +833,6 @@ class SMARTDiffusion(SMART):
 
         pos = hist_pose.clone()
         heading = hist_heading.clone()
-        vocab = self.token_vocab
 
         for c in range(C):
             frame_start = c * shift
@@ -733,28 +851,12 @@ class SMARTDiffusion(SMART):
 
             active_tokens = chunk_tokens[decode_mask]
             active_types = agent_types[decode_mask]
-            traj = _lookup_token_trajectories(active_tokens, vocab, active_types)
-            # traj: [A, 6, 4, 2] - use steps 1..shift and skip the reference frame.
-            local_corners = traj[:, 1:1 + shift, :, :]
-
-            active_heading = heading[decode_mask]
-            cos, sin = active_heading.cos(), active_heading.sin()
-            num_active = int(active_tokens.shape[0])
-            rot = torch.zeros(num_active, 2, 2, device=device)
-            rot[:, 0, 0] = cos
-            rot[:, 0, 1] = sin
-            rot[:, 1, 0] = -sin
-            rot[:, 1, 1] = cos
-
-            # Rotate local token boxes to world coordinates, then derive centers/headings.
-            world_corners = torch.bmm(local_corners.reshape(num_active, -1, 2), rot)
-            world_corners = (
-                world_corners.reshape(num_active, shift, 4, 2)
-                + pos[decode_mask, None, None, :]
+            world, chunk_heading = self._token_chunk_world(
+                active_tokens,
+                active_types,
+                pos[decode_mask],
+                heading[decode_mask],
             )
-            world = world_corners.mean(dim=2)
-            diff_xy = world_corners[:, :, 0, :] - world_corners[:, :, 3, :]
-            chunk_heading = torch.atan2(diff_xy[:, :, 1], diff_xy[:, :, 0])
 
             pred_traj[decode_mask, frame_start:frame_end] = world[:, :n_frames]
             pred_head[decode_mask, frame_start:frame_end] = chunk_heading[:, :n_frames]
@@ -779,5 +881,5 @@ class SMARTDiffusion(SMART):
             'next_token_idx': pred_token_ids,
             'next_token_idx_gt': gt_tokens,
             'next_token_eval_mask': gt_valid,
-            'pred_prob': torch.zeros(num_agents, C, device=device),
+            'pred_prob': per_agent_confidence,
         }

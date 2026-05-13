@@ -37,8 +37,10 @@ Maintain this repository as the primary implementation repo for SMART baseline r
 1. Use the code graph for architecture and symbol discovery.
 2. Read only the files needed to execute the current task.
 3. Keep SMART-Diffusion aligned with SMART/QCNet-style graph-relative geometry: raw coordinates may be used for neighbor search, but embeddings should consume edge-relative features.
-4. After meaningful work, update `docs/progress.md` and refresh `docs/next.md`.
-5. Update `docs/spec.md` and `docs/decisions.md` only when project direction or durable decisions change.
+4. Represent diffusion map context as flat/ragged tokens with packed-scene batch ids, not per-scene padding.
+5. Refresh future-token graph geometry from currently unmasked diffusion tokens during training and sampling.
+6. After meaningful work, update `docs/progress.md` and refresh `docs/next.md`.
+7. Update `docs/spec.md` and `docs/decisions.md` only when project direction or durable decisions change.
 
 ## Risks
 

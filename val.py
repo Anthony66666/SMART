@@ -1,6 +1,7 @@
 
 from argparse import ArgumentParser
 import pytorch_lightning as pl
+from pytorch_lightning.strategies import DDPStrategy
 from torch_geometric.loader import DataLoader
 from smart.datasets.scalable_dataset import MultiDataset
 from smart.model import SMART
@@ -11,6 +12,18 @@ from smart.utils.log import Logging
 from smart.utils.torch_compat import register_checkpoint_safe_globals
 
 register_checkpoint_safe_globals()
+
+
+def build_strategy(trainer_config):
+    strategy_name = getattr(trainer_config, 'strategy', None)
+    if strategy_name in (None, "", "auto"):
+        return "auto"
+    if strategy_name == "ddp_find_unused_parameters_false":
+        return DDPStrategy(find_unused_parameters=False, gradient_as_bucket_view=True)
+    if strategy_name == "ddp_find_unused_parameters_true":
+        return DDPStrategy(find_unused_parameters=True, gradient_as_bucket_view=True)
+    return strategy_name
+
 
 if __name__ == '__main__':
     pl.seed_everything(2, workers=True)
@@ -47,7 +60,11 @@ if __name__ == '__main__':
                                     logger=logger)
 
     trainer_config = config.Trainer
+    strategy = build_strategy(trainer_config)
     trainer = pl.Trainer(accelerator=trainer_config.accelerator,
                          devices=trainer_config.devices,
-                         strategy='ddp', num_sanity_val_steps=0)
+                         strategy=strategy,
+                         num_nodes=getattr(trainer_config, 'num_nodes', 1),
+                         precision=getattr(trainer_config, 'precision', 32),
+                         num_sanity_val_steps=0)
     trainer.validate(model, dataloader)

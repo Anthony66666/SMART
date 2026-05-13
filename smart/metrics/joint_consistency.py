@@ -33,8 +33,8 @@ def _agent_bbox_corners(positions, headings, shapes):
 
     rot = torch.zeros(A, T, 2, 2, device=device)
     rot[..., 0, 0] = cos.squeeze(-1)
-    rot[..., 0, 1] = -sin.squeeze(-1)
-    rot[..., 1, 0] = sin.squeeze(-1)
+    rot[..., 0, 1] = sin.squeeze(-1)
+    rot[..., 1, 0] = -sin.squeeze(-1)
     rot[..., 1, 1] = cos.squeeze(-1)
 
     rotated = torch.matmul(local_corners.expand(-1, T, -1, -1), rot)
