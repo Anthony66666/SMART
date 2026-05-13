@@ -82,4 +82,5 @@ Model:
     use_type_embedding: true
     use_map_context: true
     max_map_tokens: 0  # 0 disables scene-level truncation and follows SMART radius map-agent selection.
+    geometry_dropout_prob: 0.25
     freeze_encoder: false

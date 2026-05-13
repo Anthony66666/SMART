@@ -1,6 +1,13 @@
 # Progress
 
 ## 2026-05-13 CST
+- Task: Added SMART-Diffusion training-time geometry dropout to reduce teacher-forced geometry mismatch.
+- Result: `_refresh_token_geometry` now accepts a `geometry_known_mask`; diffusion loss randomly drops a configurable fraction of visible GT tokens from geometry-chain advancement during training while keeping token inputs unchanged. Diffusion train configs set `geometry_dropout_prob: 0.25`; validation sets `0.0`.
+- Files: `smart/model/smart_diffusion.py`, `configs/train/train_scalable_diffusion.yaml`, `configs/train/train_scalable_diffusion_local.yaml`, `configs/validation/validation_scalable_diffusion.yaml`
+- Validation: `py_compile` passed; real-batch geometry check confirmed dropout changes refreshed positions while keeping finite tensors.
+- Next: Run a longer GPU training smoke and inspect whether early visualizations reduce straight-line collapse without destabilizing diffusion loss.
+
+## 2026-05-13 CST
 - Task: Implemented SMART-Diffusion audit fixes for training speed, map memory, dynamic geometry, trainer config handling, and diagnostics.
 - Result: `ntp_aux_loss_weight <= 0` now skips the NTP forward pass; diffusion map context is flat/ragged with packed-scene batch ids; future-token positions/headings refresh from currently unmasked tokens during training and sampling; token conditioning includes SMART agent shape embeddings; `train.py`/`val.py` respect yaml strategy and precision; `ConflictRate` bbox rotation now matches SMART decode; `pred_prob` now carries token-level diffusion selection confidence.
 - Files: `smart/model/smart_diffusion.py`, `smart/modules/diffusion_decoder.py`, `train.py`, `val.py`, `smart/metrics/joint_consistency.py`

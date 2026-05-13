@@ -71,6 +71,8 @@ class SMARTDiffusion(SMART):
         self.use_type_embedding = bool(getattr(diffusion_cfg, 'use_type_embedding', True))
         self.use_map_context = bool(getattr(diffusion_cfg, 'use_map_context', True))
         self.max_map_tokens = int(getattr(diffusion_cfg, 'max_map_tokens', 128))
+        self.geometry_dropout_prob = float(getattr(diffusion_cfg, 'geometry_dropout_prob', 0.0))
+        self.geometry_dropout_prob = min(max(self.geometry_dropout_prob, 0.0), 1.0)
         self.diffusion_eval_batches = int(getattr(diffusion_cfg, 'eval_inference_batches', 2))
         token_size = int(getattr(model_config.decoder, 'token_size', 2048))
 
@@ -297,7 +299,7 @@ class SMARTDiffusion(SMART):
         chunk_heading = torch.atan2(diff_xy[:, :, 1], diff_xy[:, :, 0])
         return world, chunk_heading
 
-    def _refresh_token_geometry(self, token_ids, packed):
+    def _refresh_token_geometry(self, token_ids, packed, geometry_known_mask=None):
         """Estimate each future-token node pose from currently unmasked tokens."""
         positions = packed['token_positions'].clone()
         headings = packed['token_headings'].clone()
@@ -320,18 +322,20 @@ class SMARTDiffusion(SMART):
 
             for chunk_idx in range(C):
                 node_idx = offsets[:, chunk_idx]
-                node_valid = packed['valid_mask'][seq_idx, node_idx]
-                if node_valid.any():
-                    positions[seq_idx, node_idx[node_valid]] = cur_pos[node_valid]
-                    headings[seq_idx, node_idx[node_valid]] = cur_heading[node_valid]
+                node_has_gt = packed['valid_mask'][seq_idx, node_idx]
+                if node_has_gt.any():
+                    positions[seq_idx, node_idx[node_has_gt]] = cur_pos[node_has_gt]
+                    headings[seq_idx, node_idx[node_has_gt]] = cur_heading[node_has_gt]
 
                 chunk_tokens = token_ids[seq_idx, node_idx]
                 known = (
-                    node_valid
+                    node_has_gt
                     & (chunk_tokens >= 0)
                     & (chunk_tokens < self.token_size)
                     & (chunk_tokens != self.mask_token_id)
                 )
+                if geometry_known_mask is not None:
+                    known = known & geometry_known_mask[seq_idx, node_idx].bool()
                 if not known.any():
                     continue
 
@@ -553,7 +557,15 @@ class SMARTDiffusion(SMART):
         mask = (torch.rand_like(gt.float()) < mask_prob.unsqueeze(-1)) & packed['valid_mask']
         noisy = gt.clone()
         noisy[mask] = self.mask_token_id
-        token_positions, token_headings = self._refresh_token_geometry(noisy, packed)
+        geometry_known_mask = (~mask) & packed['valid_mask']
+        if self.training and self.geometry_dropout_prob > 0.0:
+            geometry_keep = torch.rand_like(gt.float()) >= self.geometry_dropout_prob
+            geometry_known_mask = geometry_known_mask & geometry_keep
+        token_positions, token_headings = self._refresh_token_geometry(
+            noisy,
+            packed,
+            geometry_known_mask=geometry_known_mask,
+        )
 
         logits = self.diffusion_decoder(
             noisy_token_ids=noisy,
