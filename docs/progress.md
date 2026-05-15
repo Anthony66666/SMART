@@ -1,5 +1,13 @@
 # Progress
 
+## 2026-05-15 18:24 CST
+- Task: Implemented temporal block diffusion for SMART-Diffusion.
+- Result: Diffusion training now samples one temporal block per step, masks/losses only the current block, conditions on previous blocks, and excludes future blocks from decoder attention. Inference now samples future tokens block by block while reusing the existing MaskGIT remask sampler inside each block. Diffusion train/validation configs enable 4-chunk blocks with 8 denoising steps and use DDP unused-parameter detection.
+- Files: `smart/model/smart_diffusion.py`, `configs/train/train_scalable_diffusion.yaml`, `configs/train/train_scalable_diffusion_local.yaml`, `configs/validation/validation_scalable_diffusion.yaml`, `docs/spec.md`, `docs/decisions.md`, `docs/progress.md`, `docs/next.md`
+- Validation: `py_compile` passed; targeted checks passed for block range coverage, current-block-only masks, previous/current decoder visibility, future-block exclusion, config loading, block loss masking, and block sampler fill behavior.
+- Open: Real dataset train/validation smoke was not run in this turn.
+- Next: Run one local train batch and one validation inference with the block config, then inspect step visualizations for trajectory continuity, map adherence, and collisions.
+
 ## 2026-05-15 CST
 - Task: Implemented SMART-Diffusion stability and fair-comparison upgrades.
 - Result: Diffusion now uses quasi-random timestep sampling that works at batch size 1, exact-count low-variance masks, alternating antithetic token ranking, target-category-only training/evaluation by default, 6-layer diffusion configs, 32-step sampling, and MaskGIT-style remask/resample inference. Validation visualization now shows prediction/GT futures only for target-category agents while keeping other agents as context.

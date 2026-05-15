@@ -25,7 +25,7 @@ Dataset:
   <<: *time_info
 
 Trainer:
-  strategy: ddp_find_unused_parameters_false
+  strategy: ddp_find_unused_parameters_true
   accelerator: "gpu"
   devices: 14
   max_epochs: 32
@@ -89,4 +89,9 @@ Model:
     antithetic_mask_ranking: true
     remask_sampling: true
     remask_confidence_temperature: 1.0
+    block_training: true
+    block_size_chunks: 4
+    block_denoise_steps: 8
+    block_mask_prob_min: 0.3
+    block_mask_prob_max: 0.85
     freeze_encoder: false

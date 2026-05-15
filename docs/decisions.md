@@ -76,3 +76,10 @@
 - Decision: Use quasi-random timestep sampling across global steps, exact-count masked token selection with alternating antithetic ranking, 6-layer diffusion decoding, and MaskGIT-style remask/resample sampling by default.
 - Why: This directly targets training variance, capacity mismatch with SMART, and early denoising error lock-in without changing SMART tokenization.
 - Impact: Diffusion configs default to `num_layers: 6`, `num_steps: 32`, exact low-variance masking, and `remask_sampling: true`.
+
+## Decision: Use temporal block diffusion for SMART-Diffusion
+- Date: 2026-05-15
+- Context: Full-horizon diffusion denoises all 16 future chunks at once, which makes early sampling weakly conditioned and leaves later chunks without generated trajectory context.
+- Decision: Default SMART-Diffusion to 4-chunk temporal blocks with 8 denoising steps per block. Training masks and supervises only the current block while conditioning on previous GT blocks; inference samples blocks autoregressively and conditions later blocks on earlier sampled blocks.
+- Why: This adapts Block Diffusion's block-autoregressive idea to SMART trajectory tokens without replacing SMART's graph decoder or token vocabulary.
+- Impact: Diffusion configs include `block_training`, `block_size_chunks`, `block_denoise_steps`, and block mask-probability bounds. Full-horizon diffusion remains available by disabling block training or setting the block size to cover all future chunks.
