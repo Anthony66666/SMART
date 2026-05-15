@@ -73,8 +73,8 @@ Model:
     time_span: 30
   diffusion:
     future_chunk_steps: 5
-    num_steps: 16
-    num_layers: 2
+    num_steps: 32
+    num_layers: 6
     eps: 1.0e-3
     min_t: 1.0e-3
     ntp_aux_loss_weight: 0.2
@@ -83,4 +83,10 @@ Model:
     use_map_context: true
     max_map_tokens: 0  # 0 disables scene-level truncation and follows SMART radius map-agent selection.
     geometry_dropout_prob: 0.25
+    target_category_only: true
+    low_variance_masking: true
+    mask_count_mode: exact
+    antithetic_mask_ranking: true
+    remask_sampling: true
+    remask_confidence_temperature: 1.0
     freeze_encoder: false

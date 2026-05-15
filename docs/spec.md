@@ -39,8 +39,9 @@ Maintain this repository as the primary implementation repo for SMART baseline r
 3. Keep SMART-Diffusion aligned with SMART/QCNet-style graph-relative geometry: raw coordinates may be used for neighbor search, but embeddings should consume edge-relative features.
 4. Represent diffusion map context as flat/ragged tokens with packed-scene batch ids, not per-scene padding.
 5. Refresh future-token graph geometry from currently unmasked diffusion tokens during training and sampling, with training-time geometry dropout to reduce train/inference mismatch.
-6. After meaningful work, update `docs/progress.md` and refresh `docs/next.md`.
-7. Update `docs/spec.md` and `docs/decisions.md` only when project direction or durable decisions change.
+6. Train SMART-Diffusion with low-variance timestep/mask selection, SMART target-category alignment, and MaskGIT-style remask/resample sampling.
+7. After meaningful work, update `docs/progress.md` and refresh `docs/next.md`.
+8. Update `docs/spec.md` and `docs/decisions.md` only when project direction or durable decisions change.
 
 ## Risks
 

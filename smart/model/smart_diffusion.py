@@ -61,8 +61,8 @@ class SMARTDiffusion(SMART):
                 f"diffusion.future_chunk_steps ({self.future_chunk_steps}) must equal "
                 f"agent_encoder.shift ({agent_shift})."
             )
-        self.diffusion_num_steps = int(getattr(diffusion_cfg, 'num_steps', 16))
-        self.diffusion_num_layers = int(getattr(diffusion_cfg, 'num_layers', 2))
+        self.diffusion_num_steps = int(getattr(diffusion_cfg, 'num_steps', 32))
+        self.diffusion_num_layers = int(getattr(diffusion_cfg, 'num_layers', 6))
         self.diffusion_eps = float(getattr(diffusion_cfg, 'eps', 1e-3))
         self.min_t = float(getattr(diffusion_cfg, 'min_t', 1e-3))
         self.freeze_encoder = bool(getattr(diffusion_cfg, 'freeze_encoder', False))
@@ -73,6 +73,13 @@ class SMARTDiffusion(SMART):
         self.max_map_tokens = int(getattr(diffusion_cfg, 'max_map_tokens', 128))
         self.geometry_dropout_prob = float(getattr(diffusion_cfg, 'geometry_dropout_prob', 0.0))
         self.geometry_dropout_prob = min(max(self.geometry_dropout_prob, 0.0), 1.0)
+        self.target_category_only = bool(getattr(diffusion_cfg, 'target_category_only', True))
+        self.low_variance_masking = bool(getattr(diffusion_cfg, 'low_variance_masking', True))
+        self.mask_count_mode = str(getattr(diffusion_cfg, 'mask_count_mode', 'exact')).lower()
+        self.antithetic_mask_ranking = bool(getattr(diffusion_cfg, 'antithetic_mask_ranking', True))
+        self.remask_sampling = bool(getattr(diffusion_cfg, 'remask_sampling', True))
+        self.remask_confidence_temperature = float(getattr(diffusion_cfg, 'remask_confidence_temperature', 1.0))
+        self.remask_confidence_temperature = max(self.remask_confidence_temperature, 1e-6)
         self.diffusion_eval_batches = int(getattr(diffusion_cfg, 'eval_inference_batches', 2))
         token_size = int(getattr(model_config.decoder, 'token_size', 2048))
 
@@ -201,15 +208,102 @@ class SMARTDiffusion(SMART):
             return zero
         return next(self.parameters()).sum() * 0.0
 
-    def _sample_diffusion_timesteps(self, batch_size, device):
-        """Low-discrepancy stratified samples in [min_t, 1]."""
-        if batch_size <= 1:
+    def _current_step_rank(self):
+        step = 0
+        rank = 0
+        try:
+            step = int(self.global_step)
+        except Exception:
+            step = int(getattr(self, '_manual_global_step', 0))
+        try:
+            trainer = self.trainer
+            rank = int(getattr(trainer, 'global_rank', 0))
+        except Exception:
+            try:
+                rank = int(getattr(self, 'global_rank', 0))
+            except Exception:
+                rank = 0
+        return step, rank
+
+    def _sample_diffusion_timesteps(self, batch_size, device, step=None, rank=None):
+        """Low-discrepancy samples in [min_t, 1], including batch_size=1."""
+        if batch_size <= 0:
+            return torch.empty(0, device=device)
+        if step is None or rank is None:
+            current_step, current_rank = self._current_step_rank()
+            step = current_step if step is None else step
+            rank = current_rank if rank is None else rank
+
+        if self.low_variance_masking:
+            golden_ratio_inv = 0.6180339887498949
+            offsets = torch.arange(batch_size, device=device, dtype=torch.float)
+            base = float(step * max(1, batch_size) + rank * 104729)
+            unit_t = torch.frac((offsets + base + 0.5) * golden_ratio_inv)
+        elif batch_size <= 1:
             unit_t = torch.rand(batch_size, device=device)
         else:
             strata = torch.arange(batch_size, device=device, dtype=torch.float)
             unit_t = (strata + torch.rand(batch_size, device=device)) / float(batch_size)
             unit_t = unit_t[torch.randperm(batch_size, device=device)]
         return self.min_t + (1.0 - self.min_t) * unit_t
+
+    def _mask_ranking_scores(self, shape, device, step=None, rank=None):
+        if step is None or rank is None:
+            current_step, current_rank = self._current_step_rank()
+            step = current_step if step is None else step
+            rank = current_rank if rank is None else rank
+        B, L = shape
+        golden_ratio_inv = 0.6180339887498949
+        batch_axis = torch.arange(B, device=device, dtype=torch.float).unsqueeze(1)
+        token_axis = torch.arange(L, device=device, dtype=torch.float).unsqueeze(0)
+        pair_step = int(step) // 2 if self.antithetic_mask_ranking else int(step)
+        scores = torch.frac(
+            (
+                token_axis
+                + 0.37 * batch_axis
+                + 0.754877666 * float(pair_step)
+                + 0.56984029 * float(rank)
+            )
+            * golden_ratio_inv
+        )
+        if self.antithetic_mask_ranking and int(step) % 2 == 1:
+            scores = 1.0 - scores
+        return scores
+
+    def _sample_training_mask(self, valid_mask, mask_prob, step=None, rank=None):
+        if (
+            not self.low_variance_masking
+            or self.mask_count_mode != 'exact'
+        ):
+            return (torch.rand_like(valid_mask.float()) < mask_prob.unsqueeze(-1)) & valid_mask
+
+        mask = torch.zeros_like(valid_mask)
+        scores = self._mask_ranking_scores(valid_mask.shape, valid_mask.device, step=step, rank=rank)
+        scores = scores.masked_fill(~valid_mask, float('inf'))
+        for batch_idx in range(valid_mask.shape[0]):
+            valid_count = int(valid_mask[batch_idx].sum().item())
+            if valid_count <= 0:
+                continue
+            prob = float(mask_prob[batch_idx].detach().clamp(0.0, 1.0).item())
+            mask_count = int(round(prob * valid_count))
+            mask_count = min(max(mask_count, 0), valid_count)
+            if mask_count <= 0:
+                continue
+            selected = torch.topk(scores[batch_idx], k=mask_count, largest=False).indices
+            mask[batch_idx, selected] = True
+        return mask
+
+    def _target_agent_mask(self, data):
+        target = (
+            data['agent']['valid_mask'][:, self.num_historical_steps - 1].bool()
+            & (data['agent']['type'] != 3)
+        )
+        if self.target_category_only:
+            try:
+                target = target & (data['agent']['category'].long() == 3)
+            except Exception:
+                pass
+        return target
 
     def _get_map_batch(self, data):
         if isinstance(data, Batch) and 'batch' in data['pt_token']:
@@ -364,11 +458,7 @@ class SMARTDiffusion(SMART):
         future_slice = slice(h, h + self.num_future_chunks)
         tokens = data['agent']['token_idx'][:, future_slice].long()
         valid = data['agent']['agent_valid_mask'][:, future_slice].bool()
-        agents_ok = (
-            data['agent']['valid_mask'][:, self.num_historical_steps - 1].bool()
-            & (data['agent']['type'] != 3)
-            & valid.any(dim=-1)
-        )
+        agents_ok = self._target_agent_mask(data) & valid.any(dim=-1)
         return tokens, valid, agents_ok
 
     # -- per-scene packing -------------------------------------------------
@@ -554,7 +644,7 @@ class SMARTDiffusion(SMART):
         sigma_t, mask_prob, dsigma_t = self.noise_schedule(t)
 
         gt = packed['token_ids']
-        mask = (torch.rand_like(gt.float()) < mask_prob.unsqueeze(-1)) & packed['valid_mask']
+        mask = self._sample_training_mask(packed['valid_mask'], mask_prob)
         noisy = gt.clone()
         noisy[mask] = self.mask_token_id
         geometry_known_mask = (~mask) & packed['valid_mask']
@@ -655,10 +745,7 @@ class SMARTDiffusion(SMART):
         if self.inference_token and batch_idx < self.diffusion_eval_batches:
             pred_out = self.inference(data)
             if pred_out is not None:
-                em = (
-                    data['agent']['valid_mask'][:, self.num_historical_steps - 1]
-                    & (data['agent']['type'] != 3)
-                )
+                em = self._target_agent_mask(data)
                 if not em.any():
                     return
                 pred_valid = pred_out.get('pred_valid_mask', pred_out['valid_mask'])
@@ -699,8 +786,8 @@ class SMARTDiffusion(SMART):
                           chunk_ids, valid_mask, agent_context, agent_type_ids,
                           map_context=None, map_positions=None, map_orientations=None,
                           map_batch=None, map_valid_mask=None, agent_shape_embeddings=None,
-                          packed=None):
-        """Iteratively denoise masked future tokens (MDLM-style).
+                          packed=None, return_trace=False):
+        """Iteratively denoise masked future tokens with optional remasking.
 
         Returns: ([B, L] long sampled token IDs, [B, L] token confidence).
         """
@@ -711,6 +798,7 @@ class SMARTDiffusion(SMART):
         x = torch.full((B, L), self.mask_token_id, dtype=torch.long, device=device)
         mask = valid_mask.clone()
         confidence_out = summary.new_zeros((B, L))
+        trace = []
 
         for step in range(S):
             t_cur = max(1.0 - step / S, self.min_t)
@@ -736,47 +824,82 @@ class SMARTDiffusion(SMART):
                 map_batch=map_batch,
                 map_valid_mask=map_valid_mask,
             )
-            probs = F.softmax(logits, dim=-1)
+            probs = F.softmax(logits / self.remask_confidence_temperature, dim=-1)
 
             if step == S - 1 or t_next <= self.min_t:
                 if mask.any():
                     final_prob, final_ids = probs[mask].max(dim=-1)
                     x[mask] = final_ids
                     confidence_out[mask] = final_prob
+                if return_trace:
+                    trace.append({
+                        'step': step,
+                        'masked_before': int(mask.sum().item()),
+                        'masked_after': 0,
+                        'remasked': 0,
+                    })
                 mask.zero_()
             else:
                 _, p_next, _ = self.noise_schedule(torch.tensor(t_next, device=device))
                 p_next_value = float(p_next.item())
-                confidence = probs.max(dim=-1).values
+                masked_before = int(mask.sum().item())
+
+                if mask.any():
+                    sampled = torch.multinomial(
+                        probs[mask].clamp(min=1e-10),
+                        1,
+                    ).squeeze(-1)
+                    x[mask] = sampled
+                    selected_prob = probs[mask].gather(-1, sampled.unsqueeze(-1)).squeeze(-1)
+                    confidence_out[mask] = selected_prob
+
+                token_confidence = confidence_out.clone()
+                known_valid = valid_mask & (x != self.mask_token_id)
+                if known_valid.any():
+                    safe_x = x.clamp(min=0, max=self.token_size - 1)
+                    token_confidence[known_valid] = probs.gather(
+                        -1,
+                        safe_x.unsqueeze(-1),
+                    ).squeeze(-1)[known_valid]
+                token_confidence = token_confidence.masked_fill(~valid_mask, float('inf'))
+
+                next_mask = torch.zeros_like(mask)
                 for batch_idx in range(B):
                     valid_count = int(valid_mask[batch_idx].sum().item())
                     if valid_count == 0:
                         continue
-                    current_masked = int(mask[batch_idx].sum().item())
-                    target_masked = int(round(p_next_value * valid_count))
-                    to_unmask = max(0, current_masked - target_masked)
-                    if to_unmask <= 0:
-                        continue
-
-                    candidate_indices = torch.nonzero(mask[batch_idx], as_tuple=False).squeeze(-1)
+                    candidate_mask = valid_mask[batch_idx] if self.remask_sampling else mask[batch_idx]
+                    candidate_indices = torch.nonzero(candidate_mask, as_tuple=False).squeeze(-1)
                     if candidate_indices.numel() == 0:
                         continue
-                    k = min(to_unmask, int(candidate_indices.numel()))
-                    topk_local = torch.topk(confidence[batch_idx, candidate_indices], k=k).indices
-                    selected = candidate_indices[topk_local]
-                    sampled = torch.multinomial(
-                        probs[batch_idx, selected].clamp(min=1e-10),
-                        1,
-                    ).squeeze(-1)
-                    x[batch_idx, selected] = sampled
-                    selected_prob = probs[batch_idx, selected].gather(
-                        -1,
-                        sampled.unsqueeze(-1),
-                    ).squeeze(-1)
-                    confidence_out[batch_idx, selected] = selected_prob
-                    mask[batch_idx, selected] = False
+                    target_masked = int(round(p_next_value * valid_count))
+                    target_masked = min(max(target_masked, 0), int(candidate_indices.numel()))
+                    if target_masked <= 0:
+                        continue
+                    low_conf_local = torch.topk(
+                        token_confidence[batch_idx, candidate_indices],
+                        k=target_masked,
+                        largest=False,
+                    ).indices
+                    next_mask[batch_idx, candidate_indices[low_conf_local]] = True
 
-        return x.masked_fill(~valid_mask, 0), confidence_out.masked_fill(~valid_mask, 0.0)
+                remasked = next_mask & valid_mask
+                x[remasked] = self.mask_token_id
+                confidence_out[remasked] = 0.0
+                if return_trace:
+                    trace.append({
+                        'step': step,
+                        'masked_before': masked_before,
+                        'masked_after': int(next_mask.sum().item()),
+                        'remasked': int((next_mask & ~mask).sum().item()),
+                    })
+                mask = next_mask
+
+        out = x.masked_fill(~valid_mask, 0)
+        conf = confidence_out.masked_fill(~valid_mask, 0.0)
+        if return_trace:
+            return out, conf, trace
+        return out, conf
 
     # -- full inference ----------------------------------------------------
 

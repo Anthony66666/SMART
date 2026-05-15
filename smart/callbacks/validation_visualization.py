@@ -104,6 +104,7 @@ def save_validation_visualization(
     hist_steps = data["agent"]["valid_mask"].shape[1] - prediction["gt"].shape[1]
     current_step = hist_steps - 1
     valid_agents = data["agent"]["valid_mask"][:, current_step] & (data["agent"]["type"] != 3)
+    target_agents = _target_agent_mask(data, prediction, current_step)
     if valid_agents.any():
         agent_indices = torch.nonzero(valid_agents, as_tuple=False).squeeze(-1)
     else:
@@ -122,7 +123,18 @@ def save_validation_visualization(
     ax.set_title(title)
 
     _draw_map(ax, data)
-    _draw_agents(ax, data, prediction, agent_indices, current_step, hist_steps, av_index, Polygon, Circle)
+    _draw_agents(
+        ax,
+        data,
+        prediction,
+        agent_indices,
+        target_agents,
+        current_step,
+        hist_steps,
+        av_index,
+        Polygon,
+        Circle,
+    )
 
     ax.set_aspect("equal", adjustable="box")
     ax.grid(True, linestyle=":", alpha=0.25)
@@ -158,6 +170,7 @@ def _draw_agents(
     data,
     prediction,
     agent_indices,
+    target_agents,
     current_step,
     hist_steps,
     av_index,
@@ -166,6 +179,7 @@ def _draw_agents(
 ) -> None:
     for agent_index in agent_indices.tolist():
         is_ego = agent_index == av_index
+        is_target = bool(target_agents[agent_index].item()) if target_agents.numel() > agent_index else False
         color = "#8f63d2" if is_ego else "#a9d2ff"
         edge_color = "#8f63d2" if is_ego else "#000000"
         linewidth = 2.4 if is_ego else 1.8
@@ -173,7 +187,7 @@ def _draw_agents(
         history_mask = data["agent"]["valid_mask"][agent_index, :hist_steps]
         history = data["agent"]["position"][agent_index, :hist_steps, :2][history_mask]
         gt_mask = data["agent"]["valid_mask"][agent_index, hist_steps:]
-        gt = prediction["gt"][agent_index][gt_mask]
+        gt = prediction["gt"][agent_index][gt_mask] if is_target else prediction["gt"][agent_index][:0]
         pred = prediction["pred_traj"][agent_index]
         if "pred_valid_mask" in prediction:
             pred_valid = prediction["pred_valid_mask"][agent_index]
@@ -181,6 +195,7 @@ def _draw_agents(
             pred_valid = gt_mask[:pred.shape[0]]
         else:
             pred_valid = torch.ones(pred.shape[0], dtype=torch.bool)
+        pred_valid = pred_valid & is_target
         pred = pred[pred_valid]
         visible_gt = gt
 
@@ -251,6 +266,15 @@ def _oriented_box(center_xy, heading, length, width):
         center_xy - forward + lateral,
     ]
     return [(float(point[0].item()), float(point[1].item())) for point in corners]
+
+
+def _target_agent_mask(data, prediction, current_step):
+    valid = data["agent"]["valid_mask"][:, current_step] & (data["agent"]["type"] != 3)
+    if "category" in data["agent"]:
+        return valid & (data["agent"]["category"].long() == 3)
+    if "pred_valid_mask" in prediction:
+        return valid & prediction["pred_valid_mask"].any(dim=-1)
+    return valid
 
 
 def _heading_triangle(center_xy, heading, length, width):

@@ -62,3 +62,17 @@
 - Decision: Add `diffusion.geometry_dropout_prob` so training can randomly prevent visible GT tokens from advancing the temporary geometry chain. Validation and inference keep dropout disabled.
 - Why: This exposes the decoder to incomplete geometry states similar to early denoising and reduces over-reliance on perfect teacher-forced future geometry.
 - Impact: Training configs default to `geometry_dropout_prob: 0.25`; validation config sets it to `0.0`.
+
+## Decision: Align SMART-Diffusion with SMART target-category evaluation
+- Date: 2026-05-15
+- Context: Diffusion was training and evaluating all non-background agents, while original SMART primarily supervises target-category agents selected by `WaymoTargetBuilder`.
+- Decision: Default SMART-Diffusion training, validation metrics, and visualized prediction trajectories to agents with `category == 3` and `type != 3`.
+- Why: This makes SMART vs diffusion comparisons fairer and avoids judging diffusion on agents that the baseline objective does not emphasize.
+- Impact: Diffusion configs now include `target_category_only: true`; non-target agents remain available as context but are not default prediction targets.
+
+## Decision: Use low-variance mask training and remask sampling for SMART-Diffusion
+- Date: 2026-05-15
+- Context: Batch size can be one, Bernoulli mask counts add avoidable variance, and one-way confidence release can lock in early wrong tokens.
+- Decision: Use quasi-random timestep sampling across global steps, exact-count masked token selection with alternating antithetic ranking, 6-layer diffusion decoding, and MaskGIT-style remask/resample sampling by default.
+- Why: This directly targets training variance, capacity mismatch with SMART, and early denoising error lock-in without changing SMART tokenization.
+- Impact: Diffusion configs default to `num_layers: 6`, `num_steps: 32`, exact low-variance masking, and `remask_sampling: true`.

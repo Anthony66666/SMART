@@ -1,5 +1,12 @@
 # Progress
 
+## 2026-05-15 CST
+- Task: Implemented SMART-Diffusion stability and fair-comparison upgrades.
+- Result: Diffusion now uses quasi-random timestep sampling that works at batch size 1, exact-count low-variance masks, alternating antithetic token ranking, target-category-only training/evaluation by default, 6-layer diffusion configs, 32-step sampling, and MaskGIT-style remask/resample inference. Validation visualization now shows prediction/GT futures only for target-category agents while keeping other agents as context.
+- Files: `smart/model/smart_diffusion.py`, `smart/callbacks/validation_visualization.py`, `configs/train/train_scalable_diffusion.yaml`, `configs/train/train_scalable_diffusion_local.yaml`, `configs/validation/validation_scalable_diffusion.yaml`
+- Validation: `py_compile` passed; targeted checks covered low-discrepancy timestep coverage, exact-count masks, antithetic ranking, target-category filtering, and remask sampling; real local train batch and validation inference smoke passed; target-category visualization rendered to `/tmp/smart_diffusion_target_category_viz.png`.
+- Next: Restart server training from scratch with the updated diffusion config and compare target-category validation metrics/visualizations against SMART.
+
 ## 2026-05-13 CST
 - Task: Added SMART-Diffusion training-time geometry dropout to reduce teacher-forced geometry mismatch.
 - Result: `_refresh_token_geometry` now accepts a `geometry_known_mask`; diffusion loss randomly drops a configurable fraction of visible GT tokens from geometry-chain advancement during training while keeping token inputs unchanged. Diffusion train configs set `geometry_dropout_prob: 0.25`; validation sets `0.0`.
