@@ -87,11 +87,13 @@ Model:
     low_variance_masking: true
     mask_count_mode: exact
     antithetic_mask_ranking: true
-    remask_sampling: true
+    remask_sampling: false
     remask_confidence_temperature: 1.0
     block_training: true
     block_size_chunks: 4
-    block_denoise_steps: 8
-    block_mask_prob_min: 0.3
-    block_mask_prob_max: 0.85
+    block_denoise_steps: 16
+    block_mask_prob_min: 0.5
+    block_mask_prob_max: 1.0
+    block_train_all_blocks: true
+    block_loss_weight: clipped_consistent
     freeze_encoder: false

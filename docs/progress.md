@@ -1,5 +1,13 @@
 # Progress
 
+## 2026-05-16 CST
+- Task: Reworked SMART-Diffusion block training to match the Block Diffusion objective more closely.
+- Result: Block diffusion now computes losses for all temporal blocks every training step, uses clean previous blocks as context, hides future blocks from decoder attention, samples clipped effective mask rates directly, uses exact mask counts with `1 / p_actual` loss scaling, and defaults block inference to monotonic unmasking. Configs now set 4-chunk blocks, 16 denoising steps per block, mask probability bounds `[0.5, 1.0]`, `block_train_all_blocks: true`, `block_loss_weight: clipped_consistent`, and `remask_sampling: false`.
+- Files: `smart/model/smart_diffusion.py`, `configs/train/train_scalable_diffusion.yaml`, `configs/train/train_scalable_diffusion_local.yaml`, `configs/validation/validation_scalable_diffusion.yaml`, `docs/spec.md`, `docs/decisions.md`, `docs/progress.md`, `docs/next.md`
+- Validation: `py_compile` passed; targeted checks passed for all-block decoder calls, previous/current/future visibility masks, clipped actual mask ratios, no-mask-residue monotonic sampling, and diffusion config loading.
+- Open: Real dataset train/validation smoke was not run in this turn.
+- Next: Restart diffusion training from scratch, because old block checkpoints used a different training objective and mask weighting.
+
 ## 2026-05-15 18:24 CST
 - Task: Implemented temporal block diffusion for SMART-Diffusion.
 - Result: Diffusion training now samples one temporal block per step, masks/losses only the current block, conditions on previous blocks, and excludes future blocks from decoder attention. Inference now samples future tokens block by block while reusing the existing MaskGIT remask sampler inside each block. Diffusion train/validation configs enable 4-chunk blocks with 8 denoising steps and use DDP unused-parameter detection.

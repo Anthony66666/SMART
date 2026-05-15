@@ -1,3 +1,5 @@
+import math
+
 import torch
 import torch.nn.functional as F
 from torch_geometric.data import Batch, HeteroData
@@ -77,20 +79,21 @@ class SMARTDiffusion(SMART):
         self.low_variance_masking = bool(getattr(diffusion_cfg, 'low_variance_masking', True))
         self.mask_count_mode = str(getattr(diffusion_cfg, 'mask_count_mode', 'exact')).lower()
         self.antithetic_mask_ranking = bool(getattr(diffusion_cfg, 'antithetic_mask_ranking', True))
-        self.remask_sampling = bool(getattr(diffusion_cfg, 'remask_sampling', True))
+        self.remask_sampling = bool(getattr(diffusion_cfg, 'remask_sampling', False))
         self.remask_confidence_temperature = float(getattr(diffusion_cfg, 'remask_confidence_temperature', 1.0))
         self.remask_confidence_temperature = max(self.remask_confidence_temperature, 1e-6)
         self.block_training = bool(getattr(diffusion_cfg, 'block_training', True))
+        self.block_train_all_blocks = bool(getattr(diffusion_cfg, 'block_train_all_blocks', True))
+        self.block_loss_weight = str(getattr(diffusion_cfg, 'block_loss_weight', 'clipped_consistent')).lower()
         self.block_size_chunks = int(getattr(diffusion_cfg, 'block_size_chunks', self.num_future_chunks))
         if self.block_size_chunks <= 0:
             self.block_size_chunks = self.num_future_chunks
         self.block_size_chunks = min(max(self.block_size_chunks, 1), self.num_future_chunks)
-        num_blocks = (self.num_future_chunks + self.block_size_chunks - 1) // self.block_size_chunks
-        default_block_steps = max(1, self.diffusion_num_steps // max(1, num_blocks))
+        default_block_steps = 16
         self.block_denoise_steps = int(getattr(diffusion_cfg, 'block_denoise_steps', default_block_steps))
         self.block_denoise_steps = max(1, self.block_denoise_steps)
-        self.block_mask_prob_min = float(getattr(diffusion_cfg, 'block_mask_prob_min', 0.3))
-        self.block_mask_prob_max = float(getattr(diffusion_cfg, 'block_mask_prob_max', 0.85))
+        self.block_mask_prob_min = float(getattr(diffusion_cfg, 'block_mask_prob_min', 0.5))
+        self.block_mask_prob_max = float(getattr(diffusion_cfg, 'block_mask_prob_max', 1.0))
         self.block_mask_prob_min = min(max(self.block_mask_prob_min, 0.0), 1.0)
         self.block_mask_prob_max = min(max(self.block_mask_prob_max, 0.0), 1.0)
         if self.block_mask_prob_min > self.block_mask_prob_max:
@@ -324,27 +327,61 @@ class SMARTDiffusion(SMART):
     def _chunk_window_mask(self, chunk_ids, start, end):
         return (chunk_ids >= start) & (chunk_ids < end)
 
-    def _sample_training_block_range(self, packed):
-        ranges = self._block_ranges()
-        if len(ranges) <= 1:
-            return ranges[0][0], ranges[0][1], 0
+    def _sample_clipped_mask_probabilities(self, batch_size, device, block_idx=0):
+        if batch_size <= 0:
+            return torch.empty(0, device=device)
+        beta = self.block_mask_prob_min
+        omega = self.block_mask_prob_max
+        if omega <= beta:
+            return torch.full((batch_size,), beta, device=device)
 
-        step, rank = self._current_step_rank()
         if self.low_variance_masking:
-            first_idx = (int(step) + int(rank)) % len(ranges)
+            step, rank = self._current_step_rank()
+            golden_ratio_inv = 0.6180339887498949
+            offsets = torch.arange(batch_size, device=device, dtype=torch.float)
+            base = (
+                float(step * max(1, len(self._block_ranges())) * max(1, batch_size))
+                + float(block_idx * max(1, batch_size))
+                + float(rank * 104729)
+            )
+            unit = torch.frac((offsets + base + 0.5) * golden_ratio_inv)
         else:
-            first_idx = int(torch.randint(len(ranges), (1,), device=packed['valid_mask'].device).item())
+            unit = torch.rand(batch_size, device=device)
+        return beta + (omega - beta) * unit
 
-        chunk_ids = packed['chunk_ids']
-        valid_mask = packed['valid_mask']
-        for offset in range(len(ranges)):
-            block_idx = (first_idx + offset) % len(ranges)
-            start, end = ranges[block_idx]
-            block_valid = valid_mask & self._chunk_window_mask(chunk_ids, start, end)
-            if bool(block_valid.any().item()):
-                return start, end, block_idx
-        start, end = ranges[first_idx]
-        return start, end, first_idx
+    def _sample_block_mask_counts(self, valid_mask, block_idx=0):
+        mask = torch.zeros_like(valid_mask)
+        p_eff = self._sample_clipped_mask_probabilities(
+            valid_mask.shape[0],
+            valid_mask.device,
+            block_idx=block_idx,
+        )
+        p_actual = torch.zeros_like(p_eff)
+        step, rank = self._current_step_rank()
+        scores = self._mask_ranking_scores(
+            valid_mask.shape,
+            valid_mask.device,
+            step=step * max(1, len(self._block_ranges())) + int(block_idx),
+            rank=rank,
+        )
+        scores = scores.masked_fill(~valid_mask, float('inf'))
+
+        for batch_idx in range(valid_mask.shape[0]):
+            valid_count = int(valid_mask[batch_idx].sum().item())
+            if valid_count <= 0:
+                continue
+            prob = float(p_eff[batch_idx].detach().clamp(0.0, 1.0).item())
+            min_count = int(math.ceil(self.block_mask_prob_min * valid_count))
+            max_count = int(math.floor(self.block_mask_prob_max * valid_count))
+            min_count = min(max(min_count, 0), valid_count)
+            max_count = min(max(max_count, min_count), valid_count)
+            mask_count = int(round(prob * valid_count))
+            mask_count = min(max(mask_count, min_count), max_count)
+            if mask_count > 0:
+                selected = torch.topk(scores[batch_idx], k=mask_count, largest=False).indices
+                mask[batch_idx, selected] = True
+            p_actual[batch_idx] = float(mask_count) / float(valid_count)
+        return mask, p_actual
 
     def _target_agent_mask(self, data):
         target = (
@@ -691,39 +728,20 @@ class SMARTDiffusion(SMART):
         packed['map_valid_mask'] = map_valid_mask
         return packed, summary, ft, fv, agents_ok, agent_batch
 
-    def _compute_diffusion_loss(self, packed, summary):
+    def _compute_full_diffusion_loss(self, packed, summary):
         B = summary.shape[0]
         t = self._sample_diffusion_timesteps(B, summary.device)
         sigma_t, mask_prob, dsigma_t = self.noise_schedule(t)
 
         gt = packed['token_ids']
-        if self._block_diffusion_enabled():
-            block_start, block_end, _block_idx = self._sample_training_block_range(packed)
-            block_window = self._chunk_window_mask(packed['chunk_ids'], block_start, block_end)
-            loss_valid_mask = packed['valid_mask'] & block_window
-            decoder_valid_mask = packed['valid_mask'] & (packed['chunk_ids'] < block_end)
-            previous_valid_mask = packed['valid_mask'] & (packed['chunk_ids'] < block_start)
-            mask_prob = mask_prob.clamp(
-                min=self.block_mask_prob_min,
-                max=self.block_mask_prob_max,
-            )
-        else:
-            loss_valid_mask = packed['valid_mask']
-            decoder_valid_mask = packed['valid_mask']
-            previous_valid_mask = torch.zeros_like(packed['valid_mask'])
-
+        loss_valid_mask = packed['valid_mask']
         mask = self._sample_training_mask(loss_valid_mask, mask_prob)
         noisy = gt.clone()
-        noisy[~decoder_valid_mask] = self.mask_token_id
         noisy[mask] = self.mask_token_id
-        geometry_known_mask = previous_valid_mask | ((~mask) & loss_valid_mask)
+        geometry_known_mask = (~mask) & loss_valid_mask
         if self.training and self.geometry_dropout_prob > 0.0:
             geometry_keep = torch.rand_like(gt.float()) >= self.geometry_dropout_prob
-            geometry_known_mask = previous_valid_mask | (
-                geometry_known_mask
-                & ~previous_valid_mask
-                & geometry_keep
-            )
+            geometry_known_mask = geometry_known_mask & geometry_keep
         token_positions, token_headings = self._refresh_token_geometry(
             noisy,
             packed,
@@ -736,7 +754,7 @@ class SMARTDiffusion(SMART):
             token_headings=token_headings,
             token_agent_ids=packed['token_agent_ids'],
             noisy_token_chunk_ids=packed['chunk_ids'], scene_summary=summary,
-            t=t, valid_mask=decoder_valid_mask,
+            t=t, valid_mask=packed['valid_mask'],
             agent_context=packed['agent_context'],
             agent_type_ids=packed['agent_type_ids'],
             agent_shape_embeddings=packed['agent_shape_embeddings'],
@@ -758,7 +776,100 @@ class SMARTDiffusion(SMART):
         else:
             loss = logits.sum() * 0.0
             acc = logits.new_zeros(())
-        return loss, acc
+        mask_ratio = mask.to(dtype=logits.dtype).sum() / loss_valid_mask.to(dtype=logits.dtype).sum().clamp_min(1.0)
+        return loss, acc, mask_ratio
+
+    def _compute_block_loss_for_range(self, packed, summary, block_start, block_end, block_idx):
+        gt = packed['token_ids']
+        block_window = self._chunk_window_mask(packed['chunk_ids'], block_start, block_end)
+        loss_valid_mask = packed['valid_mask'] & block_window
+        decoder_valid_mask = packed['valid_mask'] & (packed['chunk_ids'] < block_end)
+        previous_valid_mask = packed['valid_mask'] & (packed['chunk_ids'] < block_start)
+        mask, p_actual = self._sample_block_mask_counts(loss_valid_mask, block_idx=block_idx)
+
+        noisy = gt.clone()
+        noisy[~decoder_valid_mask] = self.mask_token_id
+        noisy[mask] = self.mask_token_id
+        geometry_known_mask = previous_valid_mask | ((~mask) & loss_valid_mask)
+        if self.training and self.geometry_dropout_prob > 0.0:
+            geometry_keep = torch.rand_like(gt.float()) >= self.geometry_dropout_prob
+            geometry_known_mask = previous_valid_mask | (
+                geometry_known_mask
+                & ~previous_valid_mask
+                & geometry_keep
+            )
+        token_positions, token_headings = self._refresh_token_geometry(
+            noisy,
+            packed,
+            geometry_known_mask=geometry_known_mask,
+        )
+
+        t = p_actual.clamp(min=self.min_t, max=1.0)
+        logits = self.diffusion_decoder(
+            noisy_token_ids=noisy,
+            token_positions=token_positions,
+            token_headings=token_headings,
+            token_agent_ids=packed['token_agent_ids'],
+            noisy_token_chunk_ids=packed['chunk_ids'], scene_summary=summary,
+            t=t, valid_mask=decoder_valid_mask,
+            agent_context=packed['agent_context'],
+            agent_type_ids=packed['agent_type_ids'],
+            agent_shape_embeddings=packed['agent_shape_embeddings'],
+            physical_token_embeddings=self._physical_token_embeddings(noisy, packed['agent_type_ids']),
+            map_context=packed.get('map_context'),
+            map_positions=packed.get('map_positions'),
+            map_orientations=packed.get('map_orientations'),
+            map_batch=packed.get('map_batch'),
+            map_valid_mask=packed.get('map_valid_mask'),
+        )
+
+        valid_count = loss_valid_mask.to(dtype=logits.dtype).sum()
+        mask_count = mask.to(dtype=logits.dtype).sum()
+        if mask.any():
+            log_p = F.log_softmax(logits, dim=-1)
+            nll = -log_p.gather(-1, gt.unsqueeze(-1)).squeeze(-1)
+            if self.block_loss_weight == 'clipped_consistent':
+                per_scene_weight = p_actual.clamp_min(self.min_t).reciprocal()
+                weight = per_scene_weight.unsqueeze(-1).expand_as(nll)
+            else:
+                weight = torch.ones_like(nll)
+            loss_sum = (weight * nll * mask.to(dtype=nll.dtype)).sum()
+            correct = (logits[mask].argmax(-1) == gt[mask]).to(dtype=logits.dtype).sum()
+        else:
+            loss_sum = logits.sum() * 0.0
+            correct = logits.new_zeros(())
+        return loss_sum, correct, mask_count, valid_count
+
+    def _compute_block_diffusion_loss_all_blocks(self, packed, summary):
+        loss_sum = summary.new_zeros(())
+        correct_sum = summary.new_zeros(())
+        mask_count_sum = summary.new_zeros(())
+        valid_count_sum = summary.new_zeros(())
+
+        for block_idx, (block_start, block_end) in enumerate(self._block_ranges()):
+            block_loss, block_correct, block_mask_count, block_valid_count = (
+                self._compute_block_loss_for_range(
+                    packed,
+                    summary,
+                    block_start,
+                    block_end,
+                    block_idx,
+                )
+            )
+            loss_sum = loss_sum + block_loss
+            correct_sum = correct_sum + block_correct
+            mask_count_sum = mask_count_sum + block_mask_count
+            valid_count_sum = valid_count_sum + block_valid_count
+
+        loss = loss_sum / valid_count_sum.clamp_min(1.0)
+        acc = correct_sum / mask_count_sum.clamp_min(1.0)
+        mask_ratio = mask_count_sum / valid_count_sum.clamp_min(1.0)
+        return loss, acc, mask_ratio
+
+    def _compute_diffusion_loss(self, packed, summary):
+        if self._block_diffusion_enabled():
+            return self._compute_block_diffusion_loss_all_blocks(packed, summary)
+        return self._compute_full_diffusion_loss(packed, summary)
 
     def training_step(self, data, batch_idx):
         data = self._prepare_batch(data)
@@ -769,7 +880,7 @@ class SMARTDiffusion(SMART):
                      prog_bar=False, on_step=True, on_epoch=True, batch_size=1)
             return zero_loss
 
-        diffusion_loss, mask_acc = self._compute_diffusion_loss(packed, summary)
+        diffusion_loss, mask_acc, mask_ratio = self._compute_diffusion_loss(packed, summary)
         ntp_loss = self._compute_optional_ntp_loss(data, diffusion_loss)
         loss = diffusion_loss + self.ntp_aux_loss_weight * ntp_loss
 
@@ -783,6 +894,8 @@ class SMARTDiffusion(SMART):
         self.log('ntp_loss', ntp_loss, prog_bar=True, on_step=True, on_epoch=True,
                  batch_size=1)
         self.log('train_mask_acc', mask_acc, on_step=True, on_epoch=True, batch_size=1)
+        self.log('train_block_mask_ratio', mask_ratio, on_step=True, on_epoch=True,
+                 batch_size=1)
 
         return loss
 
@@ -795,7 +908,7 @@ class SMARTDiffusion(SMART):
                      batch_size=1, sync_dist=True)
             return
 
-        diffusion_loss, mask_acc = self._compute_diffusion_loss(packed, summary)
+        diffusion_loss, mask_acc, mask_ratio = self._compute_diffusion_loss(packed, summary)
         ntp_loss = self._compute_optional_ntp_loss(data, diffusion_loss)
         total_loss = diffusion_loss + self.ntp_aux_loss_weight * ntp_loss
 
@@ -813,6 +926,8 @@ class SMARTDiffusion(SMART):
                  batch_size=1, sync_dist=True)
         self.log('val_mask_acc', mask_acc, prog_bar=True, on_step=False, on_epoch=True,
                  batch_size=1, sync_dist=True)
+        self.log('val_block_mask_ratio', mask_ratio, prog_bar=False, on_step=False,
+                 on_epoch=True, batch_size=1, sync_dist=True)
 
         # Full inference for ADE/FDE (only first 2 batches to limit cost)
         if self.inference_token and batch_idx < self.diffusion_eval_batches:

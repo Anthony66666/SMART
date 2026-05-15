@@ -83,3 +83,10 @@
 - Decision: Default SMART-Diffusion to 4-chunk temporal blocks with 8 denoising steps per block. Training masks and supervises only the current block while conditioning on previous GT blocks; inference samples blocks autoregressively and conditions later blocks on earlier sampled blocks.
 - Why: This adapts Block Diffusion's block-autoregressive idea to SMART trajectory tokens without replacing SMART's graph decoder or token vocabulary.
 - Impact: Diffusion configs include `block_training`, `block_size_chunks`, `block_denoise_steps`, and block mask-probability bounds. Full-horizon diffusion remains available by disabling block training or setting the block size to cover all future chunks.
+
+## Decision: Align SMART-Diffusion block training with the Block Diffusion objective
+- Date: 2026-05-16
+- Context: The first block rollout trained only one temporal block per step and clamped mask probability separately from the loss weight, which increased loss variance and deviated from the paper's sum-over-blocks objective.
+- Decision: Train all temporal blocks every step, use direct clipped effective mask-rate sampling with exact mask counts, scale masked NLL by the matching `1 / p_actual`, and default block sampling to monotonic unmasking.
+- Why: This is closer to Block Diffusion's objective while keeping SMART's graph decoder and avoiding a text-model KV-cache dependency.
+- Impact: Diffusion configs now use `block_train_all_blocks: true`, `block_loss_weight: clipped_consistent`, `block_denoise_steps: 16`, and `remask_sampling: false`. Old block-diffusion checkpoints should be restarted from scratch because the loss schedule and objective changed.
