@@ -7,7 +7,7 @@ from torch_geometric.data import Batch, HeteroData
 from smart.metrics.joint_consistency import ConflictRate, InteractionConsistency
 from smart.model.smart import SMART
 from smart.modules.diffusion_decoder import DiffusionDecoder
-from smart.utils.diffusion_noise import LogLinearNoise
+from smart.utils.diffusion_noise import LogLinearNoise, get_bd3_noise
 
 
 def _lookup_token_trajectories(token_ids, token_vocab, agent_types):
@@ -84,7 +84,29 @@ class SMARTDiffusion(SMART):
         self.remask_confidence_temperature = max(self.remask_confidence_temperature, 1e-6)
         self.block_training = bool(getattr(diffusion_cfg, 'block_training', True))
         self.block_train_all_blocks = bool(getattr(diffusion_cfg, 'block_train_all_blocks', True))
+        self.block_vectorized_training = bool(getattr(diffusion_cfg, 'block_vectorized_training', True))
         self.block_loss_weight = str(getattr(diffusion_cfg, 'block_loss_weight', 'clipped_consistent')).lower()
+        self.noise_type = str(getattr(diffusion_cfg, 'noise_type', 'loglinear')).lower()
+        if hasattr(diffusion_cfg, 'sampling_eps_min'):
+            sampling_eps_min = float(getattr(diffusion_cfg, 'sampling_eps_min'))
+        else:
+            sampling_eps_min = float(getattr(diffusion_cfg, 'block_mask_prob_min', 1e-3))
+        if hasattr(diffusion_cfg, 'sampling_eps_max'):
+            sampling_eps_max = float(getattr(diffusion_cfg, 'sampling_eps_max'))
+        else:
+            sampling_eps_max = float(getattr(diffusion_cfg, 'block_mask_prob_max', 1.0))
+        sampling_eps_min = min(max(sampling_eps_min, 1e-3), 1.0)
+        sampling_eps_max = min(max(sampling_eps_max, sampling_eps_min), 1.0)
+        self.resample_mask_bounds = bool(getattr(diffusion_cfg, 'resample_mask_bounds', True))
+        self.var_min = bool(getattr(diffusion_cfg, 'var_min', True))
+        self.fix_clipping = bool(getattr(diffusion_cfg, 'fix_clipping', False))
+        self.val_var_batches = int(getattr(diffusion_cfg, 'val_var_batches', 100))
+        self.val_var_batches = max(0, self.val_var_batches)
+        self.clip_search_grid = self._parse_clip_search_grid(
+            getattr(diffusion_cfg, 'clip_search_grid', None),
+            default_min=sampling_eps_min,
+            default_max=sampling_eps_max,
+        )
         self.block_size_chunks = int(getattr(diffusion_cfg, 'block_size_chunks', self.num_future_chunks))
         if self.block_size_chunks <= 0:
             self.block_size_chunks = self.num_future_chunks
@@ -105,6 +127,10 @@ class SMARTDiffusion(SMART):
         token_size = int(getattr(model_config.decoder, 'token_size', 2048))
 
         self.noise_schedule = LogLinearNoise(eps=self.diffusion_eps)
+        self.bd3_noise = get_bd3_noise(self.noise_type, eps=self.diffusion_eps)
+        self.register_buffer('sampling_eps_min', torch.tensor(sampling_eps_min, dtype=torch.float))
+        self.register_buffer('sampling_eps_max', torch.tensor(sampling_eps_max, dtype=torch.float))
+        self._schedule_var_values = None
 
         self.diffusion_decoder = DiffusionDecoder(
             hidden_dim=self.hidden_dim,
@@ -157,6 +183,41 @@ class SMARTDiffusion(SMART):
         return self._token_vocab_cache
 
     # -- helpers -----------------------------------------------------------
+
+    @staticmethod
+    def _parse_clip_search_grid(raw_grid, default_min=1e-3, default_max=1.0):
+        if raw_grid is None:
+            grid = [
+                (1e-3, 1.0),
+                (0.25, 1.0),
+                (0.5, 1.0),
+                (1e-3, 0.75),
+            ]
+        else:
+            grid = []
+            for item in raw_grid:
+                if isinstance(item, str):
+                    parts = item.replace(':', ',').split(',')
+                    if len(parts) != 2:
+                        raise ValueError(f"Invalid clip_search_grid item: {item}")
+                    eps_min, eps_max = float(parts[0]), float(parts[1])
+                else:
+                    eps_min, eps_max = float(item[0]), float(item[1])
+                grid.append((eps_min, eps_max))
+
+        grid.append((float(default_min), float(default_max)))
+        grid.append((1e-3, 1.0))
+        cleaned = []
+        seen = set()
+        for eps_min, eps_max in grid:
+            eps_min = min(max(float(eps_min), 1e-3), 1.0)
+            eps_max = min(max(float(eps_max), eps_min), 1.0)
+            key = (round(eps_min, 6), round(eps_max, 6))
+            if key in seen:
+                continue
+            cleaned.append((eps_min, eps_max))
+            seen.add(key)
+        return cleaned
 
     def _get_agent_batch(self, data):
         if isinstance(data, Batch) and 'batch' in data['agent']:
@@ -327,61 +388,120 @@ class SMARTDiffusion(SMART):
     def _chunk_window_mask(self, chunk_ids, start, end):
         return (chunk_ids >= start) & (chunk_ids < end)
 
-    def _sample_clipped_mask_probabilities(self, batch_size, device, block_idx=0):
+    def _current_sampling_eps(self):
+        eps_min = float(self.sampling_eps_min.detach().item())
+        eps_max = float(self.sampling_eps_max.detach().item())
+        eps_min = min(max(eps_min, 1e-3), 1.0)
+        eps_max = min(max(eps_max, eps_min), 1.0)
+        return eps_min, eps_max
+
+    def _sample_bd3_timesteps(self, batch_size, device, sampling_eps_min=None, sampling_eps_max=None):
+        """Sample BD3-LM block mask probabilities.
+
+        Adapted from Apache-2.0 bd3lms ``Diffusion._sample_t``. For log-linear
+        BD3-LM, ``t`` is the absorbing-mask move probability.
+        """
         if batch_size <= 0:
             return torch.empty(0, device=device)
-        beta = self.block_mask_prob_min
-        omega = self.block_mask_prob_max
-        if omega <= beta:
-            return torch.full((batch_size,), beta, device=device)
+        if sampling_eps_min is None or sampling_eps_max is None:
+            sampling_eps_min, sampling_eps_max = self._current_sampling_eps()
+        sampling_eps_min = float(sampling_eps_min)
+        sampling_eps_max = float(sampling_eps_max)
+        if sampling_eps_max >= 1.0 and sampling_eps_min >= 1.0:
+            return torch.ones(batch_size, device=device)
 
         if self.low_variance_masking:
-            step, rank = self._current_step_rank()
-            golden_ratio_inv = 0.6180339887498949
-            offsets = torch.arange(batch_size, device=device, dtype=torch.float)
-            base = (
-                float(step * max(1, len(self._block_ranges())) * max(1, batch_size))
-                + float(block_idx * max(1, batch_size))
-                + float(rank * 104729)
-            )
-            unit = torch.frac((offsets + base + 0.5) * golden_ratio_inv)
+            unit = torch.rand(batch_size, device=device)
+            offsets = torch.arange(batch_size, device=device, dtype=torch.float) / float(batch_size)
+            unit = (unit / float(batch_size) + offsets) % 1.0
         else:
             unit = torch.rand(batch_size, device=device)
-        return beta + (omega - beta) * unit
+        return unit * (sampling_eps_max - sampling_eps_min) + sampling_eps_min
 
-    def _sample_block_mask_counts(self, valid_mask, block_idx=0):
-        mask = torch.zeros_like(valid_mask)
-        p_eff = self._sample_clipped_mask_probabilities(
-            valid_mask.shape[0],
-            valid_mask.device,
-            block_idx=block_idx,
-        )
-        p_actual = torch.zeros_like(p_eff)
-        step, rank = self._current_step_rank()
-        scores = self._mask_ranking_scores(
-            valid_mask.shape,
-            valid_mask.device,
-            step=step * max(1, len(self._block_ranges())) + int(block_idx),
-            rank=rank,
-        )
-        scores = scores.masked_fill(~valid_mask, float('inf'))
-
+    def _repair_bd3_mask_bounds(self, mask, valid_mask, sampling_eps_min, sampling_eps_max):
+        random_scores = torch.rand_like(valid_mask.float())
+        repaired = mask.clone()
         for batch_idx in range(valid_mask.shape[0]):
             valid_count = int(valid_mask[batch_idx].sum().item())
             if valid_count <= 0:
                 continue
-            prob = float(p_eff[batch_idx].detach().clamp(0.0, 1.0).item())
-            min_count = int(math.ceil(self.block_mask_prob_min * valid_count))
-            max_count = int(math.floor(self.block_mask_prob_max * valid_count))
+            min_count = 0
+            max_count = valid_count
+            if sampling_eps_min != 1e-3:
+                min_count = int(math.ceil(float(sampling_eps_min) * valid_count))
+            if sampling_eps_max != 1.0:
+                max_count = int(math.floor(float(sampling_eps_max) * valid_count))
             min_count = min(max(min_count, 0), valid_count)
             max_count = min(max(max_count, min_count), valid_count)
-            mask_count = int(round(prob * valid_count))
-            mask_count = min(max(mask_count, min_count), max_count)
-            if mask_count > 0:
-                selected = torch.topk(scores[batch_idx], k=mask_count, largest=False).indices
-                mask[batch_idx, selected] = True
-            p_actual[batch_idx] = float(mask_count) / float(valid_count)
-        return mask, p_actual
+            count = int(repaired[batch_idx].sum().item())
+            target_count = min(max(count, min_count), max_count)
+            if target_count == count:
+                continue
+            repaired[batch_idx].zero_()
+            if target_count > 0:
+                scores = random_scores[batch_idx].masked_fill(~valid_mask[batch_idx], float('inf'))
+                selected = torch.topk(scores, k=target_count, largest=False).indices
+                repaired[batch_idx, selected] = True
+        return repaired
+
+    def _resample_bd3_mask_bounds(self, valid_mask, move_chance, sampling_eps_min, sampling_eps_max):
+        """BD3-LM q(x_t|x_0) resampling for clipped mask-ratio intervals.
+
+        The official text code repeatedly regenerates blocks whose masked ratio
+        falls outside the clipping interval. This graph version applies the same
+        rule per packed scene/block view, with a finite repair step for ragged
+        blocks where exact interval satisfaction can be impossible.
+        """
+        move_chance = move_chance.clamp(0.0, 1.0)
+        mask = (torch.rand_like(valid_mask.float()) <= move_chance.unsqueeze(-1)) & valid_mask
+        if sampling_eps_max >= 1.0 and sampling_eps_min >= 1.0:
+            return valid_mask.clone()
+        if (
+            not self.resample_mask_bounds
+            or (float(sampling_eps_min) == 1e-3 and float(sampling_eps_max) == 1.0)
+        ):
+            return mask
+
+        valid_count = valid_mask.sum(dim=-1).clamp_min(1)
+        for _ in range(32):
+            perc_masked = mask.sum(dim=-1).to(dtype=move_chance.dtype) / valid_count.to(dtype=move_chance.dtype)
+            if sampling_eps_min == 1e-3 and sampling_eps_max != 1.0:
+                regen = perc_masked > float(sampling_eps_max)
+            elif sampling_eps_min != 1e-3 and sampling_eps_max == 1.0:
+                regen = perc_masked < float(sampling_eps_min)
+            else:
+                regen = (
+                    (perc_masked < float(sampling_eps_min))
+                    | (perc_masked > float(sampling_eps_max))
+                )
+            regen = regen & valid_mask.any(dim=-1)
+            if not bool(regen.any().item()):
+                break
+            new_mask = (torch.rand_like(valid_mask.float()) <= move_chance.unsqueeze(-1)) & valid_mask
+            mask[regen] = new_mask[regen]
+        return self._repair_bd3_mask_bounds(mask, valid_mask, sampling_eps_min, sampling_eps_max)
+
+    def _sample_bd3_block_mask(self, valid_mask, t=None, sampling_eps_min=None, sampling_eps_max=None):
+        if sampling_eps_min is None or sampling_eps_max is None:
+            sampling_eps_min, sampling_eps_max = self._current_sampling_eps()
+        if t is None:
+            t = self._sample_bd3_timesteps(
+                valid_mask.shape[0],
+                valid_mask.device,
+                sampling_eps_min=sampling_eps_min,
+                sampling_eps_max=sampling_eps_max,
+            )
+        loss_scaling, move_chance = self.bd3_noise(t)
+        mask = self._resample_bd3_mask_bounds(
+            valid_mask,
+            move_chance,
+            sampling_eps_min=sampling_eps_min,
+            sampling_eps_max=sampling_eps_max,
+        )
+        loss_weight = -loss_scaling
+        if sampling_eps_min is not None and float(sampling_eps_min) > 0.5:
+            loss_weight = torch.ones_like(loss_weight)
+        return mask, loss_weight, move_chance, t
 
     def _target_agent_mask(self, data):
         target = (
@@ -779,13 +899,18 @@ class SMARTDiffusion(SMART):
         mask_ratio = mask.to(dtype=logits.dtype).sum() / loss_valid_mask.to(dtype=logits.dtype).sum().clamp_min(1.0)
         return loss, acc, mask_ratio
 
-    def _compute_block_loss_for_range(self, packed, summary, block_start, block_end, block_idx):
+    def _compute_block_loss_for_range(self, packed, summary, block_start, block_end, block_idx,
+                                      sampling_eps_min=None, sampling_eps_max=None):
         gt = packed['token_ids']
         block_window = self._chunk_window_mask(packed['chunk_ids'], block_start, block_end)
         loss_valid_mask = packed['valid_mask'] & block_window
         decoder_valid_mask = packed['valid_mask'] & (packed['chunk_ids'] < block_end)
         previous_valid_mask = packed['valid_mask'] & (packed['chunk_ids'] < block_start)
-        mask, p_actual = self._sample_block_mask_counts(loss_valid_mask, block_idx=block_idx)
+        mask, loss_weight, move_chance, _t = self._sample_bd3_block_mask(
+            loss_valid_mask,
+            sampling_eps_min=sampling_eps_min,
+            sampling_eps_max=sampling_eps_max,
+        )
 
         noisy = gt.clone()
         noisy[~decoder_valid_mask] = self.mask_token_id
@@ -804,7 +929,7 @@ class SMARTDiffusion(SMART):
             geometry_known_mask=geometry_known_mask,
         )
 
-        t = p_actual.clamp(min=self.min_t, max=1.0)
+        t = move_chance.clamp(min=self.min_t, max=1.0)
         logits = self.diffusion_decoder(
             noisy_token_ids=noisy,
             token_positions=token_positions,
@@ -828,11 +953,7 @@ class SMARTDiffusion(SMART):
         if mask.any():
             log_p = F.log_softmax(logits, dim=-1)
             nll = -log_p.gather(-1, gt.unsqueeze(-1)).squeeze(-1)
-            if self.block_loss_weight == 'clipped_consistent':
-                per_scene_weight = p_actual.clamp_min(self.min_t).reciprocal()
-                weight = per_scene_weight.unsqueeze(-1).expand_as(nll)
-            else:
-                weight = torch.ones_like(nll)
+            weight = loss_weight.unsqueeze(-1).expand_as(nll)
             loss_sum = (weight * nll * mask.to(dtype=nll.dtype)).sum()
             correct = (logits[mask].argmax(-1) == gt[mask]).to(dtype=logits.dtype).sum()
         else:
@@ -840,11 +961,221 @@ class SMARTDiffusion(SMART):
             correct = logits.new_zeros(())
         return loss_sum, correct, mask_count, valid_count
 
-    def _compute_block_diffusion_loss_all_blocks(self, packed, summary):
+    def _select_block_view_indices(self, packed, train_all_blocks):
+        B = packed['token_ids'].shape[0]
+        K = len(self._block_ranges())
+        device = packed['token_ids'].device
+        if train_all_blocks:
+            base_indices = torch.arange(B, device=device).repeat_interleave(K)
+            block_indices = torch.arange(K, device=device).repeat(B)
+            return base_indices, block_indices
+
+        if self.low_variance_masking:
+            step, rank = self._current_step_rank()
+            offsets = torch.arange(B, device=device, dtype=torch.float)
+            unit = torch.frac((offsets + 0.5 + float(step) + float(rank * 104729)) * 0.6180339887498949)
+            block_indices = torch.clamp((unit * K).long(), max=K - 1)
+        else:
+            block_indices = torch.randint(0, K, (B,), device=device)
+        base_indices = torch.arange(B, device=device)
+        return base_indices, block_indices
+
+    def _duplicate_map_context_for_block_views(self, packed, base_indices):
+        map_context = packed.get('map_context')
+        map_positions = packed.get('map_positions')
+        map_orientations = packed.get('map_orientations')
+        map_batch = packed.get('map_batch')
+        map_valid_mask = packed.get('map_valid_mask')
+        if map_context is None or map_context.numel() == 0:
+            return None, None, None, None, None
+
+        kept_context = []
+        kept_positions = []
+        kept_orientations = []
+        kept_batch = []
+        kept_valid = []
+        for view_idx, base_idx in enumerate(base_indices.detach().cpu().tolist()):
+            keep = map_batch == int(base_idx)
+            if not bool(keep.any().item()):
+                continue
+            kept_context.append(map_context[keep])
+            kept_positions.append(map_positions[keep])
+            kept_orientations.append(map_orientations[keep])
+            kept_batch.append(torch.full(
+                (int(keep.sum().item()),),
+                view_idx,
+                dtype=torch.long,
+                device=map_batch.device,
+            ))
+            if map_valid_mask is not None:
+                kept_valid.append(map_valid_mask[keep])
+            else:
+                kept_valid.append(torch.ones(
+                    int(keep.sum().item()),
+                    dtype=torch.bool,
+                    device=map_batch.device,
+                ))
+
+        if not kept_context:
+            return None, None, None, None, None
+        return (
+            torch.cat(kept_context, dim=0),
+            torch.cat(kept_positions, dim=0),
+            torch.cat(kept_orientations, dim=0),
+            torch.cat(kept_batch, dim=0),
+            torch.cat(kept_valid, dim=0),
+        )
+
+    def _build_block_view_packed(self, packed, base_indices):
+        view_packed = {
+            'token_ids': packed['token_ids'][base_indices],
+            'token_positions': packed['token_positions'][base_indices],
+            'token_headings': packed['token_headings'][base_indices],
+            'token_agent_ids': packed['token_agent_ids'][base_indices],
+            'chunk_ids': packed['chunk_ids'][base_indices],
+            'valid_mask': packed['valid_mask'][base_indices],
+            'agent_context': packed['agent_context'][base_indices],
+            'agent_shape_embeddings': packed['agent_shape_embeddings'][base_indices],
+            'agent_type_ids': packed['agent_type_ids'][base_indices],
+            'agent_start_positions': packed['agent_start_positions'],
+            'agent_start_headings': packed['agent_start_headings'],
+            'agent_types_global': packed['agent_types_global'],
+        }
+
+        agent_map_by_seq = {
+            int(seq_idx): (scene_idx, agent_indices)
+            for scene_idx, seq_idx, agent_indices in packed['agent_maps']
+        }
+        view_maps = []
+        for view_idx, base_idx in enumerate(base_indices.detach().cpu().tolist()):
+            scene_idx, agent_indices = agent_map_by_seq[int(base_idx)]
+            view_maps.append((scene_idx, view_idx, agent_indices))
+        view_packed['agent_maps'] = view_maps
+        return view_packed
+
+    def _compute_block_diffusion_loss_vectorized(
+        self,
+        packed,
+        summary,
+        train_all_blocks=True,
+        sampling_eps_min=None,
+        sampling_eps_max=None,
+        return_block_losses=False,
+    ):
+        ranges = self._block_ranges()
+        base_indices, block_indices = self._select_block_view_indices(
+            packed,
+            train_all_blocks=train_all_blocks,
+        )
+        if block_indices.numel() == 0:
+            zero = summary.sum() * 0.0
+            if return_block_losses:
+                return zero, zero, zero, summary.new_zeros((0,))
+            return zero, zero, zero
+
+        device = packed['token_ids'].device
+        block_starts = torch.tensor([r[0] for r in ranges], device=device, dtype=torch.long)[block_indices]
+        block_ends = torch.tensor([r[1] for r in ranges], device=device, dtype=torch.long)[block_indices]
+        view_packed = self._build_block_view_packed(packed, base_indices)
+        gt = view_packed['token_ids']
+        chunk_ids = view_packed['chunk_ids']
+        valid_mask = view_packed['valid_mask']
+
+        block_window = (chunk_ids >= block_starts.unsqueeze(-1)) & (chunk_ids < block_ends.unsqueeze(-1))
+        loss_valid_mask = valid_mask & block_window
+        decoder_valid_mask = valid_mask & (chunk_ids < block_ends.unsqueeze(-1))
+        previous_valid_mask = valid_mask & (chunk_ids < block_starts.unsqueeze(-1))
+        mask, loss_weight, move_chance, _t = self._sample_bd3_block_mask(
+            loss_valid_mask,
+            sampling_eps_min=sampling_eps_min,
+            sampling_eps_max=sampling_eps_max,
+        )
+
+        noisy = gt.clone()
+        noisy[~decoder_valid_mask] = self.mask_token_id
+        noisy[mask] = self.mask_token_id
+        geometry_known_mask = previous_valid_mask | ((~mask) & loss_valid_mask)
+        if self.training and self.geometry_dropout_prob > 0.0:
+            geometry_keep = torch.rand_like(gt.float()) >= self.geometry_dropout_prob
+            geometry_known_mask = previous_valid_mask | (
+                geometry_known_mask
+                & ~previous_valid_mask
+                & geometry_keep
+            )
+        token_positions, token_headings = self._refresh_token_geometry(
+            noisy,
+            view_packed,
+            geometry_known_mask=geometry_known_mask,
+        )
+
+        map_context, map_positions, map_orientations, map_batch, map_valid_mask = (
+            self._duplicate_map_context_for_block_views(packed, base_indices)
+        )
+        logits = self.diffusion_decoder(
+            noisy_token_ids=noisy,
+            token_positions=token_positions,
+            token_headings=token_headings,
+            token_agent_ids=view_packed['token_agent_ids'],
+            noisy_token_chunk_ids=chunk_ids,
+            scene_summary=summary[base_indices],
+            t=move_chance.clamp(min=self.min_t, max=1.0),
+            valid_mask=decoder_valid_mask,
+            agent_context=view_packed['agent_context'],
+            agent_type_ids=view_packed['agent_type_ids'],
+            agent_shape_embeddings=view_packed['agent_shape_embeddings'],
+            physical_token_embeddings=self._physical_token_embeddings(noisy, view_packed['agent_type_ids']),
+            map_context=map_context,
+            map_positions=map_positions,
+            map_orientations=map_orientations,
+            map_batch=map_batch,
+            map_valid_mask=map_valid_mask,
+        )
+
+        valid_per_view = loss_valid_mask.to(dtype=logits.dtype).sum(dim=-1)
+        valid_count = valid_per_view.sum()
+        mask_count = mask.to(dtype=logits.dtype).sum()
+        if mask.any():
+            log_p = F.log_softmax(logits, dim=-1)
+            nll = -log_p.gather(-1, gt.unsqueeze(-1)).squeeze(-1)
+            weighted_nll = loss_weight.unsqueeze(-1).expand_as(nll) * nll * mask.to(dtype=nll.dtype)
+            loss_sum = weighted_nll.sum()
+            correct = (logits[mask].argmax(-1) == gt[mask]).to(dtype=logits.dtype).sum()
+            block_losses = weighted_nll.sum(dim=-1) / valid_per_view.clamp_min(1.0)
+        else:
+            loss_sum = logits.sum() * 0.0
+            correct = logits.new_zeros(())
+            block_losses = valid_per_view.new_zeros(valid_per_view.shape)
+
+        loss = loss_sum / valid_count.clamp_min(1.0)
+        acc = correct / mask_count.clamp_min(1.0)
+        mask_ratio = mask_count / valid_count.clamp_min(1.0)
+        if return_block_losses:
+            return loss, acc, mask_ratio, block_losses.detach()
+        return loss, acc, mask_ratio
+
+    def _compute_block_diffusion_loss_all_blocks(
+        self,
+        packed,
+        summary,
+        sampling_eps_min=None,
+        sampling_eps_max=None,
+        return_block_losses=False,
+    ):
+        if self.block_vectorized_training or not self.block_train_all_blocks:
+            return self._compute_block_diffusion_loss_vectorized(
+                packed,
+                summary,
+                train_all_blocks=self.block_train_all_blocks,
+                sampling_eps_min=sampling_eps_min,
+                sampling_eps_max=sampling_eps_max,
+                return_block_losses=return_block_losses,
+            )
+
         loss_sum = summary.new_zeros(())
         correct_sum = summary.new_zeros(())
         mask_count_sum = summary.new_zeros(())
         valid_count_sum = summary.new_zeros(())
+        block_losses = []
 
         for block_idx, (block_start, block_end) in enumerate(self._block_ranges()):
             block_loss, block_correct, block_mask_count, block_valid_count = (
@@ -854,22 +1185,140 @@ class SMARTDiffusion(SMART):
                     block_start,
                     block_end,
                     block_idx,
+                    sampling_eps_min=sampling_eps_min,
+                    sampling_eps_max=sampling_eps_max,
                 )
             )
             loss_sum = loss_sum + block_loss
             correct_sum = correct_sum + block_correct
             mask_count_sum = mask_count_sum + block_mask_count
             valid_count_sum = valid_count_sum + block_valid_count
+            block_losses.append(block_loss.detach() / block_valid_count.detach().clamp_min(1.0))
 
         loss = loss_sum / valid_count_sum.clamp_min(1.0)
         acc = correct_sum / mask_count_sum.clamp_min(1.0)
         mask_ratio = mask_count_sum / valid_count_sum.clamp_min(1.0)
+        if return_block_losses:
+            return loss, acc, mask_ratio, torch.stack(block_losses) if block_losses else summary.new_zeros((0,))
         return loss, acc, mask_ratio
 
-    def _compute_diffusion_loss(self, packed, summary):
+    def _compute_diffusion_loss(
+        self,
+        packed,
+        summary,
+        sampling_eps_min=None,
+        sampling_eps_max=None,
+        return_block_losses=False,
+    ):
         if self._block_diffusion_enabled():
-            return self._compute_block_diffusion_loss_all_blocks(packed, summary)
-        return self._compute_full_diffusion_loss(packed, summary)
+            return self._compute_block_diffusion_loss_all_blocks(
+                packed,
+                summary,
+                sampling_eps_min=sampling_eps_min,
+                sampling_eps_max=sampling_eps_max,
+                return_block_losses=return_block_losses,
+            )
+        loss, acc, mask_ratio = self._compute_full_diffusion_loss(packed, summary)
+        if return_block_losses:
+            return loss, acc, mask_ratio, summary.new_zeros((0,))
+        return loss, acc, mask_ratio
+
+    @staticmethod
+    def _interval_key(eps_min, eps_max):
+        return (round(float(eps_min), 6), round(float(eps_max), 6))
+
+    def on_validation_epoch_start(self):
+        self._schedule_var_values = {
+            self._interval_key(eps_min, eps_max): []
+            for eps_min, eps_max in self.clip_search_grid
+        }
+
+    def _record_schedule_variance(self, eps_min, eps_max, block_losses):
+        if self._schedule_var_values is None or self.val_var_batches <= 0:
+            return
+        key = self._interval_key(eps_min, eps_max)
+        values = self._schedule_var_values.setdefault(key, [])
+        if len(values) >= self.val_var_batches or block_losses.numel() == 0:
+            return
+        values.append(block_losses.detach())
+
+    def _evaluate_schedule_candidates(self, packed, summary, current_key, current_block_losses):
+        if not self.var_min or self.val_var_batches <= 0:
+            return None
+        if current_block_losses is not None:
+            self._record_schedule_variance(current_key[0], current_key[1], current_block_losses)
+
+        full_key = self._interval_key(1e-3, 1.0)
+        full_loss = None
+        evaluated = {current_key}
+        if current_key == full_key:
+            full_loss = None
+
+        for eps_min, eps_max in self.clip_search_grid:
+            key = self._interval_key(eps_min, eps_max)
+            if key in evaluated:
+                continue
+            loss, _acc, _ratio, block_losses = self._compute_diffusion_loss(
+                packed,
+                summary,
+                sampling_eps_min=eps_min,
+                sampling_eps_max=eps_max,
+                return_block_losses=True,
+            )
+            self._record_schedule_variance(eps_min, eps_max, block_losses)
+            if key == full_key:
+                full_loss = loss
+            evaluated.add(key)
+        return full_loss
+
+    def on_validation_epoch_end(self):
+        if not self.var_min or not self._schedule_var_values:
+            return
+
+        best_key = None
+        best_var = None
+        for key, values in self._schedule_var_values.items():
+            if not values:
+                continue
+            local_vars = []
+            for item in values:
+                item = item.to(device=self.device, dtype=torch.float)
+                if item.numel() > 1:
+                    local_vars.append(item.var(unbiased=False))
+                else:
+                    local_vars.append(item.new_zeros(()))
+            if not local_vars:
+                continue
+            local_stat = torch.stack([
+                torch.stack(local_vars).sum(),
+                torch.tensor(float(len(local_vars)), device=self.device),
+            ])
+            try:
+                gathered = self.all_gather(local_stat)
+                var_score = gathered[..., 0].sum() / gathered[..., 1].sum().clamp_min(1.0)
+            except Exception:
+                var_score = local_stat[0] / local_stat[1].clamp_min(1.0)
+
+            self.log(
+                f'valid_var_{key[0]:.3g}_{key[1]:.3g}',
+                var_score,
+                prog_bar=False,
+                on_step=False,
+                on_epoch=True,
+                sync_dist=True,
+            )
+            if best_var is None or float(var_score.detach().item()) < float(best_var.detach().item()):
+                best_var = var_score
+                best_key = key
+
+        if best_key is not None and not self.fix_clipping:
+            self.sampling_eps_min.fill_(float(best_key[0]))
+            self.sampling_eps_max.fill_(float(best_key[1]))
+        self.log('sampling_eps_min', self.sampling_eps_min, prog_bar=False,
+                 on_step=False, on_epoch=True, sync_dist=True)
+        self.log('sampling_eps_max', self.sampling_eps_max, prog_bar=False,
+                 on_step=False, on_epoch=True, sync_dist=True)
+        self._schedule_var_values = None
 
     def training_step(self, data, batch_idx):
         data = self._prepare_batch(data)
@@ -896,6 +1345,10 @@ class SMARTDiffusion(SMART):
         self.log('train_mask_acc', mask_acc, on_step=True, on_epoch=True, batch_size=1)
         self.log('train_block_mask_ratio', mask_ratio, on_step=True, on_epoch=True,
                  batch_size=1)
+        self.log('train_sampling_eps_min', self.sampling_eps_min, on_step=True, on_epoch=True,
+                 batch_size=1)
+        self.log('train_sampling_eps_max', self.sampling_eps_max, on_step=True, on_epoch=True,
+                 batch_size=1)
 
         return loss
 
@@ -908,9 +1361,39 @@ class SMARTDiffusion(SMART):
                      batch_size=1, sync_dist=True)
             return
 
-        diffusion_loss, mask_acc, mask_ratio = self._compute_diffusion_loss(packed, summary)
+        collect_var = self.var_min and batch_idx < self.val_var_batches
+        current_eps_min, current_eps_max = self._current_sampling_eps()
+        current_key = self._interval_key(current_eps_min, current_eps_max)
+        if collect_var:
+            diffusion_loss, mask_acc, mask_ratio, current_block_losses = self._compute_diffusion_loss(
+                packed,
+                summary,
+                return_block_losses=True,
+            )
+        else:
+            diffusion_loss, mask_acc, mask_ratio = self._compute_diffusion_loss(packed, summary)
+            current_block_losses = None
         ntp_loss = self._compute_optional_ntp_loss(data, diffusion_loss)
         total_loss = diffusion_loss + self.ntp_aux_loss_weight * ntp_loss
+        full_diffusion_loss = None
+        if self._block_diffusion_enabled():
+            if collect_var:
+                full_diffusion_loss = self._evaluate_schedule_candidates(
+                    packed,
+                    summary,
+                    current_key=current_key,
+                    current_block_losses=current_block_losses,
+                )
+            if full_diffusion_loss is None:
+                if current_key == self._interval_key(1e-3, 1.0):
+                    full_diffusion_loss = diffusion_loss
+                else:
+                    full_diffusion_loss, _full_acc, _full_mask_ratio = self._compute_diffusion_loss(
+                        packed,
+                        summary,
+                        sampling_eps_min=1e-3,
+                        sampling_eps_max=1.0,
+                    )
 
         self.log('val_empty_diffusion_batch', total_loss.new_zeros(()),
                  prog_bar=False, on_step=False, on_epoch=True,
@@ -922,12 +1405,19 @@ class SMARTDiffusion(SMART):
                  batch_size=1, sync_dist=True)
         self.log('val_diffusion_loss', diffusion_loss, on_step=False, on_epoch=True,
                  batch_size=1, sync_dist=True)
+        if full_diffusion_loss is not None:
+            self.log('val_diffusion_loss_full', full_diffusion_loss, on_step=False,
+                     on_epoch=True, batch_size=1, sync_dist=True)
         self.log('val_ntp_loss', ntp_loss, on_step=False, on_epoch=True,
                  batch_size=1, sync_dist=True)
         self.log('val_mask_acc', mask_acc, prog_bar=True, on_step=False, on_epoch=True,
                  batch_size=1, sync_dist=True)
         self.log('val_block_mask_ratio', mask_ratio, prog_bar=False, on_step=False,
                  on_epoch=True, batch_size=1, sync_dist=True)
+        self.log('val_sampling_eps_min', self.sampling_eps_min, prog_bar=False,
+                 on_step=False, on_epoch=True, batch_size=1, sync_dist=True)
+        self.log('val_sampling_eps_max', self.sampling_eps_max, prog_bar=False,
+                 on_step=False, on_epoch=True, batch_size=1, sync_dist=True)
 
         # Full inference for ADE/FDE (only first 2 batches to limit cost)
         if self.inference_token and batch_idx < self.diffusion_eval_batches:

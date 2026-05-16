@@ -1,6 +1,13 @@
 # Progress
 
 ## 2026-05-16 CST
+- Task: Implemented BD3-LM-style vectorized block training and data-driven clipping search for SMART-Diffusion.
+- Result: Block training now builds one graph-equivalent view per scene/block and runs a single vectorized decoder forward for all block losses, with fallback loop support via `block_vectorized_training: false` and sampled-block support via `block_train_all_blocks: false`. Block masking now uses BD3-LM-style `t == move_chance`, resampled clipping bounds, Apache-2.0-inspired noise schedule helpers, validation-time candidate variance collection, and adaptive `sampling_eps_min/max` updates. Diffusion configs expose `noise_type`, `sampling_eps_min/max`, `resample_mask_bounds`, `var_min`, `fix_clipping`, `clip_search_grid`, `val_var_batches`, and `block_vectorized_training`.
+- Files: `smart/model/smart_diffusion.py`, `smart/utils/diffusion_noise.py`, `configs/train/train_scalable_diffusion.yaml`, `configs/train/train_scalable_diffusion_local.yaml`, `configs/validation/validation_scalable_diffusion.yaml`, `docs/spec.md`, `docs/decisions.md`, `docs/progress.md`, `docs/next.md`
+- Validation: `py_compile` passed; targeted tensor checks passed for vectorized current/previous/future visibility, map batch duplication, exact full-mask NLL behavior, clipping-bound repair, and vectorized-vs-loop deterministic equivalence. Real validation sample smoke passed for vectorized diffusion loss, schedule candidate collection, and block inference with `pred_traj=(73,80,2)`, `next_token_idx=(73,16)`.
+- Open: A full Trainer validation epoch was not run, so epoch-end distributed schedule update logging should be watched in the next real run.
+- Next: Restart SMART-Diffusion from scratch again because the block masking distribution and loss scaling changed from the previous all-block objective.
+
 - Task: Reworked SMART-Diffusion block training to match the Block Diffusion objective more closely.
 - Result: Block diffusion now computes losses for all temporal blocks every training step, uses clean previous blocks as context, hides future blocks from decoder attention, samples clipped effective mask rates directly, uses exact mask counts with `1 / p_actual` loss scaling, and defaults block inference to monotonic unmasking. Configs now set 4-chunk blocks, 16 denoising steps per block, mask probability bounds `[0.5, 1.0]`, `block_train_all_blocks: true`, `block_loss_weight: clipped_consistent`, and `remask_sampling: false`.
 - Files: `smart/model/smart_diffusion.py`, `configs/train/train_scalable_diffusion.yaml`, `configs/train/train_scalable_diffusion_local.yaml`, `configs/validation/validation_scalable_diffusion.yaml`, `docs/spec.md`, `docs/decisions.md`, `docs/progress.md`, `docs/next.md`

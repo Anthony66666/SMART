@@ -77,6 +77,18 @@ Model:
     num_layers: 6
     eps: 1.0e-3
     min_t: 1.0e-3
+    noise_type: loglinear
+    sampling_eps_min: 1.0e-3
+    sampling_eps_max: 1.0
+    resample_mask_bounds: true
+    var_min: true
+    fix_clipping: false
+    clip_search_grid:
+      - [1.0e-3, 1.0]
+      - [0.25, 1.0]
+      - [0.5, 1.0]
+      - [1.0e-3, 0.75]
+    val_var_batches: 100
     ntp_aux_loss_weight: 0.2
     use_agent_context: true
     use_type_embedding: true
@@ -90,10 +102,11 @@ Model:
     remask_sampling: false
     remask_confidence_temperature: 1.0
     block_training: true
+    block_vectorized_training: true
     block_size_chunks: 4
     block_denoise_steps: 16
-    block_mask_prob_min: 0.5
-    block_mask_prob_max: 1.0
+    block_mask_prob_min: 1.0e-3  # deprecated alias; sampling_eps_min is authoritative.
+    block_mask_prob_max: 1.0     # deprecated alias; sampling_eps_max is authoritative.
     block_train_all_blocks: true
     block_loss_weight: clipped_consistent
     freeze_encoder: false

@@ -90,3 +90,10 @@
 - Decision: Train all temporal blocks every step, use direct clipped effective mask-rate sampling with exact mask counts, scale masked NLL by the matching `1 / p_actual`, and default block sampling to monotonic unmasking.
 - Why: This is closer to Block Diffusion's objective while keeping SMART's graph decoder and avoiding a text-model KV-cache dependency.
 - Impact: Diffusion configs now use `block_train_all_blocks: true`, `block_loss_weight: clipped_consistent`, `block_denoise_steps: 16`, and `remask_sampling: false`. Old block-diffusion checkpoints should be restarted from scratch because the loss schedule and objective changed.
+
+## Decision: Port BD3-LM vectorized training as graph-equivalent block views
+- Date: 2026-05-16
+- Context: Official Block Diffusion avoids per-block forward loops with clean/noisy token packing and specialized attention masks, but SMART-Diffusion uses PyTorch 1.12 graph attention instead of dense SDPA/FlexAttention.
+- Decision: Batch each scene/block as a separate graph view in one `DiffusionDecoder` forward, duplicate ragged map context with new packed view ids, and use BD3-LM-style `t == move_chance` masking plus validation-time clipping variance search.
+- Why: This preserves SMART's graph decoder and repo environment while adding the paper's two practical ingredients: vectorized all-block training and data-driven schedule selection.
+- Impact: Configs now default to `block_vectorized_training: true`, `sampling_eps_min/max`, `var_min: true`, and `clip_search_grid`; `block_mask_prob_min/max` remain deprecated compatibility aliases. Old diffusion checkpoints should be restarted again because mask sampling and loss scaling changed.
