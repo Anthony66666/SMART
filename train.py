@@ -7,12 +7,13 @@ from pytorch_lightning.strategies import DDPStrategy
 from smart.utils.config import load_config_act
 from smart.datamodules import MultiDataModule
 from smart.model import SMART
+from smart.model import SMARTSelfDistill
 from smart.utils.log import Logging
 
 
 if __name__ == '__main__':
     parser = ArgumentParser()
-    Predictor_hash = {"smart": SMART, }
+    Predictor_hash = {"smart": SMART, "smart_self_distill": SMARTSelfDistill, }
     parser.add_argument('--config', type=str, default='configs/train/train_scalable.yaml')
     parser.add_argument('--pretrain_ckpt', type=str, default="")
     parser.add_argument('--ckpt_path', type=str, default="")

@@ -348,19 +348,17 @@ class SMARTAgentDecoder(nn.Module):
                 'next_token_eval_mask': next_token_eval_mask,
                 }
 
-    def inference(self,
-                  data: HeteroData,
-                  map_enc: Mapping[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    def _init_rollout_state(self, data: HeteroData) -> Dict[str, torch.Tensor]:
+        hist_token_idx = (self.num_historical_steps - 1) // self.shift
         eval_mask = data['agent']['valid_mask'][:, self.num_historical_steps - 1]
         pos_a = data['agent']['token_pos'].clone()
         head_a = data['agent']['token_heading'].clone()
-        num_agent, num_step, traj_dim = pos_a.shape
-        pos_a[:, (self.num_historical_steps - 1) // self.shift:] = 0
-        head_a[:, (self.num_historical_steps - 1) // self.shift:] = 0
+        pos_a[:, hist_token_idx:] = 0
+        head_a[:, hist_token_idx:] = 0
         head_vector_a = torch.stack([head_a.cos(), head_a.sin()], dim=-1)
 
         agent_valid_mask = data['agent']['agent_valid_mask'].clone()
-        agent_valid_mask[:, (self.num_historical_steps - 1) // self.shift:] = True
+        agent_valid_mask[:, hist_token_idx:] = True
         agent_valid_mask[~eval_mask] = False
         agent_token_index = data['agent']['token_idx']
         agent_category = data['agent']['category']
@@ -373,137 +371,336 @@ class SMARTAgentDecoder(nn.Module):
             inference=True)
 
         agent_type = data["agent"]["type"]
-        veh_mask = (agent_type == 0)  # * agent_category==3
-        cyc_mask = (agent_type == 2)  # * agent_category==3
-        ped_mask = (agent_type == 1)  # * agent_category==3
-        av_mask = data["agent"]["av_index"]
+        return {
+            'hist_token_idx': hist_token_idx,
+            'eval_mask': eval_mask,
+            'pos_a': pos_a,
+            'head_a': head_a,
+            'head_vector_a': head_vector_a,
+            'num_agent': pos_a.shape[0],
+            'num_step': pos_a.shape[1],
+            'agent_valid_mask': agent_valid_mask,
+            'agent_token_index': agent_token_index,
+            'agent_category': agent_category,
+            'agent_token_traj_all': agent_token_traj_all,
+            'agent_token_emb': agent_token_emb,
+            'categorical_embs': categorical_embs,
+            'agent_type': agent_type,
+            'veh_mask': agent_type == 0,
+            'cyc_mask': agent_type == 2,
+            'ped_mask': agent_type == 1,
+            'mask': agent_valid_mask.clone(),
+            'feat_a': feat_a,
+            'feat_a_t_dict': {},
+            'vel': torch.zeros_like(pos_a),
+        }
 
-        self.num_recurrent_steps_val = data["agent"]['position'].shape[1]-self.num_historical_steps
-        pred_traj = torch.zeros(data["agent"].num_nodes, self.num_recurrent_steps_val, 2, device=feat_a.device)
-        pred_head = torch.zeros(data["agent"].num_nodes, self.num_recurrent_steps_val, device=feat_a.device)
-        pred_prob = torch.zeros(data["agent"].num_nodes, self.num_recurrent_steps_val // self.shift, device=feat_a.device)
-        next_token_idx_list = []
-        mask = agent_valid_mask.clone()
-        feat_a_t_dict = {}
-        for t in range(self.num_recurrent_steps_val // self.shift):
-            if t == 0:
-                inference_mask = mask.clone()
-                inference_mask[:, (self.num_historical_steps - 1) // self.shift + t:] = False
+    def _token_traj_for_indices(self, state: Dict[str, torch.Tensor], token_idx: torch.Tensor) -> torch.Tensor:
+        if token_idx.dim() == 1:
+            gather_idx = token_idx[:, None, None, None, None].expand(
+                -1, 1, self.shift + 1, 4, 2)
+            return torch.gather(state['agent_token_traj_all'], 1, gather_idx)[:, 0]
+        gather_idx = token_idx[..., None, None, None].expand(
+            -1, -1, self.shift + 1, 4, 2)
+        return torch.gather(state['agent_token_traj_all'], 1, gather_idx)
+
+    def _transform_token_traj(self,
+                              state: Dict[str, torch.Tensor],
+                              token_traj: torch.Tensor,
+                              t: int) -> torch.Tensor:
+        hist_token_idx = state['hist_token_idx']
+        theta = state['head_a'][:, hist_token_idx - 1 + t]
+        cos, sin = theta.cos(), theta.sin()
+        rot_mat = torch.zeros((state['num_agent'], 2, 2), device=theta.device)
+        rot_mat[:, 0, 0] = cos
+        rot_mat[:, 0, 1] = sin
+        rot_mat[:, 1, 0] = -sin
+        rot_mat[:, 1, 1] = cos
+        prev_pos = state['pos_a'][:, hist_token_idx - 1 + t]
+
+        if token_traj.dim() == 5:
+            beam_size = token_traj.size(1)
+            agent_diff_rel = torch.bmm(
+                token_traj.reshape(-1, 4, 2),
+                rot_mat[:, None, None, ...].repeat(
+                    1, beam_size, self.shift + 1, 1, 1).reshape(-1, 2, 2)
+            ).reshape(state['num_agent'], beam_size, self.shift + 1, 4, 2)
+            return agent_diff_rel + prev_pos[:, None, None, None, :]
+
+        agent_diff_rel = torch.bmm(
+            token_traj.reshape(-1, 4, 2),
+            rot_mat[:, None, ...].repeat(1, self.shift + 1, 1, 1).reshape(-1, 2, 2)
+        ).reshape(state['num_agent'], self.shift + 1, 4, 2)
+        return agent_diff_rel + prev_pos[:, None, None, :]
+
+    def _candidate_token_trajs(self,
+                               state: Dict[str, torch.Tensor],
+                               topk_idx: torch.Tensor,
+                               t: int) -> torch.Tensor:
+        return self._transform_token_traj(state, self._token_traj_for_indices(state, topk_idx), t)
+
+    def _update_rollout_state(self,
+                              data: HeteroData,
+                              state: Dict[str, torch.Tensor],
+                              selected_token_idx: torch.Tensor,
+                              selected_agent_pred_rel: torch.Tensor,
+                              t: int) -> torch.Tensor:
+        hist_token_idx = state['hist_token_idx']
+        pos_write_idx = hist_token_idx + t
+        state['pos_a'][:, pos_write_idx] = selected_agent_pred_rel[:, -1].clone().mean(dim=1)
+        diff_xy = selected_agent_pred_rel[:, -1, 0, :] - selected_agent_pred_rel[:, -1, 3, :]
+        theta = torch.arctan2(diff_xy[:, 1], diff_xy[:, 0])
+        state['head_a'][:, pos_write_idx] = theta
+
+        agent_token_emb = state['agent_token_emb'].clone()
+        veh_mask = state['veh_mask']
+        ped_mask = state['ped_mask']
+        cyc_mask = state['cyc_mask']
+        agent_token_emb[veh_mask, pos_write_idx] = self.agent_token_emb_veh[selected_token_idx[veh_mask]]
+        agent_token_emb[ped_mask, pos_write_idx] = self.agent_token_emb_ped[selected_token_idx[ped_mask]]
+        agent_token_emb[cyc_mask, pos_write_idx] = self.agent_token_emb_cyc[selected_token_idx[cyc_mask]]
+        state['agent_token_emb'] = agent_token_emb
+
+        motion_vector_a = torch.cat([state['pos_a'].new_zeros(data['agent']['num_nodes'], 1, self.input_dim),
+                                     state['pos_a'][:, 1:] - state['pos_a'][:, :-1]], dim=1)
+        head_vector_a = torch.stack([state['head_a'].cos(), state['head_a'].sin()], dim=-1)
+        vel = motion_vector_a.clone() / (0.1 * self.shift)
+        vel[:, hist_token_idx + 1 + t:] = 0
+        motion_vector_a[:, hist_token_idx + 1 + t:] = 0
+        x_a = torch.stack(
+            [torch.norm(motion_vector_a[:, :, :2], p=2, dim=-1),
+             angle_between_2d_vectors(ctr_vector=head_vector_a, nbr_vector=motion_vector_a[:, :, :2])], dim=-1)
+        x_a = self.x_a_emb(continuous_inputs=x_a.reshape(-1, x_a.size(-1)),
+                           categorical_embs=state['categorical_embs'])
+        x_a = x_a.reshape(-1, state['num_step'], self.hidden_dim)
+        state['feat_a'] = self.fusion_emb(torch.cat((agent_token_emb, x_a), dim=-1))
+        state['head_vector_a'] = head_vector_a
+        state['vel'] = vel
+        return vel
+
+    def _rollout_step(self,
+                      data: HeteroData,
+                      map_enc: Mapping[str, torch.Tensor],
+                      state: Dict[str, torch.Tensor],
+                      t: int,
+                      sample_policy: str = 'multinomial',
+                      forced_token_idx: Optional[torch.Tensor] = None,
+                      topk: Optional[int] = None) -> Dict[str, torch.Tensor]:
+        hist_token_idx = state['hist_token_idx']
+        mask = state['mask']
+        if t == 0:
+            inference_mask = mask.clone()
+            inference_mask[:, hist_token_idx + t:] = False
+        else:
+            inference_mask = torch.zeros_like(mask)
+            inference_mask[:, hist_token_idx + t - 1] = True
+
+        edge_index_t, r_t = self.build_temporal_edge(
+            state['pos_a'], state['head_a'], state['head_vector_a'], state['num_agent'], mask, inference_mask)
+        if isinstance(data, Batch):
+            batch_s = torch.cat([data['agent']['batch'] + data.num_graphs * step
+                                 for step in range(state['num_step'])], dim=0)
+            batch_pl = torch.cat([data['pt_token']['batch'] + data.num_graphs * step
+                                  for step in range(state['num_step'])], dim=0)
+        else:
+            batch_s = torch.arange(state['num_step'],
+                                   device=state['pos_a'].device).repeat_interleave(data['agent']['num_nodes'])
+            batch_pl = torch.arange(state['num_step'],
+                                    device=state['pos_a'].device).repeat_interleave(data['pt_token']['num_nodes'])
+        edge_index_pl2a, r_pl2a = self.build_map2agent_edge(
+            data, state['num_step'], state['agent_category'], state['pos_a'], state['head_a'],
+            state['head_vector_a'], inference_mask, batch_s, batch_pl)
+        mask_s = inference_mask.transpose(0, 1).reshape(-1)
+        edge_index_a2a, r_a2a = self.build_interaction_edge(
+            state['pos_a'], state['head_a'], state['head_vector_a'], batch_s, mask_s)
+
+        feat_a = state['feat_a']
+        feat_a_t_dict = state['feat_a_t_dict']
+        for i in range(self.num_layers):
+            if i in feat_a_t_dict:
+                feat_a = feat_a_t_dict[i]
+            feat_a = feat_a.reshape(-1, self.hidden_dim)
+            feat_a = self.t_attn_layers[i](feat_a, r_t, edge_index_t)
+            feat_a = feat_a.reshape(-1, state['num_step'],
+                                    self.hidden_dim).transpose(0, 1).reshape(-1, self.hidden_dim)
+            feat_a = self.pt2a_attn_layers[i]((map_enc['x_pt'].repeat_interleave(
+                repeats=state['num_step'], dim=0).reshape(-1, state['num_step'], self.hidden_dim).transpose(
+                    0, 1).reshape(-1, self.hidden_dim), feat_a), r_pl2a, edge_index_pl2a)
+            feat_a = self.a2a_attn_layers[i](feat_a, r_a2a, edge_index_a2a)
+            feat_a = feat_a.reshape(state['num_step'], -1, self.hidden_dim).transpose(0, 1)
+
+            update_idx = hist_token_idx - 1 + t
+            if i + 1 not in feat_a_t_dict:
+                feat_a_t_dict[i + 1] = feat_a
             else:
-                inference_mask = torch.zeros_like(mask)
-                inference_mask[:, (self.num_historical_steps - 1) // self.shift + t - 1] = True
-            edge_index_t, r_t = self.build_temporal_edge(pos_a, head_a, head_vector_a, num_agent, mask, inference_mask)
-            if isinstance(data, Batch):
-                batch_s = torch.cat([data['agent']['batch'] + data.num_graphs * t
-                                     for t in range(num_step)], dim=0)
-                batch_pl = torch.cat([data['pt_token']['batch'] + data.num_graphs * t
-                                      for t in range(num_step)], dim=0)
+                cached_feat = feat_a_t_dict[i + 1].clone()
+                cached_feat[:, update_idx] = feat_a[:, update_idx]
+                feat_a_t_dict[i + 1] = cached_feat
+
+        pred_idx = hist_token_idx - 1 + t
+        logits = self.token_predict_head(feat_a[:, pred_idx])
+        probs = torch.softmax(logits, dim=-1)
+        topk = min(int(topk or self.beam_size), logits.size(-1))
+        topk_prob, next_token_idx = torch.topk(probs, k=topk, dim=-1)
+        candidate_rel = self._candidate_token_trajs(state, next_token_idx, t)
+
+        if forced_token_idx is None:
+            if sample_policy == 'argmax':
+                sample_index = torch.zeros((state['num_agent'], 1), dtype=torch.long, device=logits.device)
             else:
-                batch_s = torch.arange(num_step,
-                                       device=pos_a.device).repeat_interleave(data['agent']['num_nodes'])
-                batch_pl = torch.arange(num_step,
-                                        device=pos_a.device).repeat_interleave(data['pt_token']['num_nodes'])
-            # In the inference stage, we only infer the current stage for recurrent
-            edge_index_pl2a, r_pl2a = self.build_map2agent_edge(data, num_step, agent_category, pos_a, head_a,
-                                                                head_vector_a,
-                                                                inference_mask, batch_s,
-                                                                batch_pl)
-            mask_s = inference_mask.transpose(0, 1).reshape(-1)
-            edge_index_a2a, r_a2a = self.build_interaction_edge(pos_a, head_a, head_vector_a,
-                                                                batch_s, mask_s)
+                sample_index = torch.multinomial(topk_prob, 1).to(logits.device)
+            selected_rel = candidate_rel.gather(
+                dim=1,
+                index=sample_index[..., None, None, None].expand(
+                    -1, -1, self.shift + 1, 4, 2))[:, 0]
+            selected_token_idx = next_token_idx.gather(dim=1, index=sample_index).squeeze(-1)
+            selected_prob = topk_prob.gather(dim=-1, index=sample_index).squeeze(-1)
+        else:
+            selected_token_idx = forced_token_idx.long()
+            selected_rel = self._transform_token_traj(
+                state, self._token_traj_for_indices(state, selected_token_idx), t)
+            selected_prob = probs.gather(dim=-1, index=selected_token_idx[:, None]).squeeze(-1)
 
-            for i in range(self.num_layers):
-                if i in feat_a_t_dict:
-                    feat_a = feat_a_t_dict[i]
-                feat_a = feat_a.reshape(-1, self.hidden_dim)
-                feat_a = self.t_attn_layers[i](feat_a, r_t, edge_index_t)
-                feat_a = feat_a.reshape(-1, num_step,
-                                        self.hidden_dim).transpose(0, 1).reshape(-1, self.hidden_dim)
-                feat_a = self.pt2a_attn_layers[i]((map_enc['x_pt'].repeat_interleave(
-                    repeats=num_step, dim=0).reshape(-1, num_step, self.hidden_dim).transpose(0, 1).reshape(
-                        -1, self.hidden_dim), feat_a), r_pl2a, edge_index_pl2a)
-                feat_a = self.a2a_attn_layers[i](feat_a, r_a2a, edge_index_a2a)
-                feat_a = feat_a.reshape(num_step, -1, self.hidden_dim).transpose(0, 1)
-
-                if i+1 not in feat_a_t_dict:
-                    feat_a_t_dict[i+1] = feat_a
-                else:
-                    feat_a_t_dict[i+1][:, (self.num_historical_steps - 1) // self.shift - 1 + t] = feat_a[:, (self.num_historical_steps - 1) // self.shift - 1 + t]
-
-            next_token_prob = self.token_predict_head(feat_a[:, (self.num_historical_steps - 1) // self.shift - 1 + t])
-
-            next_token_prob_softmax = torch.softmax(next_token_prob, dim=-1)
-
-            topk_prob, next_token_idx = torch.topk(next_token_prob_softmax, k=self.beam_size, dim=-1)
-
-            expanded_index = next_token_idx[..., None, None, None].expand(-1, -1, 6, 4, 2)
-            next_token_traj = torch.gather(agent_token_traj_all, 1, expanded_index)
-
-            theta = head_a[:, (self.num_historical_steps - 1) // self.shift - 1 + t]
-            cos, sin = theta.cos(), theta.sin()
-            rot_mat = torch.zeros((num_agent, 2, 2), device=theta.device)
-            rot_mat[:, 0, 0] = cos
-            rot_mat[:, 0, 1] = sin
-            rot_mat[:, 1, 0] = -sin
-            rot_mat[:, 1, 1] = cos
-            agent_diff_rel = torch.bmm(next_token_traj.view(-1, 4, 2),
-                                       rot_mat[:, None, None, ...].repeat(1, self.beam_size, self.shift + 1, 1, 1).view(
-                                           -1, 2, 2)).view(num_agent, self.beam_size, self.shift + 1, 4, 2)
-            agent_pred_rel = agent_diff_rel + pos_a[:, (self.num_historical_steps - 1) // self.shift - 1 + t, :][:, None, None, None, ...]
-
-            sample_index = torch.multinomial(topk_prob, 1).to(agent_pred_rel.device)
-            agent_pred_rel = agent_pred_rel.gather(dim=1,
-                                                   index=sample_index[..., None, None, None].expand(-1, -1, 6, 4,
-                                                                                                    2))[:, 0, ...]
-            pred_prob[:, t] = topk_prob.gather(dim=-1, index=sample_index)[:, 0]
-            pred_traj[:, t * 5:(t + 1) * 5] = agent_pred_rel[:, 1:, ...].clone().mean(dim=2)
-            diff_xy = agent_pred_rel[:, 1:, 0, :] - agent_pred_rel[:, 1:, 3, :]
-            pred_head[:, t * 5:(t + 1) * 5] = torch.arctan2(diff_xy[:, :, 1], diff_xy[:, :, 0])
-
-            pos_a[:, (self.num_historical_steps - 1) // self.shift + t] = agent_pred_rel[:, -1, ...].clone().mean(dim=1)
-            diff_xy = agent_pred_rel[:, -1, 0, :] - agent_pred_rel[:, -1, 3, :]
-            theta = torch.arctan2(diff_xy[:, 1], diff_xy[:, 0])
-            head_a[:, (self.num_historical_steps - 1) // self.shift + t] = theta
-            next_token_idx = next_token_idx.gather(dim=1, index=sample_index)
-            next_token_idx = next_token_idx.squeeze(-1)
-            next_token_idx_list.append(next_token_idx[:, None])
-            agent_token_emb[veh_mask, (self.num_historical_steps - 1) // self.shift + t] = self.agent_token_emb_veh[
-                next_token_idx[veh_mask]]
-            agent_token_emb[ped_mask, (self.num_historical_steps - 1) // self.shift + t] = self.agent_token_emb_ped[
-                next_token_idx[ped_mask]]
-            agent_token_emb[cyc_mask, (self.num_historical_steps - 1) // self.shift + t] = self.agent_token_emb_cyc[
-                next_token_idx[cyc_mask]]
-            motion_vector_a = torch.cat([pos_a.new_zeros(data['agent']['num_nodes'], 1, self.input_dim),
-                                         pos_a[:, 1:] - pos_a[:, :-1]], dim=1)
-
-            head_vector_a = torch.stack([head_a.cos(), head_a.sin()], dim=-1)
-
-            vel = motion_vector_a.clone() / (0.1 * self.shift)
-            vel[:, (self.num_historical_steps - 1) // self.shift + 1 + t:] = 0
-            motion_vector_a[:, (self.num_historical_steps - 1) // self.shift + 1 + t:] = 0
-            x_a = torch.stack(
-                [torch.norm(motion_vector_a[:, :, :2], p=2, dim=-1),
-                 angle_between_2d_vectors(ctr_vector=head_vector_a, nbr_vector=motion_vector_a[:, :, :2])], dim=-1)
-
-            x_a = self.x_a_emb(continuous_inputs=x_a.view(-1, x_a.size(-1)),
-                               categorical_embs=categorical_embs)
-            x_a = x_a.view(-1, num_step, self.hidden_dim)
-
-            feat_a = torch.cat((agent_token_emb, x_a), dim=-1)
-            feat_a = self.fusion_emb(feat_a)
-
-        agent_valid_mask[agent_category != 3] = False
+        selected_traj = selected_rel[:, 1:].clone().mean(dim=2)
+        diff_xy = selected_rel[:, 1:, 0, :] - selected_rel[:, 1:, 3, :]
+        selected_head = torch.arctan2(diff_xy[:, :, 1], diff_xy[:, :, 0])
+        step_mask = state['mask'][:, pred_idx].clone()
+        step_mask[state['agent_category'] != 3] = False
+        self._update_rollout_state(data, state, selected_token_idx, selected_rel, t)
 
         return {
-            'pos_a': pos_a[:, (self.num_historical_steps - 1) // self.shift:],
-            'head_a': head_a[:, (self.num_historical_steps - 1) // self.shift:],
+            'logits': logits,
+            'topk_prob': topk_prob,
+            'topk_idx': next_token_idx,
+            'candidate_trajs': candidate_rel[:, :, 1:].mean(dim=3),
+            'selected_token_idx': selected_token_idx,
+            'selected_prob': selected_prob,
+            'selected_traj': selected_traj,
+            'selected_head': selected_head,
+            'mask': step_mask,
+            'vel': state['vel'],
+        }
+
+    def inference(self,
+                  data: HeteroData,
+                  map_enc: Mapping[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        state = self._init_rollout_state(data)
+        self.num_recurrent_steps_val = data["agent"]['position'].shape[1]-self.num_historical_steps
+        pred_traj = torch.zeros(data["agent"].num_nodes, self.num_recurrent_steps_val, 2,
+                                device=state['feat_a'].device)
+        pred_head = torch.zeros(data["agent"].num_nodes, self.num_recurrent_steps_val,
+                                device=state['feat_a'].device)
+        pred_prob = torch.zeros(data["agent"].num_nodes, self.num_recurrent_steps_val // self.shift,
+                                device=state['feat_a'].device)
+        next_token_idx_list = []
+        for t in range(self.num_recurrent_steps_val // self.shift):
+            step = self._rollout_step(data, map_enc, state, t, sample_policy='multinomial', topk=self.beam_size)
+            pred_prob[:, t] = step['selected_prob']
+            pred_traj[:, t * self.shift:(t + 1) * self.shift] = step['selected_traj']
+            pred_head[:, t * self.shift:(t + 1) * self.shift] = step['selected_head']
+            next_token_idx_list.append(step['selected_token_idx'][:, None])
+
+        state['agent_valid_mask'][state['agent_category'] != 3] = False
+
+        return {
+            'pos_a': state['pos_a'][:, state['hist_token_idx']:],
+            'head_a': state['head_a'][:, state['hist_token_idx']:],
             'gt': data['agent']['position'][:, self.num_historical_steps:, :self.input_dim].contiguous(),
-            'valid_mask': agent_valid_mask[:, self.num_historical_steps:],
+            'valid_mask': state['agent_valid_mask'][:, self.num_historical_steps:],
             'pred_traj': pred_traj,
             'pred_head': pred_head,
             'next_token_idx': torch.cat(next_token_idx_list, dim=-1),
-            'next_token_idx_gt': agent_token_index.roll(shifts=-1, dims=1),
+            'next_token_idx_gt': state['agent_token_index'].roll(shifts=-1, dims=1),
             'next_token_eval_mask': data['agent']['agent_valid_mask'],
             'pred_prob': pred_prob,
-            'vel': vel
+            'vel': state['vel']
+        }
+
+    def rollout_tokens(self,
+                       data: HeteroData,
+                       map_enc: Mapping[str, torch.Tensor],
+                       num_steps: int,
+                       num_rollouts: int,
+                       topk: int) -> Dict[str, torch.Tensor]:
+        with torch.no_grad():
+            num_steps = min(int(num_steps), (data["agent"]['position'].shape[1] - self.num_historical_steps) // self.shift)
+            token_rollouts = []
+            traj_rollouts = []
+            head_rollouts = []
+            mask_rollouts = []
+            candidate_idx_rollouts = []
+            candidate_traj_rollouts = []
+            candidate_prob_rollouts = []
+            for _ in range(int(num_rollouts)):
+                state = self._init_rollout_state(data)
+                token_steps = []
+                traj_steps = []
+                head_steps = []
+                mask_steps = []
+                candidate_idx_steps = []
+                candidate_traj_steps = []
+                candidate_prob_steps = []
+                for t in range(num_steps):
+                    step = self._rollout_step(data, map_enc, state, t, sample_policy='multinomial', topk=topk)
+                    token_steps.append(step['selected_token_idx'])
+                    traj_steps.append(step['selected_traj'])
+                    head_steps.append(step['selected_head'])
+                    mask_steps.append(step['mask'])
+                    candidate_idx_steps.append(step['topk_idx'])
+                    candidate_traj_steps.append(step['candidate_trajs'])
+                    candidate_prob_steps.append(step['topk_prob'])
+                token_rollouts.append(torch.stack(token_steps, dim=-1))
+                traj_rollouts.append(torch.cat(traj_steps, dim=1))
+                head_rollouts.append(torch.cat(head_steps, dim=1))
+                mask_rollouts.append(torch.stack(mask_steps, dim=-1))
+                candidate_idx_rollouts.append(torch.stack(candidate_idx_steps, dim=1))
+                candidate_traj_rollouts.append(torch.stack(candidate_traj_steps, dim=1))
+                candidate_prob_rollouts.append(torch.stack(candidate_prob_steps, dim=1))
+
+            return {
+                'token_idx': torch.stack(token_rollouts, dim=0),
+                'pred_traj': torch.stack(traj_rollouts, dim=0),
+                'pred_head': torch.stack(head_rollouts, dim=0),
+                'mask': torch.stack(mask_rollouts, dim=0),
+                'candidate_idx': torch.stack(candidate_idx_rollouts, dim=0),
+                'candidate_trajs': torch.stack(candidate_traj_rollouts, dim=0),
+                'candidate_prob': torch.stack(candidate_prob_rollouts, dim=0),
+            }
+
+    def score_token_prefix(self,
+                           data: HeteroData,
+                           map_enc: Mapping[str, torch.Tensor],
+                           forced_token_idx: torch.Tensor,
+                           num_steps: int) -> Dict[str, torch.Tensor]:
+        if forced_token_idx.dim() == 2:
+            forced_token_idx = forced_token_idx.unsqueeze(0)
+        rollout_count = forced_token_idx.size(0)
+        num_steps = min(int(num_steps), forced_token_idx.size(-1))
+        logits_rollouts = []
+        mask_rollouts = []
+        traj_rollouts = []
+        head_rollouts = []
+        for rollout_id in range(rollout_count):
+            state = self._init_rollout_state(data)
+            logits_steps = []
+            mask_steps = []
+            traj_steps = []
+            head_steps = []
+            for t in range(num_steps):
+                step = self._rollout_step(
+                    data, map_enc, state, t, forced_token_idx=forced_token_idx[rollout_id, :, t])
+                logits_steps.append(step['logits'])
+                mask_steps.append(step['mask'])
+                traj_steps.append(step['selected_traj'])
+                head_steps.append(step['selected_head'])
+            logits_rollouts.append(torch.stack(logits_steps, dim=1))
+            mask_rollouts.append(torch.stack(mask_steps, dim=-1))
+            traj_rollouts.append(torch.cat(traj_steps, dim=1))
+            head_rollouts.append(torch.cat(head_steps, dim=1))
+
+        return {
+            'logits': torch.stack(logits_rollouts, dim=0),
+            'mask': torch.stack(mask_rollouts, dim=0),
+            'pred_traj': torch.stack(traj_rollouts, dim=0),
+            'pred_head': torch.stack(head_rollouts, dim=0),
         }
