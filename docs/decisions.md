@@ -1,5 +1,12 @@
 # Decisions
 
+## Decision: Use prefix-constrained geometry for SMART-Diffusion denoising
+- Date: 2026-05-18
+- Context: Out-of-road rollouts persisted even though map tokens were retained and map-to-token edges were rebuilt each denoising step; masked future chunks still lacked reliable poses and fell back to weak historical geometry.
+- Decision: During training, suffix-close masked chunks per agent and supervise only the first masked frontier chunk. During sampling, release only prefix-ready frontier chunks and remask suffixes whenever an earlier chunk is remasked.
+- Why: Map conditioning should be queried from poses supported by an already sampled trajectory prefix, not from an early all-mask clean-trajectory guess that can amplify off-road errors.
+- Impact: SMART-Diffusion remains joint across agents at each frontier chunk, while long-horizon generation becomes chunk-prefix ordered per agent. Configs expose `prefix_constrained_sampling` and `prefix_constrained_training` for ablation.
+
 ## Decision: Use graph-first repository discovery
 - Date: 2026-04-21
 - Context: Broad grep-based exploration wastes context and scales poorly as the repository grows.

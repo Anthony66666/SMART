@@ -1,5 +1,12 @@
 # Progress
 
+## 2026-05-18 CST
+- Task: Added prefix-constrained SMART-Diffusion training and sampling to reduce out-of-road rollouts from unreliable future geometry.
+- Result: Diffusion training suffix-closes masked chunks per agent and supervises only the first masked frontier chunk; sampling now releases only prefix-ready frontier chunks, remasks suffixes when earlier chunks are remasked, keeps sample-time confidence instead of recomputing unmasked confidence, and falls back to prefix-ordered final fill. Diffusion configs now expose `prefix_constrained_sampling` and `prefix_constrained_training`.
+- Files: `smart/model/smart_diffusion.py`, `configs/train/train_scalable_diffusion.yaml`, `configs/train/train_scalable_diffusion_local.yaml`, `configs/validation/validation_scalable_diffusion.yaml`, `tests/test_smart_diffusion_prefix.py`
+- Validation: `py_compile` passed; prefix helper unit tests passed; real validation batch loss/sampling smoke passed with full map context and no remaining mask tokens under both 4-step smoke and default 32-step sampling; inference smoke produced finite `pred_traj=(73,80,2)` and valid target token ids.
+- Next: Train from scratch with prefix constraints enabled and compare off-road visualizations/metrics against the previous diffusion run.
+
 ## 2026-05-15 CST
 - Task: Implemented SMART-Diffusion stability and fair-comparison upgrades.
 - Result: Diffusion now uses quasi-random timestep sampling that works at batch size 1, exact-count low-variance masks, alternating antithetic token ranking, target-category-only training/evaluation by default, 6-layer diffusion configs, 32-step sampling, and MaskGIT-style remask/resample inference. Validation visualization now shows prediction/GT futures only for target-category agents while keeping other agents as context.

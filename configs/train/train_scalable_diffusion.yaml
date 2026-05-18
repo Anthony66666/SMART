@@ -89,4 +89,6 @@ Model:
     antithetic_mask_ranking: true
     remask_sampling: true
     remask_confidence_temperature: 1.0
+    prefix_constrained_sampling: true
+    prefix_constrained_training: true
     freeze_encoder: false

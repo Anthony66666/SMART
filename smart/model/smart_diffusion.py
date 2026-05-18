@@ -80,6 +80,8 @@ class SMARTDiffusion(SMART):
         self.remask_sampling = bool(getattr(diffusion_cfg, 'remask_sampling', True))
         self.remask_confidence_temperature = float(getattr(diffusion_cfg, 'remask_confidence_temperature', 1.0))
         self.remask_confidence_temperature = max(self.remask_confidence_temperature, 1e-6)
+        self.prefix_constrained_sampling = bool(getattr(diffusion_cfg, 'prefix_constrained_sampling', True))
+        self.prefix_constrained_training = bool(getattr(diffusion_cfg, 'prefix_constrained_training', True))
         self.diffusion_eval_batches = int(getattr(diffusion_cfg, 'eval_inference_batches', 2))
         token_size = int(getattr(model_config.decoder, 'token_size', 2048))
 
@@ -292,6 +294,62 @@ class SMARTDiffusion(SMART):
             selected = torch.topk(scores[batch_idx], k=mask_count, largest=False).indices
             mask[batch_idx, selected] = True
         return mask
+
+    def _apply_prefix_mask_closure(self, mask, valid_mask, token_agent_ids, chunk_ids):
+        """If a prefix chunk is masked, all later valid chunks for that agent stay masked."""
+        closed = (mask & valid_mask).clone()
+        B = valid_mask.shape[0]
+        for batch_idx in range(B):
+            valid_agents = torch.unique(
+                token_agent_ids[batch_idx][
+                    valid_mask[batch_idx] & (token_agent_ids[batch_idx] >= 0)
+                ]
+            )
+            for agent_id in valid_agents.tolist():
+                agent_valid = (
+                    valid_mask[batch_idx]
+                    & (token_agent_ids[batch_idx] == int(agent_id))
+                )
+                masked_chunks = chunk_ids[batch_idx][agent_valid & closed[batch_idx]]
+                if masked_chunks.numel() == 0:
+                    continue
+                first_masked_chunk = masked_chunks.min()
+                closed[batch_idx] = (
+                    closed[batch_idx]
+                    | (
+                        agent_valid
+                        & (chunk_ids[batch_idx] >= first_masked_chunk)
+                    )
+                )
+        return closed & valid_mask
+
+    def _prefix_frontier_mask(self, mask, valid_mask, token_agent_ids, chunk_ids):
+        """Return the first currently masked valid chunk for each agent."""
+        candidates = mask & valid_mask
+        frontier = torch.zeros_like(candidates)
+        B = valid_mask.shape[0]
+        for batch_idx in range(B):
+            valid_agents = torch.unique(
+                token_agent_ids[batch_idx][
+                    valid_mask[batch_idx] & (token_agent_ids[batch_idx] >= 0)
+                ]
+            )
+            for agent_id in valid_agents.tolist():
+                agent_masked = (
+                    candidates[batch_idx]
+                    & (token_agent_ids[batch_idx] == int(agent_id))
+                )
+                if not agent_masked.any():
+                    continue
+                first_masked_chunk = chunk_ids[batch_idx][agent_masked].min()
+                frontier[batch_idx] = (
+                    frontier[batch_idx]
+                    | (
+                        agent_masked
+                        & (chunk_ids[batch_idx] == first_masked_chunk)
+                    )
+                )
+        return frontier
 
     def _target_agent_mask(self, data):
         target = (
@@ -645,6 +703,21 @@ class SMARTDiffusion(SMART):
 
         gt = packed['token_ids']
         mask = self._sample_training_mask(packed['valid_mask'], mask_prob)
+        if self.prefix_constrained_training:
+            mask = self._apply_prefix_mask_closure(
+                mask,
+                packed['valid_mask'],
+                packed['token_agent_ids'],
+                packed['chunk_ids'],
+            )
+            loss_mask = self._prefix_frontier_mask(
+                mask,
+                packed['valid_mask'],
+                packed['token_agent_ids'],
+                packed['chunk_ids'],
+            )
+        else:
+            loss_mask = mask
         noisy = gt.clone()
         noisy[mask] = self.mask_token_id
         geometry_known_mask = (~mask) & packed['valid_mask']
@@ -675,13 +748,13 @@ class SMARTDiffusion(SMART):
             map_valid_mask=packed.get('map_valid_mask'),
         )
 
-        if mask.any():
+        if loss_mask.any():
             log_p = F.log_softmax(logits, dim=-1)
             nll = -log_p.gather(-1, gt.unsqueeze(-1)).squeeze(-1)
             weight = (dsigma_t / torch.expm1(sigma_t)).unsqueeze(-1).expand_as(nll)
-            loss = (weight * nll * mask.to(dtype=nll.dtype)).sum()
+            loss = (weight * nll * loss_mask.to(dtype=nll.dtype)).sum()
             loss = loss / packed['valid_mask'].to(dtype=nll.dtype).sum().clamp_min(1.0)
-            acc = (logits[mask].argmax(-1) == gt[mask]).float().mean()
+            acc = (logits[loss_mask].argmax(-1) == gt[loss_mask]).float().mean()
         else:
             loss = logits.sum() * 0.0
             acc = logits.new_zeros(())
@@ -800,10 +873,9 @@ class SMARTDiffusion(SMART):
         confidence_out = summary.new_zeros((B, L))
         trace = []
 
-        for step in range(S):
-            t_cur = max(1.0 - step / S, self.min_t)
-            t_next = max(1.0 - (step + 1) / S, self.min_t)
-            t_batch = torch.full((B,), t_cur, device=device)
+        def decode_probs(t_value):
+            nonlocal token_positions, token_headings
+            t_batch = torch.full((B,), t_value, device=device)
             if packed is not None:
                 token_positions, token_headings = self._refresh_token_geometry(x, packed)
 
@@ -824,19 +896,57 @@ class SMARTDiffusion(SMART):
                 map_batch=map_batch,
                 map_valid_mask=map_valid_mask,
             )
-            probs = F.softmax(logits / self.remask_confidence_temperature, dim=-1)
+            return F.softmax(logits / self.remask_confidence_temperature, dim=-1)
+
+        for step in range(S):
+            t_cur = max(1.0 - step / S, self.min_t)
+            t_next = max(1.0 - (step + 1) / S, self.min_t)
+            probs = decode_probs(t_cur)
 
             if step == S - 1 or t_next <= self.min_t:
-                if mask.any():
+                masked_before = int(mask.sum().item())
+                final_rounds = 0
+                final_sampled = 0
+                if self.prefix_constrained_sampling:
+                    while mask.any():
+                        sample_mask = self._prefix_frontier_mask(
+                            mask,
+                            valid_mask,
+                            token_agent_ids,
+                            chunk_ids,
+                        )
+                        if not sample_mask.any():
+                            sample_mask = mask.clone()
+                        final_prob, final_ids = probs[sample_mask].max(dim=-1)
+                        x[sample_mask] = final_ids
+                        confidence_out[sample_mask] = final_prob
+                        final_sampled += int(sample_mask.sum().item())
+                        mask = valid_mask & (x == self.mask_token_id)
+                        final_rounds += 1
+                        if not mask.any():
+                            break
+                        if final_rounds > self.num_future_chunks + 1:
+                            final_prob, final_ids = probs[mask].max(dim=-1)
+                            x[mask] = final_ids
+                            confidence_out[mask] = final_prob
+                            final_sampled += int(mask.sum().item())
+                            mask.zero_()
+                            break
+                        probs = decode_probs(t_cur)
+                elif mask.any():
+                    final_sampled = int(mask.sum().item())
+                    final_rounds = 1
                     final_prob, final_ids = probs[mask].max(dim=-1)
                     x[mask] = final_ids
                     confidence_out[mask] = final_prob
                 if return_trace:
                     trace.append({
                         'step': step,
-                        'masked_before': int(mask.sum().item()),
+                        'masked_before': masked_before,
                         'masked_after': 0,
                         'remasked': 0,
+                        'frontier': final_sampled,
+                        'final_rounds': final_rounds,
                     })
                 mask.zero_()
             else:
@@ -844,46 +954,89 @@ class SMARTDiffusion(SMART):
                 p_next_value = float(p_next.item())
                 masked_before = int(mask.sum().item())
 
-                if mask.any():
+                sample_mask = (
+                    self._prefix_frontier_mask(
+                        mask,
+                        valid_mask,
+                        token_agent_ids,
+                        chunk_ids,
+                    )
+                    if self.prefix_constrained_sampling
+                    else mask
+                )
+
+                if sample_mask.any():
                     sampled = torch.multinomial(
-                        probs[mask].clamp(min=1e-10),
+                        probs[sample_mask].clamp(min=1e-10),
                         1,
                     ).squeeze(-1)
-                    x[mask] = sampled
-                    selected_prob = probs[mask].gather(-1, sampled.unsqueeze(-1)).squeeze(-1)
-                    confidence_out[mask] = selected_prob
-
-                token_confidence = confidence_out.clone()
-                known_valid = valid_mask & (x != self.mask_token_id)
-                if known_valid.any():
-                    safe_x = x.clamp(min=0, max=self.token_size - 1)
-                    token_confidence[known_valid] = probs.gather(
+                    x[sample_mask] = sampled
+                    selected_prob = probs[sample_mask].gather(
                         -1,
-                        safe_x.unsqueeze(-1),
-                    ).squeeze(-1)[known_valid]
-                token_confidence = token_confidence.masked_fill(~valid_mask, float('inf'))
+                        sampled.unsqueeze(-1),
+                    ).squeeze(-1)
+                    confidence_out[sample_mask] = selected_prob
 
-                next_mask = torch.zeros_like(mask)
-                for batch_idx in range(B):
-                    valid_count = int(valid_mask[batch_idx].sum().item())
-                    if valid_count == 0:
-                        continue
-                    candidate_mask = valid_mask[batch_idx] if self.remask_sampling else mask[batch_idx]
-                    candidate_indices = torch.nonzero(candidate_mask, as_tuple=False).squeeze(-1)
-                    if candidate_indices.numel() == 0:
-                        continue
-                    target_masked = int(round(p_next_value * valid_count))
-                    target_masked = min(max(target_masked, 0), int(candidate_indices.numel()))
-                    if target_masked <= 0:
-                        continue
-                    low_conf_local = torch.topk(
-                        token_confidence[batch_idx, candidate_indices],
-                        k=target_masked,
-                        largest=False,
-                    ).indices
-                    next_mask[batch_idx, candidate_indices[low_conf_local]] = True
+                token_confidence = confidence_out.clone().masked_fill(~valid_mask, float('inf'))
+
+                if self.prefix_constrained_sampling:
+                    next_mask = valid_mask & (x == self.mask_token_id)
+                    for batch_idx in range(B):
+                        valid_count = int(valid_mask[batch_idx].sum().item())
+                        if valid_count == 0:
+                            continue
+                        target_masked = int(round(p_next_value * valid_count))
+                        target_masked = min(max(target_masked, 0), valid_count)
+                        already_masked = int(next_mask[batch_idx].sum().item())
+                        additional_masked = target_masked - already_masked
+                        if additional_masked <= 0 or not self.remask_sampling:
+                            continue
+                        candidate_mask = (
+                            valid_mask[batch_idx]
+                            & (x[batch_idx] != self.mask_token_id)
+                        )
+                        candidate_indices = torch.nonzero(
+                            candidate_mask,
+                            as_tuple=False,
+                        ).squeeze(-1)
+                        if candidate_indices.numel() == 0:
+                            continue
+                        additional_masked = min(additional_masked, int(candidate_indices.numel()))
+                        low_conf_local = torch.topk(
+                            token_confidence[batch_idx, candidate_indices],
+                            k=additional_masked,
+                            largest=False,
+                        ).indices
+                        next_mask[batch_idx, candidate_indices[low_conf_local]] = True
+                    next_mask = self._apply_prefix_mask_closure(
+                        next_mask,
+                        valid_mask,
+                        token_agent_ids,
+                        chunk_ids,
+                    )
+                else:
+                    next_mask = torch.zeros_like(mask)
+                    for batch_idx in range(B):
+                        valid_count = int(valid_mask[batch_idx].sum().item())
+                        if valid_count == 0:
+                            continue
+                        candidate_mask = valid_mask[batch_idx] if self.remask_sampling else mask[batch_idx]
+                        candidate_indices = torch.nonzero(candidate_mask, as_tuple=False).squeeze(-1)
+                        if candidate_indices.numel() == 0:
+                            continue
+                        target_masked = int(round(p_next_value * valid_count))
+                        target_masked = min(max(target_masked, 0), int(candidate_indices.numel()))
+                        if target_masked <= 0:
+                            continue
+                        low_conf_local = torch.topk(
+                            token_confidence[batch_idx, candidate_indices],
+                            k=target_masked,
+                            largest=False,
+                        ).indices
+                        next_mask[batch_idx, candidate_indices[low_conf_local]] = True
 
                 remasked = next_mask & valid_mask
+                newly_remasked = remasked & (x != self.mask_token_id)
                 x[remasked] = self.mask_token_id
                 confidence_out[remasked] = 0.0
                 if return_trace:
@@ -891,7 +1044,8 @@ class SMARTDiffusion(SMART):
                         'step': step,
                         'masked_before': masked_before,
                         'masked_after': int(next_mask.sum().item()),
-                        'remasked': int((next_mask & ~mask).sum().item()),
+                        'remasked': int(newly_remasked.sum().item()),
+                        'frontier': int(sample_mask.sum().item()),
                     })
                 mask = next_mask
 
