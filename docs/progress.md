@@ -1,5 +1,19 @@
 # Progress
 
+## 2026-05-20 CST
+- Task: Added training-time self-conditioning to SMART-Diffusion.
+- Result: Diffusion loss can now run a no-grad first pass on selected visible tokens, feed argmax predictions back into the final denoising pass, and supervise those self-conditioned positions against GT. Train diffusion configs enable `self_condition_prob: 0.25` and `self_condition_visible_prob: 0.10`.
+- Files: `smart/model/smart_diffusion.py`, `configs/train/train_scalable_diffusion.yaml`, `configs/train/train_scalable_diffusion_local.yaml`
+- Validation: `python3 -m py_compile smart/model/smart_diffusion.py` passed.
+- Next: Run a short diffusion training smoke and compare free-running validation metrics with self-conditioning enabled vs disabled.
+
+## 2026-05-18 CST
+- Task: Added a SMART-Diffusion map-token diagnostic visualization script.
+- Result: `scripts/visualize_diffusion_map_tokens.py` randomly samples validation agents and plots packed map tokens, all-mask map edges, GT-geometry map edges, agent history, and GT future by chunk. A one-sample smoke generated two PNGs under `outputs/diffusion_map_token_debug_smoke/`.
+- Files: `scripts/visualize_diffusion_map_tokens.py`
+- Validation: `python3 -m py_compile scripts/visualize_diffusion_map_tokens.py` passed; smoke run wrote two diagnostic images.
+- Next: Inspect multiple random samples, especially left-turn/right-turn lane cases, to determine whether bad early trajectories correlate with wrong or overly broad map-token context.
+
 ## 2026-05-18 CST
 - Task: Added prefix-constrained SMART-Diffusion training and sampling to reduce out-of-road rollouts from unreliable future geometry.
 - Result: Diffusion training suffix-closes masked chunks per agent and supervises only the first masked frontier chunk; sampling now releases only prefix-ready frontier chunks, remasks suffixes when earlier chunks are remasked, keeps sample-time confidence instead of recomputing unmasked confidence, and falls back to prefix-ordered final fill. Diffusion configs now expose `prefix_constrained_sampling` and `prefix_constrained_training`.

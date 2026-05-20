@@ -82,6 +82,15 @@ class SMARTDiffusion(SMART):
         self.remask_confidence_temperature = max(self.remask_confidence_temperature, 1e-6)
         self.prefix_constrained_sampling = bool(getattr(diffusion_cfg, 'prefix_constrained_sampling', True))
         self.prefix_constrained_training = bool(getattr(diffusion_cfg, 'prefix_constrained_training', True))
+        self.self_condition_prob = float(getattr(diffusion_cfg, 'self_condition_prob', 0.0))
+        self.self_condition_prob = min(max(self.self_condition_prob, 0.0), 1.0)
+        self.self_condition_visible_prob = float(getattr(diffusion_cfg, 'self_condition_visible_prob', 0.1))
+        self.self_condition_visible_prob = min(max(self.self_condition_visible_prob, 0.0), 1.0)
+        self.self_condition_mode = str(getattr(diffusion_cfg, 'self_condition_mode', 'argmax')).lower()
+        if self.self_condition_mode != 'argmax':
+            raise ValueError(f"Unsupported diffusion.self_condition_mode: {self.self_condition_mode}")
+        self.self_condition_loss_weight = float(getattr(diffusion_cfg, 'self_condition_loss_weight', 1.0))
+        self.self_condition_loss_weight = max(self.self_condition_loss_weight, 0.0)
         self.diffusion_eval_batches = int(getattr(diffusion_cfg, 'eval_inference_batches', 2))
         token_size = int(getattr(model_config.decoder, 'token_size', 2048))
 
@@ -696,6 +705,37 @@ class SMARTDiffusion(SMART):
         packed['map_valid_mask'] = map_valid_mask
         return packed, summary, ft, fv, agents_ok, agent_batch
 
+    def _decode_diffusion_logits(self, noisy, packed, summary, t, geometry_known_mask):
+        token_positions, token_headings = self._refresh_token_geometry(
+            noisy,
+            packed,
+            geometry_known_mask=geometry_known_mask,
+        )
+
+        return self.diffusion_decoder(
+            noisy_token_ids=noisy,
+            token_positions=token_positions,
+            token_headings=token_headings,
+            token_agent_ids=packed['token_agent_ids'],
+            noisy_token_chunk_ids=packed['chunk_ids'], scene_summary=summary,
+            t=t, valid_mask=packed['valid_mask'],
+            agent_context=packed['agent_context'],
+            agent_type_ids=packed['agent_type_ids'],
+            agent_shape_embeddings=packed['agent_shape_embeddings'],
+            physical_token_embeddings=self._physical_token_embeddings(noisy, packed['agent_type_ids']),
+            map_context=packed.get('map_context'),
+            map_positions=packed.get('map_positions'),
+            map_orientations=packed.get('map_orientations'),
+            map_batch=packed.get('map_batch'),
+            map_valid_mask=packed.get('map_valid_mask'),
+        )
+
+    def _maybe_apply_geometry_dropout(self, geometry_known_mask, reference):
+        if self.training and self.geometry_dropout_prob > 0.0:
+            geometry_keep = torch.rand_like(reference.float()) >= self.geometry_dropout_prob
+            geometry_known_mask = geometry_known_mask & geometry_keep
+        return geometry_known_mask
+
     def _compute_diffusion_loss(self, packed, summary):
         B = summary.shape[0]
         t = self._sample_diffusion_timesteps(B, summary.device)
@@ -718,46 +758,93 @@ class SMARTDiffusion(SMART):
             )
         else:
             loss_mask = mask
+
         noisy = gt.clone()
         noisy[mask] = self.mask_token_id
-        geometry_known_mask = (~mask) & packed['valid_mask']
-        if self.training and self.geometry_dropout_prob > 0.0:
-            geometry_keep = torch.rand_like(gt.float()) >= self.geometry_dropout_prob
-            geometry_known_mask = geometry_known_mask & geometry_keep
-        token_positions, token_headings = self._refresh_token_geometry(
+
+        self_condition_mask = torch.zeros_like(mask)
+        self_condition_input_acc = gt.new_tensor(0.0, dtype=torch.float)
+        should_self_condition = (
+            self.training
+            and self.self_condition_prob > 0.0
+            and self.self_condition_visible_prob > 0.0
+            and torch.rand((), device=gt.device) < self.self_condition_prob
+        )
+        if should_self_condition:
+            visible_mask = packed['valid_mask'] & ~mask
+            self_condition_mask = (
+                torch.rand_like(gt.float()) < self.self_condition_visible_prob
+            ) & visible_mask
+            if self_condition_mask.any():
+                first_noisy = gt.clone()
+                first_mask = mask | self_condition_mask
+                first_noisy[first_mask] = self.mask_token_id
+                first_geometry_known = self._maybe_apply_geometry_dropout(
+                    (~first_mask) & packed['valid_mask'],
+                    gt,
+                )
+                with torch.no_grad():
+                    first_logits = self._decode_diffusion_logits(
+                        first_noisy,
+                        packed,
+                        summary,
+                        t,
+                        first_geometry_known,
+                    )
+                    first_pred = first_logits.argmax(dim=-1)
+                noisy[self_condition_mask] = first_pred[self_condition_mask]
+                self_condition_input_acc = (
+                    first_pred[self_condition_mask] == gt[self_condition_mask]
+                ).float().mean()
+
+        final_loss_mask = loss_mask | self_condition_mask
+        geometry_known_mask = self._maybe_apply_geometry_dropout(
+            (~mask) & packed['valid_mask'],
+            gt,
+        )
+        logits = self._decode_diffusion_logits(
             noisy,
             packed,
-            geometry_known_mask=geometry_known_mask,
+            summary,
+            t,
+            geometry_known_mask,
         )
 
-        logits = self.diffusion_decoder(
-            noisy_token_ids=noisy,
-            token_positions=token_positions,
-            token_headings=token_headings,
-            token_agent_ids=packed['token_agent_ids'],
-            noisy_token_chunk_ids=packed['chunk_ids'], scene_summary=summary,
-            t=t, valid_mask=packed['valid_mask'],
-            agent_context=packed['agent_context'],
-            agent_type_ids=packed['agent_type_ids'],
-            agent_shape_embeddings=packed['agent_shape_embeddings'],
-            physical_token_embeddings=self._physical_token_embeddings(noisy, packed['agent_type_ids']),
-            map_context=packed.get('map_context'),
-            map_positions=packed.get('map_positions'),
-            map_orientations=packed.get('map_orientations'),
-            map_batch=packed.get('map_batch'),
-            map_valid_mask=packed.get('map_valid_mask'),
-        )
-
-        if loss_mask.any():
+        if final_loss_mask.any():
             log_p = F.log_softmax(logits, dim=-1)
             nll = -log_p.gather(-1, gt.unsqueeze(-1)).squeeze(-1)
             weight = (dsigma_t / torch.expm1(sigma_t)).unsqueeze(-1).expand_as(nll)
-            loss = (weight * nll * loss_mask.to(dtype=nll.dtype)).sum()
+            supervision_weight = loss_mask.to(dtype=nll.dtype)
+            if self_condition_mask.any():
+                supervision_weight = supervision_weight + (
+                    self.self_condition_loss_weight
+                    * self_condition_mask.to(dtype=nll.dtype)
+                )
+            loss = (weight * nll * supervision_weight).sum()
             loss = loss / packed['valid_mask'].to(dtype=nll.dtype).sum().clamp_min(1.0)
-            acc = (logits[loss_mask].argmax(-1) == gt[loss_mask]).float().mean()
+            if loss_mask.any():
+                acc = (logits[loss_mask].argmax(-1) == gt[loss_mask]).float().mean()
+            else:
+                acc = logits.new_zeros(())
         else:
             loss = logits.sum() * 0.0
             acc = logits.new_zeros(())
+
+        if self.training:
+            valid_count = packed['valid_mask'].to(dtype=torch.float).sum().clamp_min(1.0)
+            self_condition_frac = self_condition_mask.to(dtype=torch.float).sum() / valid_count
+            if self_condition_mask.any():
+                self_condition_acc = (
+                    logits[self_condition_mask].argmax(-1) == gt[self_condition_mask]
+                ).float().mean()
+            else:
+                self_condition_acc = logits.new_zeros(())
+            self.log('train_self_condition_frac', self_condition_frac,
+                     prog_bar=False, on_step=True, on_epoch=True, batch_size=1)
+            self.log('train_self_condition_input_acc', self_condition_input_acc,
+                     prog_bar=False, on_step=True, on_epoch=True, batch_size=1)
+            self.log('train_self_condition_acc', self_condition_acc,
+                     prog_bar=False, on_step=True, on_epoch=True, batch_size=1)
         return loss, acc
 
     def training_step(self, data, batch_idx):

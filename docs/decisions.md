@@ -83,3 +83,10 @@
 - Decision: Use quasi-random timestep sampling across global steps, exact-count masked token selection with alternating antithetic ranking, 6-layer diffusion decoding, and MaskGIT-style remask/resample sampling by default.
 - Why: This directly targets training variance, capacity mismatch with SMART, and early denoising error lock-in without changing SMART tokenization.
 - Impact: Diffusion configs default to `num_layers: 6`, `num_steps: 32`, exact low-variance masking, and `remask_sampling: true`.
+
+## Decision: Use training-time self-conditioning for SMART-Diffusion
+- Date: 2026-05-20
+- Context: SMART-Diffusion sampling keeps model-generated future tokens as visible denoising context, while training previously used only GT visible future tokens.
+- Decision: Add optional self-conditioning that masks a subset of visible positions in a no-grad first pass, feeds argmax predictions back as visible tokens in the final pass, and supervises those positions against GT.
+- Why: This exposes training to sampled-token context without changing the inference sampler or adding random visible-token corruption.
+- Impact: Diffusion train configs now expose `self_condition_prob`, `self_condition_visible_prob`, `self_condition_mode`, and `self_condition_loss_weight`; validation loss remains teacher-forced.

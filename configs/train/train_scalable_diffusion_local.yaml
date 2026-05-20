@@ -96,4 +96,8 @@ Model:
     remask_confidence_temperature: 1.0
     prefix_constrained_sampling: true
     prefix_constrained_training: true
+    self_condition_prob: 0.25
+    self_condition_visible_prob: 0.10
+    self_condition_mode: "argmax"
+    self_condition_loss_weight: 1.0
     freeze_encoder: false
