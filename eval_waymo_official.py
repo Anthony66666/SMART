@@ -17,6 +17,8 @@ from tqdm import tqdm
 
 from smart.datasets.scalable_dataset import MultiDataset
 from smart.model import SMART
+from smart.model import SMARTAutoregressiveDiffusion
+from smart.model import SMARTDiffusion
 from smart.model import SMARTJEPA
 from smart.transforms import WaymoTargetBuilder
 from smart.utils.config import load_config_act
@@ -53,6 +55,8 @@ with contextlib.suppress(Exception):
 
 PREDICTOR_HASH = {
     "smart": SMART,
+    "smart_diffusion": SMARTDiffusion,
+    "smart_ar_diffusion": SMARTAutoregressiveDiffusion,
     "smart_jepa": SMARTJEPA,
 }
 
@@ -345,6 +349,64 @@ def prepare_data_for_inference(model, data, seed: int):
     return data
 
 
+def _validate_sim_agent_prediction(
+    prediction: Dict[str, torch.Tensor],
+    data,
+    object_id: int,
+    agent_index: int,
+    future_steps: int,
+    scenario_id: str,
+) -> None:
+    agent_ids = normalize_agent_ids(data["agent"]["id"])
+    if int(object_id) not in set(agent_ids):
+        raise ValueError(
+            f"Scenario {scenario_id} object {object_id}: sim-agent is missing from the processed SMART sample."
+        )
+
+    if "pred_traj" not in prediction or "pred_head" not in prediction:
+        raise ValueError(
+            f"Scenario {scenario_id} object {object_id}: prediction is missing pred_traj or pred_head."
+        )
+    if "pred_valid_mask" not in prediction:
+        raise ValueError(
+            f"Scenario {scenario_id} object {object_id}: prediction is missing pred_valid_mask."
+        )
+
+    pred_traj = prediction["pred_traj"].detach().cpu().float()
+    pred_head = prediction["pred_head"].detach().cpu().float()
+    pred_valid = prediction["pred_valid_mask"].detach().cpu().bool()
+
+    if agent_index < 0 or agent_index >= pred_traj.shape[0]:
+        raise ValueError(
+            f"Scenario {scenario_id} object {object_id}: agent index {agent_index} is outside pred_traj."
+        )
+    if pred_traj.shape[1] < future_steps or pred_head.shape[1] < future_steps:
+        raise ValueError(
+            f"Scenario {scenario_id} object {object_id}: prediction has fewer than {future_steps} future steps."
+        )
+    if pred_valid.shape[0] <= agent_index or pred_valid.shape[1] < future_steps:
+        raise ValueError(
+            f"Scenario {scenario_id} object {object_id}: pred_valid_mask does not cover {future_steps} future steps."
+        )
+
+    traj = pred_traj[agent_index, :future_steps]
+    head = pred_head[agent_index, :future_steps]
+    valid = pred_valid[agent_index, :future_steps]
+    if not torch.isfinite(traj).all() or not torch.isfinite(head).all():
+        raise ValueError(
+            f"Scenario {scenario_id} object {object_id}: prediction contains non-finite values."
+        )
+    if not valid.all():
+        missing = torch.nonzero(~valid, as_tuple=False).flatten().tolist()
+        raise ValueError(
+            f"Scenario {scenario_id} object {object_id}: pred_valid_mask misses future steps {missing[:10]}."
+        )
+    if torch.allclose(traj, torch.zeros_like(traj)):
+        raise ValueError(
+            f"Scenario {scenario_id} object {object_id}: zero fallback trajectory detected; refusing official export."
+        )
+
+
 def build_joint_scene(
     prediction: Dict[str, torch.Tensor],
     data,
@@ -372,6 +434,14 @@ def build_joint_scene(
         object_id = int(object_id)
         track = track_by_id[object_id]
         agent_index = id_to_index[object_id]
+        _validate_sim_agent_prediction(
+            prediction=prediction,
+            data=data,
+            object_id=object_id,
+            agent_index=agent_index,
+            future_steps=future_steps,
+            scenario_id=str(scenario.scenario_id),
+        )
         z_values = get_future_z(
             track=track,
             current_time_index=submission_config.current_time_index,

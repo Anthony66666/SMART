@@ -6,6 +6,7 @@ from torch_geometric.loader import DataLoader
 from smart.datasets.scalable_dataset import MultiDataset
 from smart.model import SMART
 from smart.model import SMARTDiffusion
+from smart.model import SMARTAutoregressiveDiffusion
 from smart.transforms import WaymoTargetBuilder
 from smart.utils.config import load_config_act
 from smart.utils.log import Logging
@@ -37,6 +38,7 @@ if __name__ == '__main__':
     Predictor_hash = {
         "smart": SMART,
         "smart_diffusion": SMARTDiffusion,
+        "smart_ar_diffusion": SMARTAutoregressiveDiffusion,
     }
 
     data_config = config.Dataset

@@ -89,14 +89,19 @@ Model:
     max_map_tokens: 0  # 0 disables scene-level truncation and follows SMART radius map-agent selection.
     geometry_dropout_prob: 0.25
     target_category_only: true
+    agent_selection_mode: smart_inference
+    supervision_mode: smart_category3
+    metric_mode: smart_val_compatible
     low_variance_masking: true
     mask_count_mode: exact
     antithetic_mask_ranking: true
     remask_sampling: true
     remask_confidence_temperature: 1.0
-    prefix_constrained_sampling: true
-    prefix_constrained_training: true
-    self_condition_prob: 0.25
+    prefix_constrained_sampling: false
+    prefix_constrained_training: false
+    use_proposal_geometry: true
+    geometry_confidence_source_threshold: 0.35
+    self_condition_prob: 1.0
     self_condition_visible_prob: 0.10
     self_condition_mode: "argmax"
     self_condition_loss_weight: 1.0

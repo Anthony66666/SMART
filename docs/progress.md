@@ -1,5 +1,19 @@
 # Progress
 
+## 2026-05-22 CST
+- Task: Added SMART autoregressive discrete diffusion.
+- Result: New `smart_ar_diffusion` predictor reuses SMART discrete trajectory tokens and the existing diffusion decoder with 2-token history, 4-token prediction, 2-token commit, 8-round/80-step rollout, rolling-anchor short-window training, synthetic history-state perturbation, and per-round local map token rescreening. Dedicated train/validation configs and unit tests were added.
+- Files: `smart/model/smart_ar_diffusion.py`, `smart/model/__init__.py`, `train.py`, `val.py`, `eval_waymo_official.py`, `tests/test_smart_ar_diffusion.py`, `configs/train/train_scalable_ar_diffusion*.yaml`, `configs/validation/validation_scalable_ar_diffusion.yaml`
+- Validation: `py_compile` passed for AR diffusion and entrypoints; all AR configs instantiate; AR diffusion unit tests passed; SMART parity and prefix regression tests passed.
+- Next: Run a real single-batch AR train smoke and validation inference smoke, then compare `smart_ar_diffusion` against full-horizon `smart_diffusion` on map violations, collisions, and sim-agent export coverage.
+
+## 2026-05-22 CST
+- Task: Implemented SMART-Diffusion parity and uncertainty-aware joint diffusion.
+- Result: Diffusion rollout now packs all SMART history-valid generation agents, keeps `loss_mask_base` limited to category-3 supervision agents, returns SMART-compatible metric `valid_mask` while preserving `pred_valid_mask` generation coverage, decodes tokens with SMART endpoint-token composition, and uses proposal geometry/confidence for masked chunks without turning sampling into prefix AR. Official Waymo export now rejects missing, non-finite, invalid-mask, and zero-fallback sim-agent predictions.
+- Files: `smart/model/smart_diffusion.py`, `smart/modules/diffusion_decoder.py`, `eval_waymo_official.py`, `tests/test_smart_diffusion_smart_parity.py`, diffusion train/validation configs, `scripts/visualize_diffusion_map_tokens.py`
+- Validation: `py_compile` passed for edited Python files; SMART parity unit tests passed with Waymo dependency skip; prefix ablation tests passed; a tiny `DiffusionDecoder` forward smoke passed with geometry confidence/source masks.
+- Next: Run real single-batch train and validation inference smoke on local Waymo data, then compare current checkpoint/current code, mask-parity only, and mask-parity plus uncertainty-aware geometry.
+
 ## 2026-05-20 CST
 - Task: Added training-time self-conditioning to SMART-Diffusion.
 - Result: Diffusion loss can now run a no-grad first pass on selected visible tokens, feed argmax predictions back into the final denoising pass, and supervise those self-conditioned positions against GT. Train diffusion configs enable `self_condition_prob: 0.25` and `self_condition_visible_prob: 0.10`.

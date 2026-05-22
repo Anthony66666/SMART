@@ -25,7 +25,7 @@ Dataset:
   <<: *time_info
 
 Trainer:
-  strategy: ddp_find_unused_parameters_false
+  strategy: ddp_find_unused_parameters_true
   accelerator: "gpu"
   devices: 14
   max_epochs: 32
@@ -44,6 +44,12 @@ Visualization:
   sample_indices: [0, 1, 2, 3]
   output_dir: "./outputs/val_visualizations"
   max_agents: 0
+  step_viz:
+    enabled: true
+    interval_steps: 2000
+    sample_indices: [110, 111, 112, 113]
+    output_dir: "./outputs/step_visualizations"
+
 
 Model:
   mode: "train"
@@ -77,21 +83,26 @@ Model:
     num_layers: 6
     eps: 1.0e-3
     min_t: 1.0e-3
-    ntp_aux_loss_weight: 0.2
+    ntp_aux_loss_weight: 0
     use_agent_context: true
     use_type_embedding: true
     use_map_context: true
     max_map_tokens: 0  # 0 disables scene-level truncation and follows SMART radius map-agent selection.
     geometry_dropout_prob: 0.25
     target_category_only: true
+    agent_selection_mode: smart_inference
+    supervision_mode: smart_category3
+    metric_mode: smart_val_compatible
     low_variance_masking: true
     mask_count_mode: exact
     antithetic_mask_ranking: true
     remask_sampling: true
     remask_confidence_temperature: 1.0
-    prefix_constrained_sampling: true
-    prefix_constrained_training: true
-    self_condition_prob: 0.25
+    prefix_constrained_sampling: false
+    prefix_constrained_training: false
+    use_proposal_geometry: true
+    geometry_confidence_source_threshold: 0.35
+    self_condition_prob: 1.0
     self_condition_visible_prob: 0.10
     self_condition_mode: "argmax"
     self_condition_loss_weight: 1.0

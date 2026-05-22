@@ -89,6 +89,7 @@ class DiffusionDecoder(nn.Module):
         self.agent_context_projection = (
             nn.Linear(hidden_dim, hidden_dim) if use_agent_context else None
         )
+        self.geometry_confidence_projection = nn.Linear(1, hidden_dim)
 
         self.temporal_layers = nn.ModuleList(
             [
@@ -149,11 +150,18 @@ class DiffusionDecoder(nn.Module):
         headings: torch.Tensor,
         chunk_ids: torch.Tensor,
         valid_mask: torch.Tensor,
+        source_mask: Optional[torch.Tensor] = None,
+        target_mask: Optional[torch.Tensor] = None,
     ):
         device = positions.device
         flat_pos = positions.reshape(-1, 2)
         flat_head = headings.reshape(-1)
         flat_valid = valid_mask.reshape(-1)
+        flat_source = flat_valid if source_mask is None else (source_mask.reshape(-1) & flat_valid)
+        flat_target = flat_valid if target_mask is None else (target_mask.reshape(-1) & flat_valid)
+        search_mask = flat_source | flat_target
+        if not search_mask.any():
+            return self._empty_edge_index(device), positions.new_zeros((0, self.hidden_dim))
         flat_batch = self._flat_batch_ids(valid_mask)
         flat_chunk = chunk_ids.reshape(-1)
         head_vector = torch.stack([flat_head.cos(), flat_head.sin()], dim=-1)
@@ -162,9 +170,16 @@ class DiffusionDecoder(nn.Module):
             head_s=flat_head,
             head_vector_s=head_vector,
             batch_s=flat_batch * self.num_future_chunks + flat_chunk,
-            mask_s=flat_valid,
+            mask_s=search_mask,
             radius_m=self.a2a_radius,
         )
+        if edge_index.numel() == 0:
+            return edge_index, self.r_a2a_embedding(continuous_inputs=r_raw, categorical_embs=None)
+        keep = flat_source[edge_index[0]] & flat_target[edge_index[1]]
+        edge_index = edge_index[:, keep]
+        r_raw = r_raw[keep]
+        if edge_index.numel() == 0:
+            return self._empty_edge_index(device), positions.new_zeros((0, self.hidden_dim))
         return edge_index, self.r_a2a_embedding(continuous_inputs=r_raw, categorical_embs=None)
 
     def _build_temporal_token_edges(
@@ -174,12 +189,16 @@ class DiffusionDecoder(nn.Module):
         chunk_ids: torch.Tensor,
         agent_ids: torch.Tensor,
         valid_mask: torch.Tensor,
+        source_mask: Optional[torch.Tensor] = None,
+        target_mask: Optional[torch.Tensor] = None,
     ):
         flat_pos = positions.reshape(-1, 2)
         flat_head = headings.reshape(-1)
         flat_chunk = chunk_ids.reshape(-1)
         flat_agent = agent_ids.reshape(-1)
-        flat_valid = valid_mask.reshape(-1)
+        flat_valid = valid_mask.reshape(-1) & (flat_agent >= 0)
+        flat_source = flat_valid if source_mask is None else (source_mask.reshape(-1) & flat_valid)
+        flat_target = flat_valid if target_mask is None else (target_mask.reshape(-1) & flat_valid)
         head_vector = torch.stack([flat_head.cos(), flat_head.sin()], dim=-1)
         max_chunk_delta = None
         if self.time_span is not None:
@@ -190,7 +209,8 @@ class DiffusionDecoder(nn.Module):
             head_vector_s=head_vector,
             agent_ids=flat_agent,
             step_ids=flat_chunk,
-            valid_mask=flat_valid & (flat_agent >= 0),
+            valid_mask=flat_source,
+            target_mask=flat_target,
             max_step_delta=max_chunk_delta,
             causal=False,
         )
@@ -277,6 +297,9 @@ class DiffusionDecoder(nn.Module):
         map_orientations: Optional[torch.Tensor] = None,
         map_batch: Optional[torch.Tensor] = None,
         map_valid_mask: Optional[torch.Tensor] = None,
+        geometry_confidence: Optional[torch.Tensor] = None,
+        temporal_source_mask: Optional[torch.Tensor] = None,
+        spatial_source_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         B, L = noisy_token_ids.shape
 
@@ -305,6 +328,12 @@ class DiffusionDecoder(nn.Module):
         if self.type_embedding is not None and agent_type_ids is not None:
             x = x + self.type_embedding(agent_type_ids.clamp(min=0, max=self.type_embedding.num_embeddings - 1))
 
+        if geometry_confidence is None:
+            geometry_confidence = valid_mask.new_zeros(valid_mask.shape, dtype=x.dtype)
+        x = x + self.geometry_confidence_projection(
+            geometry_confidence.to(dtype=x.dtype).clamp(0.0, 1.0).unsqueeze(-1)
+        )
+
         x = x * valid_mask.unsqueeze(-1).to(x.dtype)
 
         temporal_edge_index, r_temporal = self._build_temporal_token_edges(
@@ -313,12 +342,16 @@ class DiffusionDecoder(nn.Module):
             noisy_token_chunk_ids,
             token_agent_ids,
             valid_mask,
+            source_mask=temporal_source_mask,
+            target_mask=valid_mask,
         )
         spatial_edge_index, r_spatial = self._build_spatial_token_edges(
             token_positions,
             token_headings,
             noisy_token_chunk_ids,
             valid_mask,
+            source_mask=spatial_source_mask,
+            target_mask=valid_mask,
         )
         map_edge_index, r_map = self._build_map2token_edges(
             token_positions,

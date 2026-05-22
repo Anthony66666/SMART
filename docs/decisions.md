@@ -1,5 +1,19 @@
 # Decisions
 
+## Decision: Add SMART autoregressive discrete diffusion as a separate predictor
+- Date: 2026-05-22
+- Context: Full-horizon joint diffusion can refresh proposal geometry internally, but it cannot re-query local map context after committed agent motion the way an autoregressive rollout can.
+- Decision: Implement `smart_ar_diffusion` as a new predictor that reuses SMART trajectory tokens and the existing discrete diffusion decoder. Each outer step uses 2 history tokens, predicts 4 future tokens jointly, commits the first 2 tokens, updates agent state/history, and rescreens local map tokens before the next step.
+- Why: This preserves discrete diffusion inside each short window while restoring the dynamic map-query behavior that made SMART autoregressive rollout robust.
+- Impact: Existing `smart_diffusion` remains available as a full-horizon comparison path; AR diffusion configs are separate and should be used for closed-loop experiments.
+
+## Decision: SMART-Diffusion uses SMART generation parity with uncertainty-aware joint diffusion
+- Date: 2026-05-22
+- Context: Target-category-only generation and prefix-frontier denoising diverged from upstream SMART inference and degraded sim-agent rollouts with zero/fallback trajectories, boundary exits, and collisions.
+- Decision: Generate all SMART history-valid agents, supervise diffusion loss only on SMART category-3 targets, keep SMART-compatible category filtering in returned metric masks, and use proposal token geometry plus explicit confidence for masked future chunks during joint denoising.
+- Why: This preserves original SMART rollout semantics while retaining discrete diffusion's simultaneous prediction over all masked valid tokens instead of reverting to autoregressive frontier-only sampling.
+- Impact: `prefix_constrained_sampling` and `prefix_constrained_training` remain available only as ablations; default configs use `use_proposal_geometry: true`, `geometry_confidence_source_threshold: 0.35`, and SMART parity mask modes.
+
 ## Decision: Use prefix-constrained geometry for SMART-Diffusion denoising
 - Date: 2026-05-18
 - Context: Out-of-road rollouts persisted even though map tokens were retained and map-to-token edges were rebuilt each denoising step; masked future chunks still lacked reliable poses and fell back to weak historical geometry.

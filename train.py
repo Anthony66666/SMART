@@ -10,6 +10,7 @@ from smart.utils.config import load_config_act
 from smart.datamodules import MultiDataModule
 from smart.model import SMART
 from smart.model import SMARTDiffusion
+from smart.model import SMARTAutoregressiveDiffusion
 from smart.utils.log import Logging
 from smart.utils.torch_compat import register_checkpoint_safe_globals
 
@@ -32,6 +33,7 @@ if __name__ == '__main__':
     Predictor_hash = {
         "smart": SMART,
         "smart_diffusion": SMARTDiffusion,
+        "smart_ar_diffusion": SMARTAutoregressiveDiffusion,
     }
     parser.add_argument('--config', type=str, default='configs/train/train_scalable.yaml')
     parser.add_argument('--pretrain_ckpt', type=str, default="")

@@ -1,19 +1,23 @@
+# SMART-AR-Diffusion training config — discrete mask diffusion replaces autoregressive generation
 time_info: &time_info
   num_historical_steps: 11
   num_future_steps: 80
+  use_intention: True
   token_size: 2048
 
 Dataset:
   root:
-  batch_size: 4
+  train_batch_size: 4
+  val_batch_size: 4
+  test_batch_size: 1
   shuffle: True
   num_workers: 4
   pin_memory: True
   persistent_workers: True
-  train_raw_dir:
-  val_raw_dir: ["/home/anthony/SimAgentJEPA/data/waymo/validation"]
+  train_raw_dir: ["/raid/haoq_lab/wangshijie/data/waymo/training"]
+  val_raw_dir: ["/raid/haoq_lab/wangshijie/data/waymo/validation"]
   test_raw_dir:
-  TargetBuilder: WaymoTargetBuilder
+  transform: WaymoTargetBuilder
   train_processed_dir:
   val_processed_dir:
   test_processed_dir:
@@ -21,9 +25,9 @@ Dataset:
   <<: *time_info
 
 Trainer:
-  strategy: ddp_find_unused_parameters_false
+  strategy: ddp_find_unused_parameters_true
   accelerator: "gpu"
-  devices: 1
+  devices: 14
   max_epochs: 32
   save_ckpt_path:
   num_nodes: 1
@@ -31,10 +35,25 @@ Trainer:
   ckpt_path:
   precision: 32
   accumulate_grad_batches: 1
+  monitor_metric: "val_loss"
+  monitor_mode: "min"
+
+Visualization:
+  enabled: true
+  interval_epochs: 1
+  sample_indices: [0, 1, 2, 3]
+  output_dir: "./outputs/val_visualizations"
+  max_agents: 0
+  step_viz:
+    enabled: true
+    interval_steps: 2000
+    sample_indices: [110, 111, 112, 113]
+    output_dir: "./outputs/step_visualizations"
+
 
 Model:
-  mode: "validation"
-  predictor: "smart_diffusion"
+  mode: "train"
+  predictor: "smart_ar_diffusion"
   dataset: "waymo"
   input_dim: 2
   hidden_dim: 128
@@ -47,7 +66,9 @@ Model:
   num_freq_bands: 64
   lr: 0.0005
   warmup_steps: 0
-  total_steps: 32
+  total_steps: 60000
+  inference_token: True
+  rollout_num: 1
   decoder:
     <<: *time_info
     num_map_layers: 3
@@ -56,10 +77,18 @@ Model:
     pl2pl_radius: 10
     pl2a_radius: 30
     time_span: 30
-  inference_token: True
-  rollout_num: 1
   diffusion:
     future_chunk_steps: 5
+    history_tokens: 2
+    prediction_tokens: 4
+    commit_tokens: 2
+    token_steps: 5
+    total_rollout_steps: 80
+    local_map_refresh: rescreen
+    rolling_anchor_training: true
+    state_perturb_prob: 0.5
+    state_perturb_pos_sigma_m: 0.3
+    state_perturb_heading_sigma_rad: 0.05
     num_steps: 32
     num_layers: 6
     eps: 1.0e-3
@@ -69,7 +98,7 @@ Model:
     use_type_embedding: true
     use_map_context: true
     max_map_tokens: 0  # 0 disables scene-level truncation and follows SMART radius map-agent selection.
-    geometry_dropout_prob: 0.0
+    geometry_dropout_prob: 0.25
     target_category_only: true
     agent_selection_mode: smart_inference
     supervision_mode: smart_category3
@@ -83,4 +112,8 @@ Model:
     prefix_constrained_training: false
     use_proposal_geometry: true
     geometry_confidence_source_threshold: 0.35
+    self_condition_prob: 1.0
+    self_condition_visible_prob: 0.10
+    self_condition_mode: "argmax"
+    self_condition_loss_weight: 1.0
     freeze_encoder: false
