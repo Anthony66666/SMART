@@ -5,6 +5,11 @@ from types import SimpleNamespace
 import torch
 from torch_geometric.data import HeteroData
 
+from smart.callbacks.validation_visualization import (
+    _future_gt_valid_mask,
+    _prediction_valid_mask,
+    _visualized_agent_mask,
+)
 from smart.model.smart_diffusion import SMARTDiffusion
 
 
@@ -40,6 +45,7 @@ class SMARTDiffusionSMARTParityTest(unittest.TestCase):
         generation = model._generation_agent_mask(data)
         supervision = model._supervision_agent_mask(data)
         metric = model._metric_agent_mask(data)
+        category_metric = model._metric_agent_mask(data, mode='smart_category3')
 
         self.assertTrue(torch.equal(
             generation,
@@ -51,8 +57,36 @@ class SMARTDiffusionSMARTParityTest(unittest.TestCase):
         ))
         self.assertTrue(torch.equal(
             metric,
+            torch.tensor([True, True, False, True]),
+        ))
+        self.assertTrue(torch.equal(
+            category_metric,
             torch.tensor([True, False, False, True]),
         ))
+
+    def test_rollout_future_targets_do_not_require_gt_future_validity(self):
+        model = _diffusion_shell()
+        object.__setattr__(model, 'encoder', SimpleNamespace(agent_encoder=SimpleNamespace(shift=5)))
+        data = _agent_data()
+        data['agent']['token_idx'] = torch.zeros(4, 4, dtype=torch.long)
+        data['agent']['agent_valid_mask'] = torch.tensor([
+            [True, True, True, True],
+            [True, True, False, False],
+            [True, True, True, True],
+            [True, True, True, True],
+        ])
+
+        _tokens, valid, generation, supervision = model._build_future_token_targets(
+            data,
+            rollout_valid=True,
+        )
+
+        self.assertTrue(torch.equal(
+            generation,
+            torch.tensor([True, True, False, True]),
+        ))
+        self.assertTrue(valid[1].all())
+        self.assertFalse(supervision[1])
 
     def test_pack_keeps_non_target_generation_agents_but_masks_their_loss(self):
         model = _diffusion_shell()
@@ -168,7 +202,72 @@ class SMARTDiffusionSMARTParityTest(unittest.TestCase):
         self.assertTrue(out['pred_valid_mask'][1].all())
         self.assertGreater(float(out['pred_traj'][1].abs().sum()), 0.0)
         self.assertFalse(out['valid_mask'][1].any())
+        self.assertTrue(out['official_valid_mask'][1].all())
         self.assertTrue(out['valid_mask'][0].all())
+
+    def test_official_future_valid_mask_ignores_category_filtered_prediction_mask(self):
+        model = _diffusion_shell()
+        data = HeteroData()
+        data['agent']['valid_mask'] = torch.ones(2, 21, dtype=torch.bool)
+        data['agent']['valid_mask'][1, 12] = False
+        pred = {
+            'pred_traj': torch.zeros(2, 10, 2),
+            'valid_mask': torch.tensor([
+                [True] * 10,
+                [False] * 10,
+            ]),
+            'pred_valid_mask': torch.tensor([
+                [True] * 10,
+                [True, False] + [True] * 8,
+            ]),
+        }
+
+        official = model._official_future_valid_mask(data, pred)
+        eval_valid = official & pred['pred_valid_mask']
+
+        self.assertTrue(official[1, 0])
+        self.assertFalse(official[1, 1])
+        self.assertFalse(eval_valid[1, 1])
+
+
+class ValidationVisualizationMaskTest(unittest.TestCase):
+    def _toy_data(self, categories):
+        data = HeteroData()
+        data['agent']['valid_mask'] = torch.ones(3, 21, dtype=torch.bool)
+        data['agent']['type'] = torch.tensor([0, 0, 3])
+        data['agent']['category'] = torch.tensor(categories)
+        return data
+
+    def _toy_prediction(self):
+        return {
+            'gt': torch.zeros(3, 10, 2),
+            'pred_traj': torch.ones(3, 10, 2),
+            'pred_valid_mask': torch.ones(3, 10, dtype=torch.bool),
+        }
+
+    def test_official_visualization_does_not_depend_on_category(self):
+        pred = self._toy_prediction()
+        first = _visualized_agent_mask(self._toy_data([3, 0, 3]), pred, 10, 'official')
+        second = _visualized_agent_mask(self._toy_data([0, 3, 3]), pred, 10, 'official')
+
+        self.assertTrue(torch.equal(first, torch.tensor([True, True, False])))
+        self.assertTrue(torch.equal(second, torch.tensor([True, True, False])))
+
+    def test_supervision_visualization_depends_on_category(self):
+        pred = self._toy_prediction()
+        target = _visualized_agent_mask(self._toy_data([3, 0, 3]), pred, 10, 'supervision')
+
+        self.assertTrue(torch.equal(target, torch.tensor([True, False, False])))
+
+    def test_non_target_agent_has_gt_and_prediction_masks_in_official_view(self):
+        data = self._toy_data([3, 0, 3])
+        pred = self._toy_prediction()
+
+        gt_mask = _future_gt_valid_mask(data, pred, 11)[1]
+        pred_mask = _prediction_valid_mask(data, pred, 1, 11)
+
+        self.assertTrue(gt_mask.all())
+        self.assertTrue(pred_mask.all())
 
 
 class OfficialEvalCoverageTest(unittest.TestCase):

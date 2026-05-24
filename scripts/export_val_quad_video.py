@@ -197,6 +197,20 @@ def pick_agent_indices(data, max_agents, hist_steps):
 
 
 
+def prediction_valid_mask(data, prediction, agent_index, hist_steps, future_steps):
+    if "pred_valid_mask" in prediction:
+        mask = prediction["pred_valid_mask"][agent_index].bool()
+    elif "official_valid_mask" in prediction:
+        mask = prediction["official_valid_mask"][agent_index].bool()
+    else:
+        mask = data["agent"]["valid_mask"][agent_index, hist_steps:hist_steps + future_steps].bool()
+    if mask.numel() >= future_steps:
+        return mask[:future_steps]
+    pad = torch.zeros(future_steps - mask.numel(), dtype=torch.bool, device=mask.device)
+    return torch.cat([mask, pad], dim=0)
+
+
+
 def compute_view_radius(data, prediction, agent_indices, hist_steps, av_index):
     anchor = data["agent"]["position"][av_index, hist_steps - 1, :2]
     distances = [torch.tensor(20.0)]
@@ -205,7 +219,13 @@ def compute_view_radius(data, prediction, agent_indices, hist_steps, av_index):
         if history_mask.any():
             history = data["agent"]["position"][agent_index, :hist_steps, :2][history_mask]
             distances.append(torch.norm(history - anchor, dim=-1).max())
-        future_mask = data["agent"]["valid_mask"][agent_index, hist_steps:]
+        future_mask = prediction_valid_mask(
+            data,
+            prediction,
+            agent_index,
+            hist_steps,
+            int(prediction["pred_traj"].shape[1]),
+        )
         if future_mask.any():
             pred = prediction["pred_traj"][agent_index][future_mask]
             if pred.numel() > 0:
@@ -457,7 +477,7 @@ def draw_scene(ax, scene, frame_index, fps, camera_mode="global", fixed_radius=B
                 zorder=3,
             )
 
-        pred_mask = data["agent"]["valid_mask"][agent_index, hist_steps : hist_steps + future_step]
+        pred_mask = prediction_valid_mask(data, prediction, agent_index, hist_steps, future_step)
         pred = prediction["pred_traj"][agent_index, :future_step][pred_mask]
         if pred.numel() > 0:
             ax.plot(pred[:, 0], pred[:, 1], color="#e15759", linestyle="-", linewidth=linewidth, alpha=0.95, zorder=5)

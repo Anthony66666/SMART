@@ -419,7 +419,8 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
             history_frame_valid = torch.cat([history_frame_valid, commit_valid_frames], dim=1)[:, -self.num_historical_steps:]
 
         gt_pos = data['agent']['position'][:, self.num_historical_steps:self.num_historical_steps + self.ar_total_rollout_steps, :2]
-        gt_val = data['agent']['valid_mask'][:, self.num_historical_steps:self.num_historical_steps + self.ar_total_rollout_steps].bool().clone()
+        official_valid = data['agent']['valid_mask'][:, self.num_historical_steps:self.num_historical_steps + self.ar_total_rollout_steps].bool().clone()
+        gt_val = official_valid.clone()
         try:
             gt_val[data['agent']['category'].long() != 3] = False
         except Exception:
@@ -430,6 +431,7 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
             'head_a': torch.cat([data['agent']['heading'][:, self.num_historical_steps - 1:self.num_historical_steps], pred_head], dim=1),
             'gt': gt_pos,
             'valid_mask': gt_val,
+            'official_valid_mask': official_valid,
             'pred_valid_mask': pred_valid_mask,
             'pred_traj': pred_traj,
             'pred_head': pred_head,

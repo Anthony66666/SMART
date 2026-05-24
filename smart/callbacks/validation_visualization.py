@@ -90,6 +90,7 @@ def save_validation_visualization(
     output_path: Path,
     title: str,
     max_agents: int = 0,
+    view_mode: str = "official",
 ) -> None:
     import matplotlib
 
@@ -103,8 +104,8 @@ def save_validation_visualization(
 
     hist_steps = data["agent"]["valid_mask"].shape[1] - prediction["gt"].shape[1]
     current_step = hist_steps - 1
-    valid_agents = data["agent"]["valid_mask"][:, current_step] & (data["agent"]["type"] != 3)
-    target_agents = _target_agent_mask(data, prediction, current_step)
+    valid_agents = _official_agent_mask(data, current_step)
+    future_agents = _visualized_agent_mask(data, prediction, current_step, view_mode)
     if valid_agents.any():
         agent_indices = torch.nonzero(valid_agents, as_tuple=False).squeeze(-1)
     else:
@@ -128,7 +129,7 @@ def save_validation_visualization(
         data,
         prediction,
         agent_indices,
-        target_agents,
+        future_agents,
         current_step,
         hist_steps,
         av_index,
@@ -170,7 +171,7 @@ def _draw_agents(
     data,
     prediction,
     agent_indices,
-    target_agents,
+    future_agents,
     current_step,
     hist_steps,
     av_index,
@@ -179,23 +180,18 @@ def _draw_agents(
 ) -> None:
     for agent_index in agent_indices.tolist():
         is_ego = agent_index == av_index
-        is_target = bool(target_agents[agent_index].item()) if target_agents.numel() > agent_index else False
+        show_future = bool(future_agents[agent_index].item()) if future_agents.numel() > agent_index else False
         color = "#8f63d2" if is_ego else "#a9d2ff"
         edge_color = "#8f63d2" if is_ego else "#000000"
         linewidth = 2.4 if is_ego else 1.8
 
         history_mask = data["agent"]["valid_mask"][agent_index, :hist_steps]
         history = data["agent"]["position"][agent_index, :hist_steps, :2][history_mask]
-        gt_mask = data["agent"]["valid_mask"][agent_index, hist_steps:]
-        gt = prediction["gt"][agent_index][gt_mask] if is_target else prediction["gt"][agent_index][:0]
+        gt_mask = _future_gt_valid_mask(data, prediction, hist_steps)[agent_index]
+        gt = prediction["gt"][agent_index][gt_mask] if show_future else prediction["gt"][agent_index][:0]
         pred = prediction["pred_traj"][agent_index]
-        if "pred_valid_mask" in prediction:
-            pred_valid = prediction["pred_valid_mask"][agent_index]
-        elif gt_mask.numel() >= pred.shape[0]:
-            pred_valid = gt_mask[:pred.shape[0]]
-        else:
-            pred_valid = torch.ones(pred.shape[0], dtype=torch.bool)
-        pred_valid = pred_valid & is_target
+        pred_valid = _prediction_valid_mask(data, prediction, agent_index, hist_steps)
+        pred_valid = pred_valid & show_future
         pred = pred[pred_valid]
         visible_gt = gt
 
@@ -268,13 +264,58 @@ def _oriented_box(center_xy, heading, length, width):
     return [(float(point[0].item()), float(point[1].item())) for point in corners]
 
 
+def _official_agent_mask(data, current_step):
+    return data["agent"]["valid_mask"][:, current_step] & (data["agent"]["type"] != 3)
+
+
 def _target_agent_mask(data, prediction, current_step):
-    valid = data["agent"]["valid_mask"][:, current_step] & (data["agent"]["type"] != 3)
+    valid = _official_agent_mask(data, current_step)
     if "category" in data["agent"]:
         return valid & (data["agent"]["category"].long() == 3)
     if "pred_valid_mask" in prediction:
         return valid & prediction["pred_valid_mask"].any(dim=-1)
     return valid
+
+
+def _visualized_agent_mask(data, prediction, current_step, view_mode="official"):
+    mode = str(view_mode).lower()
+    if mode in ("official", "smart_val_compatible", "smart_inference", "generation"):
+        return _official_agent_mask(data, current_step)
+    if mode in ("supervision", "target", "smart_category3", "category3"):
+        return _target_agent_mask(data, prediction, current_step)
+    raise ValueError(f"Unsupported validation visualization view_mode: {view_mode}")
+
+
+def _fit_bool_vector(mask, length):
+    mask = mask.bool()
+    if mask.numel() >= length:
+        return mask[:length]
+    pad = torch.zeros(length - mask.numel(), dtype=torch.bool, device=mask.device)
+    return torch.cat([mask, pad], dim=0)
+
+
+def _fit_bool_mask(mask, length):
+    mask = mask.bool()
+    if mask.shape[1] >= length:
+        return mask[:, :length]
+    pad = torch.zeros(mask.shape[0], length - mask.shape[1], dtype=torch.bool, device=mask.device)
+    return torch.cat([mask, pad], dim=1)
+
+
+def _future_gt_valid_mask(data, prediction, hist_steps):
+    gt_len = int(prediction["gt"].shape[1])
+    if "official_valid_mask" in prediction:
+        return _fit_bool_mask(prediction["official_valid_mask"], gt_len)
+    return _fit_bool_mask(data["agent"]["valid_mask"][:, hist_steps:hist_steps + gt_len], gt_len)
+
+
+def _prediction_valid_mask(data, prediction, agent_index, hist_steps):
+    pred_len = int(prediction["pred_traj"][agent_index].shape[0])
+    if "pred_valid_mask" in prediction:
+        return _fit_bool_vector(prediction["pred_valid_mask"][agent_index], pred_len)
+    if "official_valid_mask" in prediction:
+        return _fit_bool_vector(prediction["official_valid_mask"][agent_index], pred_len)
+    return _fit_bool_vector(data["agent"]["valid_mask"][agent_index, hist_steps:hist_steps + pred_len], pred_len)
 
 
 def _heading_triangle(center_xy, heading, length, width):

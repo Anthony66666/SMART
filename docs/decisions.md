@@ -104,3 +104,10 @@
 - Decision: Add optional self-conditioning that masks a subset of visible positions in a no-grad first pass, feeds argmax predictions back as visible tokens in the final pass, and supervises those positions against GT.
 - Why: This exposes training to sampled-token context without changing the inference sampler or adding random visible-token corruption.
 - Impact: Diffusion train configs now expose `self_condition_prob`, `self_condition_visible_prob`, `self_condition_mode`, and `self_condition_loss_weight`; validation loss remains teacher-forced.
+
+## Decision: SMART-Diffusion validation parity follows official current-valid SMART metrics
+- Date: 2026-05-24
+- Context: Official SMART trains token supervision on category-3 targets, but validation ADE/FDE uses current-history-valid agents and raw future validity rather than the category-filtered inference return mask.
+- Decision: Treat `smart_val_compatible` as official current-valid validation semantics. Keep `category == 3` for diffusion/token supervision and explicit `smart_category3` ablations only.
+- Why: This matches upstream SMART validation behavior and prevents validation visualizations from hiding generated non-target vehicles because the randomized target category changed between steps.
+- Impact: Diffusion and AR diffusion outputs now expose `official_valid_mask`; visualization defaults to official view while target/supervision view remains optional for debugging training targets.

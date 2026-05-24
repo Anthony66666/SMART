@@ -137,3 +137,10 @@
 - Validation: Verified the code graph binary version, confirmed the SMART project was indexed, and ran a successful architecture query against the indexed project.
 - Open: Codex still needs a restart before future sessions can use the new MCP server directly.
 - Next: Restart Codex, then use graph-first exploration and keep `docs/*.md` updated after meaningful tasks.
+
+## 2026-05-24 CST
+- Task: Aligned SMART-Diffusion and AR-Diffusion validation/visualization masks with official SMART validation semantics.
+- Result: `smart_val_compatible` now uses current-history-valid agents for metrics, inference rollout no longer requires GT future token validity, model outputs include `official_valid_mask`, and validation/quad-video visualization draw predictions from `pred_valid_mask` instead of category-filtered target masks.
+- Files: `smart/model/smart_diffusion.py`, `smart/model/smart_ar_diffusion.py`, `smart/callbacks/validation_visualization.py`, `scripts/export_val_quad_video.py`, `tests/test_smart_diffusion_smart_parity.py`
+- Validation: In the `smart` conda environment, `python -m py_compile smart/model/smart_diffusion.py smart/model/smart_ar_diffusion.py smart/callbacks/validation_visualization.py scripts/export_val_quad_video.py tests/test_smart_diffusion_smart_parity.py` passed; `python -m unittest tests.test_smart_diffusion_smart_parity -v` passed 11 tests with 1 Waymo-dependency skip; `tests.test_smart_ar_diffusion` passed 6 tests; `tests.test_smart_diffusion_prefix` passed 3 tests.
+- Next: Inspect validation visualizations in official view for missing current-valid vehicles, then run a real validation smoke on AR diffusion configs.

@@ -442,7 +442,9 @@ class SMARTDiffusion(SMART):
     def _metric_agent_mask(self, data, mode=None):
         """Agents used by validation metrics/export checks."""
         metric_mode = getattr(self, 'metric_mode', 'smart_val_compatible') if mode is None else str(mode).lower()
-        if metric_mode in ('smart_val_compatible', 'smart_category3', 'category3', 'target_category3'):
+        if metric_mode in ('smart_val_compatible', 'official_smart', 'history_valid'):
+            return data['agent']['valid_mask'][:, self.num_historical_steps - 1].bool()
+        if metric_mode in ('smart_category3', 'category3', 'target_category3'):
             generation = self._generation_agent_mask(data)
             try:
                 return generation & (data['agent']['category'].long() == 3)
@@ -455,6 +457,15 @@ class SMARTDiffusion(SMART):
         if metric_mode in ('non_background', 'non_bg'):
             return self._generation_agent_mask(data) & (data['agent']['type'] != 3)
         raise ValueError(f"Unsupported diffusion.metric_mode: {metric_mode}")
+
+    def _official_future_valid_mask(self, data, prediction=None):
+        future_len = self.num_future_steps
+        if prediction is not None:
+            if 'pred_traj' in prediction:
+                future_len = int(prediction['pred_traj'].shape[1])
+            elif 'gt' in prediction:
+                future_len = int(prediction['gt'].shape[1])
+        return data['agent']['valid_mask'][:, self.num_historical_steps:self.num_historical_steps + future_len].bool()
 
     def _target_agent_mask(self, data):
         return self._supervision_agent_mask(data)
@@ -636,21 +647,22 @@ class SMARTDiffusion(SMART):
 
     # -- future token targets ----------------------------------------------
 
-    def _build_future_token_targets(self, data):
-        """Extract GT token indices for all agents' future chunks.
+    def _build_future_token_targets(self, data, rollout_valid=False):
+        """Extract token indices and masks for future chunks.
 
-        Returns:
-            tokens:   [num_agents, num_future_chunks] long
-            valid:    [num_agents, num_future_chunks] bool
-            generation_agents:   [num_agents] bool, agents to roll out
-            supervision_agents:  [num_agents] bool, agents to supervise
+        Training/validation loss uses GT token validity. Inference follows
+        SMART rollout semantics by treating future chunks of current-valid
+        generation agents as valid even when no GT future token exists.
         """
         h = self.history_token_steps
         future_slice = slice(h, h + self.num_future_chunks)
         tokens = data['agent']['token_idx'][:, future_slice].long()
         valid = data['agent']['agent_valid_mask'][:, future_slice].bool()
-        has_future = valid.any(dim=-1)
-        generation_agents = self._generation_agent_mask(data) & has_future
+        generation_agents = self._generation_agent_mask(data)
+        if rollout_valid:
+            valid = torch.ones_like(valid, dtype=torch.bool) & generation_agents[:, None]
+        else:
+            generation_agents = generation_agents & valid.any(dim=-1)
         supervision_agents = self._supervision_agent_mask(data) & generation_agents
         return tokens, valid, generation_agents, supervision_agents
 
@@ -790,9 +802,12 @@ class SMARTDiffusion(SMART):
             return ref_tensor.new_zeros(())
         return self._compute_ntp_loss(self(data))
 
-    def _build_diffusion_inputs(self, data):
+    def _build_diffusion_inputs(self, data, rollout_valid=False):
         ctx = self.encoder.encode_history_context(data)
-        ft, fv, generation_agents, supervision_agents = self._build_future_token_targets(data)
+        ft, fv, generation_agents, supervision_agents = self._build_future_token_targets(
+            data,
+            rollout_valid=rollout_valid,
+        )
         agent_batch = self._get_agent_batch(data)
         agent_pos = data['agent']['position'][:, self.num_historical_steps - 1, :2].float()
         agent_heading = data['agent']['heading'][:, self.num_historical_steps - 1].float()
@@ -1057,8 +1072,11 @@ class SMARTDiffusion(SMART):
                 em = self._metric_agent_mask(data)
                 if not em.any():
                     return
-                pred_valid = pred_out.get('pred_valid_mask', pred_out['valid_mask'])
-                eval_valid = pred_out['valid_mask'] & pred_valid
+                official_valid = pred_out.get('official_valid_mask')
+                if official_valid is None:
+                    official_valid = self._official_future_valid_mask(data, pred_out)
+                pred_valid = pred_out.get('pred_valid_mask', official_valid)
+                eval_valid = official_valid & pred_valid
                 self.minADE.update(pred=pred_out['pred_traj'][em],
                                    target=pred_out['gt'][em],
                                    valid_mask=eval_valid[em])
@@ -1312,7 +1330,10 @@ class SMARTDiffusion(SMART):
     def inference(self, data):
         """Diffusion sampling → chain decoding → predicted trajectories."""
         data = self._prepare_batch(data)
-        packed, summary, ft, fv, generation_agents, _supervision_agents, agent_batch = self._build_diffusion_inputs(data)
+        packed, summary, ft, fv, generation_agents, _supervision_agents, agent_batch = self._build_diffusion_inputs(
+            data,
+            rollout_valid=True,
+        )
         if packed is None:
             return None
 
@@ -1407,8 +1428,9 @@ class SMARTDiffusion(SMART):
                 pos[decode_mask] = world[:, -1]
                 heading[decode_mask] = chunk_heading[:, -1]
 
-        gt_pos = data['agent']['position'][:, self.num_historical_steps:, :2]
-        gt_val = data['agent']['valid_mask'][:, self.num_historical_steps:].bool().clone()
+        gt_pos = data['agent']['position'][:, self.num_historical_steps:self.num_historical_steps + self.num_future_steps, :2]
+        official_valid = data['agent']['valid_mask'][:, self.num_historical_steps:self.num_historical_steps + self.num_future_steps].bool().clone()
+        gt_val = official_valid.clone()
         try:
             gt_val[data['agent']['category'].long() != 3] = False
         except Exception:
@@ -1419,6 +1441,7 @@ class SMARTDiffusion(SMART):
             'head_a': torch.cat([hist_heading.unsqueeze(1), pred_head], dim=1),
             'gt': gt_pos,
             'valid_mask': gt_val,
+            'official_valid_mask': official_valid,
             'pred_valid_mask': pred_valid_mask,
             'pred_traj': pred_traj,
             'pred_head': pred_head,
