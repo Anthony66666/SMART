@@ -108,6 +108,6 @@
 ## Decision: SMART-Diffusion validation parity follows official current-valid SMART metrics
 - Date: 2026-05-24
 - Context: Official SMART trains token supervision on category-3 targets, but validation ADE/FDE uses current-history-valid agents and raw future validity rather than the category-filtered inference return mask.
-- Decision: Treat `smart_val_compatible` as official current-valid validation semantics. Keep `category == 3` for diffusion/token supervision and explicit `smart_category3` ablations only.
+- Decision: Treat `smart_val_compatible` as official current-valid validation semantics. Keep `category == 3` for diffusion/token supervision and explicit `smart_category3` ablations only. Validation ADE/FDE must use raw official future validity directly and run on every validation batch, matching upstream SMART; `pred_valid_mask` is not part of the official metric mask.
 - Why: This matches upstream SMART validation behavior and prevents validation visualizations from hiding generated non-target vehicles because the randomized target category changed between steps.
-- Impact: Diffusion and AR diffusion outputs now expose `official_valid_mask`; visualization defaults to official view while target/supervision view remains optional for debugging training targets.
+- Impact: Diffusion and AR diffusion outputs now expose `official_valid_mask`; visualization defaults to official view while target/supervision view remains optional for debugging training targets. Missing prediction coverage should be diagnosed separately from ADE/FDE.

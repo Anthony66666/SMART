@@ -467,6 +467,15 @@ class SMARTDiffusion(SMART):
                 future_len = int(prediction['gt'].shape[1])
         return data['agent']['valid_mask'][:, self.num_historical_steps:self.num_historical_steps + future_len].bool()
 
+    def _validation_eval_valid_mask(self, data, prediction):
+        official_valid = prediction.get('official_valid_mask')
+        if official_valid is None:
+            official_valid = self._official_future_valid_mask(data, prediction)
+        return official_valid
+
+    def _should_run_validation_inference(self, batch_idx):
+        return bool(self.inference_token)
+
     def _target_agent_mask(self, data):
         return self._supervision_agent_mask(data)
 
@@ -1065,18 +1074,14 @@ class SMARTDiffusion(SMART):
         self.log('val_mask_acc', mask_acc, prog_bar=True, on_step=False, on_epoch=True,
                  batch_size=1, sync_dist=True)
 
-        # Full inference for ADE/FDE (only first 2 batches to limit cost)
-        if self.inference_token and batch_idx < self.diffusion_eval_batches:
+        # Full inference for ADE/FDE, matching official SMART validation.
+        if self._should_run_validation_inference(batch_idx):
             pred_out = self.inference(data)
             if pred_out is not None:
                 em = self._metric_agent_mask(data)
                 if not em.any():
                     return
-                official_valid = pred_out.get('official_valid_mask')
-                if official_valid is None:
-                    official_valid = self._official_future_valid_mask(data, pred_out)
-                pred_valid = pred_out.get('pred_valid_mask', official_valid)
-                eval_valid = official_valid & pred_valid
+                eval_valid = self._validation_eval_valid_mask(data, pred_out)
                 self.minADE.update(pred=pred_out['pred_traj'][em],
                                    target=pred_out['gt'][em],
                                    valid_mask=eval_valid[em])

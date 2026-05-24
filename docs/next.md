@@ -12,6 +12,6 @@
 
 ## Next Actions
 
-- Inspect `pred_valid_mask` and `official_valid_mask` together when diagnosing missing trajectories; do not infer missing generation from category-filtered `valid_mask` alone.
+- Inspect `pred_valid_mask` and `official_valid_mask` together when diagnosing missing trajectories; do not use `pred_valid_mask` to filter official ADE/FDE.
 - Keep `metric_mode: smart_val_compatible` for official SMART parity; use `metric_mode: smart_category3` only for target-only ablations.
 - Use `source /home/anthony/anaconda3/etc/profile.d/conda.sh && conda activate smart` before running SMART tests in noninteractive shells.

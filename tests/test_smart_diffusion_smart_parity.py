@@ -205,7 +205,7 @@ class SMARTDiffusionSMARTParityTest(unittest.TestCase):
         self.assertTrue(out['official_valid_mask'][1].all())
         self.assertTrue(out['valid_mask'][0].all())
 
-    def test_official_future_valid_mask_ignores_category_filtered_prediction_mask(self):
+    def test_validation_eval_valid_mask_matches_official_smart_without_pred_filter(self):
         model = _diffusion_shell()
         data = HeteroData()
         data['agent']['valid_mask'] = torch.ones(2, 21, dtype=torch.bool)
@@ -218,16 +218,22 @@ class SMARTDiffusionSMARTParityTest(unittest.TestCase):
             ]),
             'pred_valid_mask': torch.tensor([
                 [True] * 10,
-                [True, False] + [True] * 8,
+                [False, False] + [True] * 8,
             ]),
         }
 
-        official = model._official_future_valid_mask(data, pred)
-        eval_valid = official & pred['pred_valid_mask']
+        eval_valid = model._validation_eval_valid_mask(data, pred)
 
-        self.assertTrue(official[1, 0])
-        self.assertFalse(official[1, 1])
+        self.assertTrue(eval_valid[1, 0])
         self.assertFalse(eval_valid[1, 1])
+        self.assertTrue(eval_valid[1, 2])
+
+    def test_validation_inference_is_not_limited_to_first_two_batches(self):
+        model = _diffusion_shell()
+        model.inference_token = True
+        model.diffusion_eval_batches = 0
+
+        self.assertTrue(model._should_run_validation_inference(batch_idx=999))
 
 
 class ValidationVisualizationMaskTest(unittest.TestCase):
