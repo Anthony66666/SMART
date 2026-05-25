@@ -35,6 +35,8 @@ Trainer:
   ckpt_path:
   precision: 32
   accumulate_grad_batches: 1
+  limit_val_batches: 50
+  check_val_every_n_epoch: 1
   monitor_metric: "val_minADE"
   monitor_mode: "min"
 

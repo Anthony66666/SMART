@@ -158,3 +158,10 @@
 - Files: `smart/model/smart_ar_diffusion.py`, `smart/model/smart_diffusion.py`, `tests/test_smart_ar_diffusion.py`, diffusion/AR train configs
 - Validation: `tests.test_smart_ar_diffusion` passed 11 tests; `py_compile` passed for AR/diffusion files; diffusion prefix tests passed; SMART parity tests passed with the existing Waymo-dependency skip; `git diff --check` passed.
 - Next: Use `val_minADE`/`val_minFDE` for AR checkpoint selection and compare `val_ar_window_loss` only as a local short-window denoising diagnostic.
+
+## 2026-05-25 CST
+- Task: Limited epoch-end AR diffusion validation batches during training.
+- Result: `train.py` now passes optional `Trainer.limit_val_batches` and `Trainer.check_val_every_n_epoch` through to PyTorch Lightning. AR diffusion train configs set `limit_val_batches: 50` and `check_val_every_n_epoch: 1` so epoch-end validation can run a bounded subset while preserving full validation when these fields are omitted.
+- Files: `train.py`, `configs/train/train_scalable_ar_diffusion.yaml`, `configs/train/train_scalable_ar_diffusion_local.yaml`
+- Validation: `python3 -m py_compile train.py` passed.
+- Next: If validation remains too slow, profile AR inference to separate repeated encoder/map-context cost from diffusion denoising cost before changing model logic.

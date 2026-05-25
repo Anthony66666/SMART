@@ -93,6 +93,8 @@ if __name__ == '__main__':
                          precision=getattr(trainer_config, 'precision', 32),
                          callbacks=callbacks,
                          max_epochs=trainer_config.max_epochs,
+                         limit_val_batches=getattr(trainer_config, 'limit_val_batches', 1.0),
+                         check_val_every_n_epoch=getattr(trainer_config, 'check_val_every_n_epoch', 1),
                          num_sanity_val_steps=0,
                          gradient_clip_val=0.5)
     if args.ckpt_path == "":
