@@ -103,6 +103,48 @@ class SMARTAutoregressiveDiffusionTest(unittest.TestCase):
         self.assertTrue(torch.equal(near_zero, torch.tensor([0])))
         self.assertTrue(torch.equal(near_ten, torch.tensor([1])))
 
+    def test_rollout_view_preserves_history_token_valid_mask(self):
+        model = _ar_shell()
+        data = _toy_sequence(num_agents=1, num_tokens=18, num_frames=91)
+        data["agent"]["agent_valid_mask"][0, 0] = False
+        generation = torch.tensor([True])
+
+        view = model._build_ar_rollout_view(
+            data,
+            data["agent"]["token_idx"][:, :2],
+            data["agent"]["token_pos"][:, :2],
+            data["agent"]["token_heading"][:, :2],
+            data["agent"]["position"][:, :11],
+            data["agent"]["heading"][:, :11],
+            data["agent"]["valid_mask"][:, :11],
+            generation,
+        )
+
+        self.assertTrue(torch.equal(
+            view["agent"]["agent_valid_mask"][0, :2],
+            torch.tensor([False, True]),
+        ))
+        self.assertTrue(view["agent"]["agent_valid_mask"][0, 2:].all())
+
+    def test_rollout_view_removes_current_invalid_agents_from_history_context(self):
+        model = _ar_shell()
+        data = _toy_sequence(num_agents=2, num_tokens=18, num_frames=91)
+        generation = torch.tensor([True, False])
+
+        view = model._build_ar_rollout_view(
+            data,
+            data["agent"]["token_idx"][:, :2],
+            data["agent"]["token_pos"][:, :2],
+            data["agent"]["token_heading"][:, :2],
+            data["agent"]["position"][:, :11],
+            data["agent"]["heading"][:, :11],
+            data["agent"]["valid_mask"][:, :11],
+            generation,
+        )
+
+        self.assertTrue(view["agent"]["agent_valid_mask"][0, :2].all())
+        self.assertFalse(view["agent"]["agent_valid_mask"][1].any())
+
     def test_inference_commits_two_tokens_per_round_for_full_eighty_steps(self):
         model = _ar_shell()
         data = _toy_sequence(num_agents=1, num_tokens=18, num_frames=91)

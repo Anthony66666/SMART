@@ -2,8 +2,8 @@
 
 ## In Flight
 
-- Run a validation inference smoke with `configs/validation/validation_scalable_ar_diffusion.yaml`; confirm current-valid non-background agents are visible in official validation visualizations even when `category != 3`.
-- Compare official-view visualizations against optional supervision/target view to verify only the latter changes when `WaymoTargetBuilder` randomly selects category-3 targets.
+- Run AR validation inference/visualization after the rollout history-token-validity fix and compare straight-vehicle speeds against the previous checkpoint/code path.
+- Inspect `next_token_idx` predicted-token speed versus `next_token_idx_gt` for current-valid straight vehicles, split by `category == 3` and non-target generation agents.
 - Continue comparing `smart_ar_diffusion` against full-horizon `smart_diffusion` on boundary exits, collisions, map violations, and official export zero-fallback checks.
 
 ## Blockers
@@ -12,6 +12,6 @@
 
 ## Next Actions
 
-- Inspect `pred_valid_mask` and `official_valid_mask` together when diagnosing missing trajectories; do not use `pred_valid_mask` to filter official ADE/FDE.
 - Keep `metric_mode: smart_val_compatible` for official SMART parity; use `metric_mode: smart_category3` only for target-only ablations.
 - Use `source /home/anthony/anaconda3/etc/profile.d/conda.sh && conda activate smart` before running SMART tests in noninteractive shells.
+- If straight-vehicle speed remains high after the mask fix, add a diagnostic that logs predicted and GT token speed percentiles by agent/category/current-speed bin.

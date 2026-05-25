@@ -144,3 +144,10 @@
 - Files: `smart/model/smart_diffusion.py`, `smart/model/smart_ar_diffusion.py`, `smart/callbacks/validation_visualization.py`, `scripts/export_val_quad_video.py`, `tests/test_smart_diffusion_smart_parity.py`
 - Validation: In the `smart` conda environment, `python -m py_compile smart/model/smart_diffusion.py smart/model/smart_ar_diffusion.py smart/callbacks/validation_visualization.py scripts/export_val_quad_video.py tests/test_smart_diffusion_smart_parity.py` passed; `python -m unittest tests.test_smart_diffusion_smart_parity -v` passed 12 tests with 1 Waymo-dependency skip; `tests.test_smart_ar_diffusion` passed 6 tests; `tests.test_smart_diffusion_prefix` passed 3 tests.
 - Next: Inspect validation visualizations in official view for missing current-valid vehicles, then run a real validation smoke on AR diffusion configs.
+
+## 2026-05-25 CST
+- Task: Fixed AR discrete diffusion rollout history-token validity.
+- Result: AR rollout views now preserve real/rolling history token validity and mask all token-history context for agents that are not current-valid generation agents, preventing invalid token-0 history from creating spurious high-speed motion features.
+- Files: `smart/model/smart_ar_diffusion.py`, `tests/test_smart_ar_diffusion.py`
+- Validation: `tests.test_smart_ar_diffusion` passed 8 tests; `py_compile` passed for AR files; diffusion prefix tests passed; SMART parity tests passed with the existing Waymo-dependency skip; `git diff --check` passed.
+- Next: Re-run AR validation visualization and inspect straight-vehicle predicted token speeds versus GT token speeds after this mask fix.

@@ -139,6 +139,10 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
         combined = torch.cat([history_token_ids, committed_token_ids], dim=1)
         return combined[:, -self.ar_history_tokens:].clone()
 
+    def _roll_history_token_valid(self, history_token_valid, committed_token_valid):
+        combined = torch.cat([history_token_valid, committed_token_valid], dim=1)
+        return combined[:, -self.ar_history_tokens:].clone()
+
     def _select_local_map_indices(self, map_positions, map_batch, scene_idx, agent_positions, map_visible=None):
         scene_mask = map_batch == int(scene_idx)
         if map_visible is not None:
@@ -250,6 +254,7 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
         history_frame_heading,
         history_frame_valid,
         generation_agents,
+        history_token_valid=None,
     ):
         view = data.clone()
         agent = view['agent']
@@ -261,7 +266,14 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
         agent['token_idx'] = torch.zeros(num_agents, total_tokens, dtype=torch.long, device=device)
         agent['token_idx'][:, :self.ar_history_tokens] = history_token_ids
         agent['agent_valid_mask'] = torch.zeros(num_agents, total_tokens, dtype=torch.bool, device=device)
-        agent['agent_valid_mask'][:, :self.ar_history_tokens] = True
+        if history_token_valid is None:
+            if 'agent_valid_mask' in data['agent']:
+                history_token_valid = data['agent']['agent_valid_mask'][:, :self.ar_history_tokens]
+            else:
+                history_token_valid = torch.ones(num_agents, self.ar_history_tokens, dtype=torch.bool, device=device)
+        history_token_valid = history_token_valid.to(device=device, dtype=torch.bool)
+        history_token_valid = history_token_valid & generation_agents[:, None].to(device=device, dtype=torch.bool)
+        agent['agent_valid_mask'][:, :self.ar_history_tokens] = history_token_valid
         agent['agent_valid_mask'][:, self.ar_history_tokens:] = generation_agents[:, None]
         agent['token_pos'] = torch.zeros(num_agents, total_tokens, 2, dtype=history_token_pos.dtype, device=history_token_pos.device)
         agent['token_pos'][:, :self.ar_history_tokens] = history_token_pos
@@ -335,6 +347,7 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
         device = data['agent']['position'].device
         generation_agents = self._generation_agent_mask(data)
         history_token_ids = data['agent']['token_idx'][:, :self.ar_history_tokens].long().clone()
+        history_token_valid = data['agent']['agent_valid_mask'][:, :self.ar_history_tokens].bool().clone()
         history_token_pos = data['agent']['token_pos'][:, :self.ar_history_tokens, :2].float().clone()
         history_token_heading = data['agent']['token_heading'][:, :self.ar_history_tokens].float().clone()
         history_frame_pos = data['agent']['position'][:, :self.num_historical_steps, :2].float().clone()
@@ -364,6 +377,7 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
                 history_frame_heading,
                 history_frame_valid,
                 generation_agents,
+                history_token_valid=history_token_valid,
             )
             packed, summary, ft, fv, _generation_agents, _supervision_agents, agent_batch = self._build_diffusion_inputs(rollout_view)
             if packed is None:
@@ -412,6 +426,7 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
             pred_prob[:, token_start:token_end] = committed_confidence
 
             history_token_ids = self._roll_history_token_ids(history_token_ids, committed_tokens)
+            history_token_valid = self._roll_history_token_valid(history_token_valid, committed_valid)
             history_token_pos = commit_token_pos[:, -self.ar_history_tokens:].clone()
             history_token_heading = commit_token_heading[:, -self.ar_history_tokens:].clone()
             history_frame_pos = torch.cat([history_frame_pos, commit_traj], dim=1)[:, -self.num_historical_steps:]
