@@ -1,5 +1,6 @@
 
 import unittest
+from pathlib import Path
 from types import MethodType, SimpleNamespace
 
 import torch
@@ -216,6 +217,68 @@ class SMARTAutoregressiveDiffusionTest(unittest.TestCase):
             packed["loss_mask_base"][0, :8],
             torch.tensor([True, True, True, True, False, False, False, False]),
         ))
+
+    def test_validation_step_uses_ar_window_loss_metrics(self):
+        model = _ar_shell()
+        data = _toy_sequence(num_agents=1, num_tokens=18, num_frames=91)
+        model.ntp_aux_loss_weight = 0.0
+        calls = {"ar_window": 0}
+        logged = []
+
+        model._prepare_batch = MethodType(lambda self, batch: batch, model)
+
+        def fake_ar_view(self, batch, anchor_token=None, perturb=None):
+            calls["ar_window"] += 1
+            return batch, None, None, 2
+
+        def fake_build_inputs(self, batch):
+            packed = {
+                "token_ids": torch.zeros(1, 4, dtype=torch.long),
+                "valid_mask": torch.ones(1, 4, dtype=torch.bool),
+                "loss_mask_base": torch.ones(1, 4, dtype=torch.bool),
+                "chunk_ids": torch.arange(4).unsqueeze(0),
+                "token_agent_ids": torch.zeros(1, 4, dtype=torch.long),
+            }
+            summary = torch.zeros(1, 1)
+            return packed, summary, None, None, None, None, None
+
+        model._build_ar_training_view = MethodType(fake_ar_view, model)
+        model._build_diffusion_inputs = MethodType(fake_build_inputs, model)
+        model._compute_diffusion_loss = MethodType(
+            lambda self, packed, summary: (torch.tensor(2.0), torch.tensor(0.5)),
+            model,
+        )
+        model._compute_optional_ntp_loss = MethodType(lambda self, batch, ref: torch.tensor(0.0), model)
+        model._should_run_validation_inference = MethodType(lambda self, batch_idx: False, model)
+        model.log = MethodType(lambda self, name, *args, **kwargs: logged.append(name), model)
+
+        model.validation_step(data, 0)
+
+        self.assertEqual(calls["ar_window"], 1)
+        self.assertIn("val_ar_window_loss", logged)
+        self.assertIn("val_ar_window_diffusion_loss", logged)
+        self.assertNotIn("val_loss", logged)
+        self.assertNotIn("val_diffusion_loss", logged)
+
+    def test_ar_train_config_monitors_rollout_metric_not_window_loss(self):
+        text = Path("configs/train/train_scalable_ar_diffusion.yaml").read_text()
+
+        self.assertIn('monitor_metric: "val_minADE"', text)
+        self.assertIn('monitor_mode: "min"', text)
+        self.assertNotIn('monitor_metric: "val_loss"', text)
+
+    def test_unused_self_condition_options_are_removed_from_code_and_configs(self):
+        paths = [
+            Path("smart/model/smart_diffusion.py"),
+            Path("configs/train/train_scalable_diffusion.yaml"),
+            Path("configs/train/train_scalable_diffusion_local.yaml"),
+            Path("configs/train/train_scalable_ar_diffusion.yaml"),
+            Path("configs/train/train_scalable_ar_diffusion_local.yaml"),
+        ]
+        for path in paths:
+            text = path.read_text()
+            self.assertNotIn("self_condition_visible_prob", text, str(path))
+            self.assertNotIn("self_condition_loss_weight", text, str(path))
 
 
 if __name__ == "__main__":

@@ -151,3 +151,10 @@
 - Files: `smart/model/smart_ar_diffusion.py`, `tests/test_smart_ar_diffusion.py`
 - Validation: `tests.test_smart_ar_diffusion` passed 8 tests; `py_compile` passed for AR files; diffusion prefix tests passed; SMART parity tests passed with the existing Waymo-dependency skip; `git diff --check` passed.
 - Next: Re-run AR validation visualization and inspect straight-vehicle predicted token speeds versus GT token speeds after this mask fix.
+
+## 2026-05-25 CST
+- Task: Clarified AR diffusion validation loss and removed unused self-conditioning config fields.
+- Result: `SMARTAutoregressiveDiffusion.validation_step()` now computes deterministic AR short-window validation loss under `val_ar_window_*` metrics while full rollout ADE/FDE remains under `val_minADE`/`val_minFDE`; AR training configs monitor `val_minADE` instead of misleading `val_loss`. Unused `self_condition_visible_prob` and `self_condition_loss_weight` fields were removed from code and diffusion train configs.
+- Files: `smart/model/smart_ar_diffusion.py`, `smart/model/smart_diffusion.py`, `tests/test_smart_ar_diffusion.py`, diffusion/AR train configs
+- Validation: `tests.test_smart_ar_diffusion` passed 11 tests; `py_compile` passed for AR/diffusion files; diffusion prefix tests passed; SMART parity tests passed with the existing Waymo-dependency skip; `git diff --check` passed.
+- Next: Use `val_minADE`/`val_minFDE` for AR checkpoint selection and compare `val_ar_window_loss` only as a local short-window denoising diagnostic.

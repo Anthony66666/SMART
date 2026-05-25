@@ -35,7 +35,7 @@ Trainer:
   ckpt_path:
   precision: 32
   accumulate_grad_batches: 1
-  monitor_metric: "val_loss"
+  monitor_metric: "val_minADE"
   monitor_mode: "min"
 
 Visualization:
@@ -113,7 +113,5 @@ Model:
     use_proposal_geometry: true
     geometry_confidence_source_threshold: 0.35
     self_condition_prob: 1.0
-    self_condition_visible_prob: 0.10
     self_condition_mode: "argmax"
-    self_condition_loss_weight: 1.0
     freeze_encoder: false

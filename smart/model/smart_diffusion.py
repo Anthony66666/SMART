@@ -117,13 +117,9 @@ class SMARTDiffusion(SMART):
         )
         self.self_condition_prob = float(getattr(diffusion_cfg, 'self_condition_prob', 1.0))
         self.self_condition_prob = min(max(self.self_condition_prob, 0.0), 1.0)
-        self.self_condition_visible_prob = float(getattr(diffusion_cfg, 'self_condition_visible_prob', 0.1))
-        self.self_condition_visible_prob = min(max(self.self_condition_visible_prob, 0.0), 1.0)
         self.self_condition_mode = str(getattr(diffusion_cfg, 'self_condition_mode', 'argmax')).lower()
         if self.self_condition_mode != 'argmax':
             raise ValueError(f"Unsupported diffusion.self_condition_mode: {self.self_condition_mode}")
-        self.self_condition_loss_weight = float(getattr(diffusion_cfg, 'self_condition_loss_weight', 1.0))
-        self.self_condition_loss_weight = max(self.self_condition_loss_weight, 0.0)
         self.diffusion_eval_batches = int(getattr(diffusion_cfg, 'eval_inference_batches', 2))
         token_size = int(getattr(model_config.decoder, 'token_size', 2048))
 

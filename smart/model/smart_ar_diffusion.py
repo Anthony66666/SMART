@@ -244,6 +244,73 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
         self.log('train_mask_acc', mask_acc, on_step=True, on_epoch=True, batch_size=1)
         return loss
 
+    def validation_step(self, data, batch_idx):
+        data = self._prepare_batch(data)
+        loss_data, _target_tokens, _target_valid, _anchor = self._build_ar_training_view(
+            data,
+            perturb=False,
+        )
+        packed, summary, _ft, _fv, _generation_agents, _supervision_agents, _agent_batch = self._build_diffusion_inputs(loss_data)
+        if packed is None:
+            self.log('val_ar_window_empty_diffusion_batch', data['agent']['position'].new_ones(()),
+                     prog_bar=False, on_step=False, on_epoch=True,
+                     batch_size=1, sync_dist=True)
+            return
+
+        diffusion_loss, mask_acc = self._compute_diffusion_loss(packed, summary)
+        ntp_loss = self._compute_optional_ntp_loss(loss_data, diffusion_loss)
+        total_loss = diffusion_loss + self.ntp_aux_loss_weight * ntp_loss
+
+        self.log('val_ar_window_empty_diffusion_batch', total_loss.new_zeros(()),
+                 prog_bar=False, on_step=False, on_epoch=True,
+                 batch_size=1, sync_dist=True)
+        self.log('val_ar_window_loss', total_loss, prog_bar=True, on_step=False, on_epoch=True,
+                 batch_size=1, sync_dist=True)
+        self.log('val_ar_window_total_loss', total_loss, on_step=False, on_epoch=True,
+                 batch_size=1, sync_dist=True)
+        self.log('val_ar_window_diffusion_loss', diffusion_loss, on_step=False, on_epoch=True,
+                 batch_size=1, sync_dist=True)
+        self.log('val_ar_window_ntp_loss', ntp_loss, on_step=False, on_epoch=True,
+                 batch_size=1, sync_dist=True)
+        self.log('val_ar_window_mask_acc', mask_acc, prog_bar=True, on_step=False, on_epoch=True,
+                 batch_size=1, sync_dist=True)
+
+        if self._should_run_validation_inference(batch_idx):
+            pred_out = self.inference(data)
+            if pred_out is not None:
+                em = self._metric_agent_mask(data)
+                if not em.any():
+                    return
+                eval_valid = self._validation_eval_valid_mask(data, pred_out)
+                self.minADE.update(pred=pred_out['pred_traj'][em],
+                                   target=pred_out['gt'][em],
+                                   valid_mask=eval_valid[em])
+                self.minFDE.update(pred=pred_out['pred_traj'][em],
+                                   target=pred_out['gt'][em],
+                                   valid_mask=eval_valid[em])
+                self.log('val_minADE', self.minADE, prog_bar=True, on_step=False,
+                         on_epoch=True, batch_size=1)
+                self.log('val_minFDE', self.minFDE, prog_bar=True, on_step=False,
+                         on_epoch=True, batch_size=1)
+                shapes = data['agent']['shape']
+                if shapes.dim() == 3:
+                    shapes = shapes[:, self.num_historical_steps - 1, :]
+                self.conflict_rate.update(
+                    pred_out['pred_traj'][em],
+                    pred_out['pred_head'][em],
+                    shapes[em],
+                    eval_valid[em],
+                )
+                self.interaction_consistency.update(
+                    pred_out['pred_traj'][em],
+                    pred_out['gt'][em],
+                    eval_valid[em],
+                )
+                self.log('val_conflict_rate', self.conflict_rate, prog_bar=False,
+                         on_step=False, on_epoch=True, batch_size=1)
+                self.log('val_interaction_consistency', self.interaction_consistency,
+                         prog_bar=False, on_step=False, on_epoch=True, batch_size=1)
+
     def _build_ar_rollout_view(
         self,
         data,
