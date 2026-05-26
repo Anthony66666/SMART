@@ -165,3 +165,10 @@
 - Files: `train.py`, `configs/train/train_scalable_ar_diffusion.yaml`, `configs/train/train_scalable_ar_diffusion_local.yaml`
 - Validation: `python3 -m py_compile train.py` passed.
 - Next: If validation remains too slow, profile AR inference to separate repeated encoder/map-context cost from diffusion denoising cost before changing model logic.
+
+## 2026-05-26 CST
+- Task: Added validation debug logging for AR diffusion server runs.
+- Result: Added `diffusion.debug_validation_logging` and rank-aware stdout logs around AR validation window loss, full rollout inference, per-round diffusion sampling, validation visualization, and step visualization. AR train/validation configs enable the flag so server logs show where epoch-end validation is spending time.
+- Files: `smart/model/smart_diffusion.py`, `smart/model/smart_ar_diffusion.py`, `smart/callbacks/validation_visualization.py`, `smart/callbacks/step_visualization.py`, AR diffusion configs
+- Validation: `python3 -m py_compile smart/model/smart_diffusion.py smart/model/smart_ar_diffusion.py smart/callbacks/validation_visualization.py smart/callbacks/step_visualization.py` passed; `git diff --check` passed for edited files.
+- Next: Use the new `[SMARTDiffusion]`, `[ValidationVisualization]`, and `[StepVisualization]` logs on the server to separate validation window loss, full AR rollout, and visualization bottlenecks.

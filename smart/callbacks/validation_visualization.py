@@ -1,4 +1,5 @@
 from pathlib import Path
+import time
 from typing import Iterable, Optional
 
 import pytorch_lightning as pl
@@ -32,8 +33,16 @@ class ValidationVisualizationCallback(pl.Callback):
         if datamodule is None or not hasattr(datamodule, "val_dataset"):
             return
         dataset = datamodule.val_dataset
+        debug_logging = bool(
+            getattr(getattr(pl_module.model_config, 'diffusion', None), 'debug_validation_logging', False)
+        )
         output_root = Path(self.output_dir) / pl_module.model_config.predictor / f"epoch_{epoch:03d}"
         output_root.mkdir(parents=True, exist_ok=True)
+        if debug_logging:
+            print(
+                f"[ValidationVisualization][rank=0 epoch={epoch}] start samples={self.sample_indices}",
+                flush=True,
+            )
 
         was_training = pl_module.training
         pl_module.eval()
@@ -42,11 +51,22 @@ class ValidationVisualizationCallback(pl.Callback):
                 for sample_index in self.sample_indices:
                     if sample_index < 0 or sample_index >= len(dataset):
                         continue
+                    sample_start = time.perf_counter()
+                    if debug_logging:
+                        print(
+                            f"[ValidationVisualization][rank=0 epoch={epoch}] sample_start index={sample_index}",
+                            flush=True,
+                        )
                     graph = dataset[sample_index]
                     batch = Batch.from_data_list([graph]).to(pl_module.device)
                     prepared = self._prepare_batch(pl_module, batch)
                     prediction = pl_module.inference(prepared)
                     if prediction is None:
+                        if debug_logging:
+                            print(
+                                f"[ValidationVisualization][rank=0 epoch={epoch}] sample_skip index={sample_index} prediction=None",
+                                flush=True,
+                            )
                         continue
                     scenario_id = self._scenario_id(graph)
                     filename = f"idx_{sample_index:05d}_{scenario_id}.png"
@@ -57,6 +77,12 @@ class ValidationVisualizationCallback(pl.Callback):
                         title=f"{pl_module.model_config.predictor} epoch={epoch} idx={sample_index} scenario={scenario_id}",
                         max_agents=self.max_agents,
                     )
+                    if debug_logging:
+                        print(
+                            f"[ValidationVisualization][rank=0 epoch={epoch}] sample_done index={sample_index} "
+                            f"elapsed={time.perf_counter() - sample_start:.2f}s output={output_root / filename}",
+                            flush=True,
+                        )
         finally:
             if was_training:
                 pl_module.train()

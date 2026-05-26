@@ -1,4 +1,5 @@
 from pathlib import Path
+import time
 from typing import Iterable, Optional
 
 import pytorch_lightning as pl
@@ -41,8 +42,16 @@ class StepVisualizationCallback(pl.Callback):
         dataset = datamodule.val_dataset
 
         predictor_name = pl_module.model_config.predictor
+        debug_logging = bool(
+            getattr(getattr(pl_module.model_config, 'diffusion', None), 'debug_validation_logging', False)
+        )
         output_root = Path(self.output_dir) / predictor_name / f"step_{global_step:06d}"
         output_root.mkdir(parents=True, exist_ok=True)
+        if debug_logging:
+            print(
+                f"[StepVisualization][rank=0 step={global_step}] start samples={self.sample_indices}",
+                flush=True,
+            )
 
         was_training = pl_module.training
         pl_module.eval()
@@ -51,11 +60,22 @@ class StepVisualizationCallback(pl.Callback):
                 for sample_index in self.sample_indices:
                     if sample_index < 0 or sample_index >= len(dataset):
                         continue
+                    sample_start = time.perf_counter()
+                    if debug_logging:
+                        print(
+                            f"[StepVisualization][rank=0 step={global_step}] sample_start index={sample_index}",
+                            flush=True,
+                        )
                     graph = dataset[sample_index]
                     batch = Batch.from_data_list([graph]).to(pl_module.device)
                     prepared = self._prepare_batch(pl_module, batch)
                     prediction = pl_module.inference(prepared)
                     if prediction is None:
+                        if debug_logging:
+                            print(
+                                f"[StepVisualization][rank=0 step={global_step}] sample_skip index={sample_index} prediction=None",
+                                flush=True,
+                            )
                         continue
                     scenario_id = _scenario_id(graph)
                     filename = f"idx_{sample_index:05d}_{scenario_id}.png"
@@ -69,6 +89,12 @@ class StepVisualizationCallback(pl.Callback):
                         title=f"{predictor_name} step={global_step} idx={sample_index} scenario={scenario_id}",
                         max_agents=self.max_agents,
                     )
+                    if debug_logging:
+                        print(
+                            f"[StepVisualization][rank=0 step={global_step}] sample_done index={sample_index} "
+                            f"elapsed={time.perf_counter() - sample_start:.2f}s output={output_root / filename}",
+                            flush=True,
+                        )
         finally:
             if was_training:
                 pl_module.train()

@@ -93,4 +93,5 @@ Model:
     prefix_constrained_training: false
     use_proposal_geometry: true
     geometry_confidence_source_threshold: 0.35
+    debug_validation_logging: true
     freeze_encoder: false

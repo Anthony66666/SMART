@@ -1,5 +1,6 @@
 
 import math
+import time
 
 import torch
 from torch_geometric.data import Batch
@@ -245,21 +246,43 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
         return loss
 
     def validation_step(self, data, batch_idx):
+        val_start = time.perf_counter()
         data = self._prepare_batch(data)
+        num_agents = int(data['agent']['position'].shape[0])
+        self._debug_log(
+            f"val_step_start batch_idx={batch_idx} agents={num_agents} "
+            f"inference_token={bool(self.inference_token)}"
+        )
+        build_start = time.perf_counter()
         loss_data, _target_tokens, _target_valid, _anchor = self._build_ar_training_view(
             data,
             perturb=False,
         )
         packed, summary, _ft, _fv, _generation_agents, _supervision_agents, _agent_batch = self._build_diffusion_inputs(loss_data)
         if packed is None:
+            self._debug_log(
+                f"val_step_empty batch_idx={batch_idx} elapsed={time.perf_counter() - val_start:.2f}s"
+            )
             self.log('val_ar_window_empty_diffusion_batch', data['agent']['position'].new_ones(()),
                      prog_bar=False, on_step=False, on_epoch=True,
                      batch_size=1, sync_dist=True)
             return
+        packed_tokens = int(packed['valid_mask'].sum().item())
+        map_tokens = 0 if packed.get('map_context') is None else int(packed['map_context'].shape[0])
+        self._debug_log(
+            f"val_step_window_inputs batch_idx={batch_idx} packed_tokens={packed_tokens} "
+            f"map_tokens={map_tokens} build_elapsed={time.perf_counter() - build_start:.2f}s"
+        )
 
+        loss_start = time.perf_counter()
         diffusion_loss, mask_acc = self._compute_diffusion_loss(packed, summary)
         ntp_loss = self._compute_optional_ntp_loss(loss_data, diffusion_loss)
         total_loss = diffusion_loss + self.ntp_aux_loss_weight * ntp_loss
+        self._debug_log(
+            f"val_step_window_loss_done batch_idx={batch_idx} "
+            f"loss={self._debug_scalar(total_loss):.4f} mask_acc={self._debug_scalar(mask_acc):.4f} "
+            f"loss_elapsed={time.perf_counter() - loss_start:.2f}s"
+        )
 
         self.log('val_ar_window_empty_diffusion_batch', total_loss.new_zeros(()),
                  prog_bar=False, on_step=False, on_epoch=True,
@@ -276,10 +299,20 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
                  batch_size=1, sync_dist=True)
 
         if self._should_run_validation_inference(batch_idx):
+            inference_start = time.perf_counter()
+            self._debug_log(f"val_step_inference_start batch_idx={batch_idx}")
             pred_out = self.inference(data)
+            self._debug_log(
+                f"val_step_inference_done batch_idx={batch_idx} "
+                f"elapsed={time.perf_counter() - inference_start:.2f}s "
+                f"pred_valid_frames={0 if pred_out is None else int(pred_out['pred_valid_mask'].sum().item())}"
+            )
             if pred_out is not None:
                 em = self._metric_agent_mask(data)
                 if not em.any():
+                    self._debug_log(
+                        f"val_step_no_metric_agents batch_idx={batch_idx} total_elapsed={time.perf_counter() - val_start:.2f}s"
+                    )
                     return
                 eval_valid = self._validation_eval_valid_mask(data, pred_out)
                 self.minADE.update(pred=pred_out['pred_traj'][em],
@@ -310,6 +343,9 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
                          on_step=False, on_epoch=True, batch_size=1)
                 self.log('val_interaction_consistency', self.interaction_consistency,
                          prog_bar=False, on_step=False, on_epoch=True, batch_size=1)
+        self._debug_log(
+            f"val_step_done batch_idx={batch_idx} total_elapsed={time.perf_counter() - val_start:.2f}s"
+        )
 
     def _build_ar_rollout_view(
         self,
@@ -409,9 +445,15 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
 
     @torch.no_grad()
     def inference(self, data):
+        inference_start = time.perf_counter()
         data = self._prepare_batch(data)
         num_agents = int(data['agent']['position'].shape[0])
         device = data['agent']['position'].device
+        rounds = self._num_ar_rollout_rounds()
+        self._debug_log(
+            f"ar_inference_start agents={num_agents} rounds={rounds} "
+            f"diffusion_steps={self.diffusion_num_steps} commit_tokens={self.ar_commit_tokens}"
+        )
         generation_agents = self._generation_agent_mask(data)
         history_token_ids = data['agent']['token_idx'][:, :self.ar_history_tokens].long().clone()
         history_token_valid = data['agent']['agent_valid_mask'][:, :self.ar_history_tokens].bool().clone()
@@ -427,14 +469,16 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
         pred_head = torch.zeros(num_agents, self.ar_total_rollout_steps, device=device)
         pred_valid_mask = torch.zeros(num_agents, self.ar_total_rollout_steps, dtype=torch.bool, device=device)
         pred_token_ids = torch.full(
-            (num_agents, self._num_ar_rollout_rounds() * self.ar_commit_tokens),
+            (num_agents, rounds * self.ar_commit_tokens),
             -1,
             dtype=torch.long,
             device=device,
         )
         pred_prob = torch.zeros_like(pred_token_ids, dtype=torch.float)
 
-        for round_idx in range(self._num_ar_rollout_rounds()):
+        for round_idx in range(rounds):
+            round_start = time.perf_counter()
+            self._debug_log(f"ar_inference_round_start round={round_idx + 1}/{rounds}")
             rollout_view = self._build_ar_rollout_view(
                 data,
                 history_token_ids,
@@ -448,7 +492,17 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
             )
             packed, summary, ft, fv, _generation_agents, _supervision_agents, agent_batch = self._build_diffusion_inputs(rollout_view)
             if packed is None:
+                self._debug_log(
+                    f"ar_inference_round_empty round={round_idx + 1}/{rounds} elapsed={time.perf_counter() - round_start:.2f}s"
+                )
                 break
+            packed_tokens = int(packed['valid_mask'].sum().item())
+            map_tokens = 0 if packed.get('map_context') is None else int(packed['map_context'].shape[0])
+            self._debug_log(
+                f"ar_inference_round_packed round={round_idx + 1}/{rounds} "
+                f"packed_tokens={packed_tokens} map_tokens={map_tokens}"
+            )
+            sample_start = time.perf_counter()
             sampled_ids, sampled_confidence = self._diffusion_sample(
                 summary=summary,
                 token_positions=packed['token_positions'],
@@ -465,6 +519,10 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
                 map_batch=packed.get('map_batch'),
                 map_valid_mask=packed.get('map_valid_mask'),
                 packed=packed,
+            )
+            self._debug_log(
+                f"ar_inference_round_sample_done round={round_idx + 1}/{rounds} "
+                f"sample_elapsed={time.perf_counter() - sample_start:.2f}s"
             )
             per_agent_tokens, per_agent_confidence = self._unpack_sampled_tokens(
                 sampled_ids,
@@ -499,6 +557,16 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
             history_frame_pos = torch.cat([history_frame_pos, commit_traj], dim=1)[:, -self.num_historical_steps:]
             history_frame_heading = torch.cat([history_frame_heading, commit_head], dim=1)[:, -self.num_historical_steps:]
             history_frame_valid = torch.cat([history_frame_valid, commit_valid_frames], dim=1)[:, -self.num_historical_steps:]
+            self._debug_log(
+                f"ar_inference_round_done round={round_idx + 1}/{rounds} "
+                f"committed_valid_frames={int(commit_valid_frames.sum().item())} "
+                f"round_elapsed={time.perf_counter() - round_start:.2f}s"
+            )
+
+        self._debug_log(
+            f"ar_inference_done elapsed={time.perf_counter() - inference_start:.2f}s "
+            f"pred_valid_frames={int(pred_valid_mask.sum().item())}"
+        )
 
         gt_pos = data['agent']['position'][:, self.num_historical_steps:self.num_historical_steps + self.ar_total_rollout_steps, :2]
         official_valid = data['agent']['valid_mask'][:, self.num_historical_steps:self.num_historical_steps + self.ar_total_rollout_steps].bool().clone()

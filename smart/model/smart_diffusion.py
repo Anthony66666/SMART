@@ -121,6 +121,7 @@ class SMARTDiffusion(SMART):
         if self.self_condition_mode != 'argmax':
             raise ValueError(f"Unsupported diffusion.self_condition_mode: {self.self_condition_mode}")
         self.diffusion_eval_batches = int(getattr(diffusion_cfg, 'eval_inference_batches', 2))
+        self.debug_validation_logging = bool(getattr(diffusion_cfg, 'debug_validation_logging', False))
         token_size = int(getattr(model_config.decoder, 'token_size', 2048))
 
         self.noise_schedule = LogLinearNoise(eps=self.diffusion_eps)
@@ -275,6 +276,32 @@ class SMARTDiffusion(SMART):
             except Exception:
                 rank = 0
         return step, rank
+
+    def _debug_log(self, message):
+        if not getattr(self, 'debug_validation_logging', False):
+            return
+        try:
+            step, rank = self._current_step_rank()
+        except Exception:
+            step, rank = 0, 0
+        try:
+            epoch = int(getattr(self.trainer, 'current_epoch', 0))
+        except Exception:
+            try:
+                epoch = int(getattr(self, 'current_epoch', 0))
+            except Exception:
+                epoch = 0
+        print(f"[SMARTDiffusion][rank={rank} epoch={epoch} step={step}] {message}", flush=True)
+
+    @staticmethod
+    def _debug_scalar(value):
+        try:
+            return float(value.detach().cpu())
+        except Exception:
+            try:
+                return float(value)
+            except Exception:
+                return float('nan')
 
     def _sample_diffusion_timesteps(self, batch_size, device, step=None, rank=None):
         """Low-discrepancy samples in [min_t, 1], including batch_size=1."""

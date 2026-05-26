@@ -113,6 +113,7 @@ Model:
     prefix_constrained_training: false
     use_proposal_geometry: true
     geometry_confidence_source_threshold: 0.35
+    debug_validation_logging: true
     self_condition_prob: 1.0
     self_condition_mode: "argmax"
     freeze_encoder: false
