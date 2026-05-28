@@ -1,6 +1,20 @@
 # Progress
 
 ## 2026-05-28 CST
+- Task: Added visible-token neighbor corruption for SMART AR diffusion training.
+- Result: Diffusion training can now replace unmasked visible future tokens with same-type top-k nearest SMART trajectory-token neighbors while preserving GT labels for loss. AR train configs enable `visible_token_corruption_prob: 0.15` and `visible_token_corruption_topk: 5`; validation sets corruption probability to `0.0`.
+- Files: `smart/model/smart_diffusion.py`, `tests/test_smart_diffusion_prefix.py`, `tests/test_smart_ar_diffusion.py`, `configs/train/train_scalable_ar_diffusion*.yaml`, `configs/validation/validation_scalable_ar_diffusion.yaml`
+- Validation: Targeted visible-token corruption tests passed; `py_compile`, diffusion prefix tests, AR diffusion tests, SMART diffusion parity tests, and `git diff --check` passed with the existing Waymo official dependency skip.
+- Next: Finetune from the previous AR diffusion checkpoint with receding-horizon proposal carry plus visible-token neighbor corruption, then compare straight-vehicle speed and map-violation visualizations.
+
+## 2026-05-28 CST
+- Task: Reverted AR diffusion default causal schedules to a disabled ablation and added multiplier-based causal mask support.
+- Result: AR configs now keep `causal_noise_schedule: false` by default, retain receding-horizon `commit_tokens: 1` plus proposal carry, and expose `causal_chunk_mask_multipliers` for experiments that preserve `mask_prob(t)` semantics. Legacy fixed `causal_chunk_mask_probs` remains supported only as fallback behavior.
+- Files: `smart/model/smart_diffusion.py`, `tests/test_smart_diffusion_prefix.py`, `tests/test_smart_ar_diffusion.py`, `configs/train/train_scalable_ar_diffusion*.yaml`, `configs/validation/validation_scalable_ar_diffusion.yaml`
+- Validation: Targeted TDD tests passed; `py_compile`, diffusion prefix tests, AR diffusion tests, SMART diffusion parity tests, and `git diff --check` passed with the existing Waymo official dependency skip.
+- Next: Re-run visualization with the old checkpoint under receding-horizon proposal carry only; compare against the fixed causal schedule run before trying visible-token neighbor corruption.
+
+## 2026-05-28 CST
 - Task: Added discrete Diffusion Forcing-style causal schedules for AR diffusion training.
 - Result: SMART diffusion loss can now use per-chunk mask probabilities and loss weights; AR diffusion configs enable `[0.20, 0.45, 0.70, 0.90]` mask probabilities and `[1.0, 0.8, 0.4, 0.2]` loss weights so near tokens are trained as executable and far tokens as softer proposals.
 - Files: `smart/model/smart_diffusion.py`, `tests/test_smart_diffusion_prefix.py`, `tests/test_smart_ar_diffusion.py`, `configs/train/train_scalable_ar_diffusion*.yaml`, `configs/validation/validation_scalable_ar_diffusion.yaml`

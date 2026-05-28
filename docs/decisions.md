@@ -1,5 +1,19 @@
 # Decisions
 
+## Decision: Use visible-token neighbor corruption for AR diffusion training
+- Date: 2026-05-28
+- Context: SMART's official rolling tokenization noise trains the model to continue from slightly perturbed token states, while AR diffusion training still used clean visible future-token context after masking.
+- Decision: During SMART-Diffusion training, keep GT labels unchanged but randomly replace some unmasked visible future tokens with same-type top-k nearest trajectory-token neighbors before decoder conditioning and geometry refresh.
+- Why: This matches the robustness role of SMART's token noise without corrupting the supervised target, exposing the diffusion decoder to plausible sampled-token context drift.
+- Impact: AR diffusion train configs enable `visible_token_corruption_prob: 0.15` with `visible_token_corruption_topk: 5`; validation keeps corruption disabled.
+
+## Decision: Keep causal chunk schedules as disabled AR diffusion ablations
+- Date: 2026-05-28
+- Context: Fixed per-chunk mask probabilities made AR diffusion visualizations worse, likely because they overrode `mask_prob(t)` while sampling still uses the global diffusion noise schedule.
+- Decision: Disable causal chunk schedules in the default AR diffusion configs. When enabled for ablation, use chunk multipliers on the global mask probability instead of fixed per-chunk probabilities.
+- Why: This keeps the diffusion timestep embedding aligned with the actual mask rate and lets receding-horizon proposal carry be evaluated without the confound of a mismatched causal schedule.
+- Impact: `commit_tokens: 1` and `carry_tail_proposal: true` remain the AR default; `causal_chunk_mask_multipliers` is available for controlled experiments, while `causal_chunk_mask_probs` is legacy fallback behavior.
+
 ## Decision: Use causal chunk noise and loss schedules for AR diffusion
 - Date: 2026-05-28
 - Context: Uniform mask/noise over a 4-token AR diffusion window treats near executable tokens and far planning tokens equally, which can let uncertain high-speed straight tokens affect closed-loop rollout.

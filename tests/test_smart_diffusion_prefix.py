@@ -63,12 +63,82 @@ class SMARTDiffusionPrefixMaskTest(unittest.TestCase):
         self.assertTrue(torch.equal(frontier, torch.tensor([[False, False, True]])))
 
 
+
+class SMARTDiffusionVisibleTokenCorruptionTest(unittest.TestCase):
+    def test_visible_token_neighbor_corruption_only_changes_visible_context(self):
+        model = _diffusion_shell()
+        model.training = True
+        model.visible_token_corruption_prob = 1.0
+        model.visible_token_corruption_probs = ()
+        model.visible_token_corruption_topk = 1
+        model.model_config = SimpleNamespace(decoder=SimpleNamespace(token_size=16))
+        model.diffusion_decoder = SimpleNamespace(mask_token_id=99)
+
+        def fake_neighbor_table(topk, device):
+            table = torch.zeros(4, 16, topk, dtype=torch.long, device=device)
+            for token_id in range(16):
+                table[:, token_id, :] = (token_id + 5) % 16
+            return table
+
+        model._token_neighbor_table = fake_neighbor_table
+        noisy = torch.tensor([[1, 2, 3, 4]])
+        visible_mask = torch.tensor([[True, False, True, False]])
+        packed = {
+            'agent_type_ids': torch.tensor([[0, 0, 1, 1]]),
+            'chunk_ids': torch.tensor([[0, 1, 2, 3]]),
+            'valid_mask': torch.ones(1, 4, dtype=torch.bool),
+        }
+
+        corrupted, corruption_mask = model._apply_visible_token_corruption(
+            noisy,
+            visible_mask,
+            packed,
+        )
+
+        self.assertTrue(torch.equal(corruption_mask, visible_mask))
+        self.assertTrue(torch.equal(corrupted, torch.tensor([[6, 2, 8, 4]])))
+
+    def test_visible_token_neighbor_corruption_uses_chunk_probabilities(self):
+        model = _diffusion_shell()
+        model.training = True
+        model.visible_token_corruption_prob = 0.0
+        model.visible_token_corruption_probs = (0.0, 1.0, 0.0, 1.0)
+        model.visible_token_corruption_topk = 1
+        model.model_config = SimpleNamespace(decoder=SimpleNamespace(token_size=16))
+        model.diffusion_decoder = SimpleNamespace(mask_token_id=99)
+
+        def fake_neighbor_table(topk, device):
+            table = torch.zeros(4, 16, topk, dtype=torch.long, device=device)
+            for token_id in range(16):
+                table[:, token_id, :] = (token_id + 5) % 16
+            return table
+
+        model._token_neighbor_table = fake_neighbor_table
+        noisy = torch.tensor([[1, 2, 3, 4]])
+        visible_mask = torch.ones(1, 4, dtype=torch.bool)
+        packed = {
+            'agent_type_ids': torch.tensor([[0, 0, 1, 1]]),
+            'chunk_ids': torch.tensor([[0, 1, 2, 3]]),
+            'valid_mask': torch.ones(1, 4, dtype=torch.bool),
+        }
+
+        corrupted, corruption_mask = model._apply_visible_token_corruption(
+            noisy,
+            visible_mask,
+            packed,
+        )
+
+        self.assertTrue(torch.equal(corruption_mask, torch.tensor([[False, True, False, True]])))
+        self.assertTrue(torch.equal(corrupted, torch.tensor([[1, 7, 3, 9]])))
+
+
 class SMARTDiffusionCausalNoiseScheduleTest(unittest.TestCase):
     def _causal_shell(self):
         model = _diffusion_shell()
         model.training = False
         model.causal_noise_schedule = True
         model.causal_chunk_mask_probs = (0.20, 0.45, 0.70, 0.90)
+        model.causal_chunk_mask_multipliers = ()
         model.causal_loss_weights = (1.0, 0.8, 0.4, 0.2)
         model.prefix_constrained_training = False
         model.low_variance_masking = False
@@ -114,6 +184,36 @@ class SMARTDiffusionCausalNoiseScheduleTest(unittest.TestCase):
         self.assertTrue(torch.allclose(
             captured['mask_prob'],
             torch.tensor([[0.20, 0.45, 0.70, 0.90]]),
+        ))
+
+    def test_causal_noise_schedule_multiplies_global_t_mask_prob(self):
+        model = self._causal_shell()
+        model.causal_chunk_mask_probs = ()
+        model.causal_chunk_mask_multipliers = (0.70, 0.90, 1.10, 1.30)
+        captured = {}
+
+        def fake_sample_training_mask(self, valid_mask, mask_prob, step=None, rank=None):
+            captured['mask_prob'] = mask_prob.detach().clone()
+            return torch.ones_like(valid_mask)
+
+        def fake_decode(self, noisy, packed, summary, t, geometry_known_mask, **_kwargs):
+            return torch.zeros(*noisy.shape, 2, device=noisy.device)
+
+        model._sample_training_mask = MethodType(fake_sample_training_mask, model)
+        model._decode_diffusion_logits = MethodType(fake_decode, model)
+        packed = {
+            'token_ids': torch.zeros(1, 4, dtype=torch.long),
+            'valid_mask': torch.ones(1, 4, dtype=torch.bool),
+            'loss_mask_base': torch.ones(1, 4, dtype=torch.bool),
+            'chunk_ids': torch.tensor([[0, 1, 2, 3]]),
+            'token_agent_ids': torch.zeros(1, 4, dtype=torch.long),
+        }
+
+        model._compute_diffusion_loss(packed, torch.zeros(1, 1))
+
+        self.assertTrue(torch.allclose(
+            captured['mask_prob'],
+            torch.tensor([[0.35, 0.45, 0.55, 0.65]]),
         ))
 
     def test_causal_loss_weights_downweight_far_chunks(self):

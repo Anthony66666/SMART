@@ -64,9 +64,9 @@ Model:
     prediction_tokens: 4
     commit_tokens: 1
     carry_tail_proposal: true
-    causal_noise_schedule: true
-    causal_chunk_mask_probs: [0.20, 0.45, 0.70, 0.90]
-    causal_loss_weights: [1.0, 0.8, 0.4, 0.2]
+    causal_noise_schedule: false
+    causal_chunk_mask_multipliers: [0.70, 0.90, 1.10, 1.30]
+    causal_loss_weights: [1.0, 1.0, 0.75, 0.5]
     token_steps: 5
     total_rollout_steps: 80
     local_map_refresh: rescreen
@@ -84,6 +84,8 @@ Model:
     use_map_context: true
     max_map_tokens: 0  # 0 disables scene-level truncation and follows SMART radius map-agent selection.
     geometry_dropout_prob: 0.0
+    visible_token_corruption_prob: 0.0
+    visible_token_corruption_topk: 5
     target_category_only: true
     agent_selection_mode: smart_inference
     supervision_mode: smart_category3

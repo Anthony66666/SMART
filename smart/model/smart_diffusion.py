@@ -109,8 +109,22 @@ class SMARTDiffusion(SMART):
         self.causal_chunk_mask_probs = tuple(
             float(x) for x in getattr(diffusion_cfg, 'causal_chunk_mask_probs', [])
         )
+        self.causal_chunk_mask_multipliers = tuple(
+            float(x) for x in getattr(diffusion_cfg, 'causal_chunk_mask_multipliers', [])
+        )
         self.causal_loss_weights = tuple(
             float(x) for x in getattr(diffusion_cfg, 'causal_loss_weights', [])
+        )
+        self.visible_token_corruption_prob = float(
+            getattr(diffusion_cfg, 'visible_token_corruption_prob', 0.0)
+        )
+        self.visible_token_corruption_prob = min(max(self.visible_token_corruption_prob, 0.0), 1.0)
+        self.visible_token_corruption_probs = tuple(
+            float(x) for x in getattr(diffusion_cfg, 'visible_token_corruption_probs', [])
+        )
+        self.visible_token_corruption_topk = max(
+            1,
+            int(getattr(diffusion_cfg, 'visible_token_corruption_topk', 5)),
         )
         self.antithetic_mask_ranking = bool(getattr(diffusion_cfg, 'antithetic_mask_ranking', True))
         self.remask_sampling = bool(getattr(diffusion_cfg, 'remask_sampling', True))
@@ -372,6 +386,24 @@ class SMARTDiffusion(SMART):
     def _training_mask_prob(self, mask_prob, packed):
         if not getattr(self, 'causal_noise_schedule', False):
             return mask_prob
+
+        chunk_multipliers = self._causal_chunk_values(
+            packed,
+            getattr(self, 'causal_chunk_mask_multipliers', ()),
+            dtype=mask_prob.dtype,
+        )
+        if chunk_multipliers is not None:
+            if mask_prob.dim() == 1:
+                base_prob = mask_prob.unsqueeze(-1).expand_as(chunk_multipliers)
+            elif mask_prob.shape == packed['valid_mask'].shape:
+                base_prob = mask_prob.to(device=chunk_multipliers.device, dtype=chunk_multipliers.dtype)
+            else:
+                raise ValueError(
+                    f"mask_prob must have shape [B] or valid_mask shape; got {tuple(mask_prob.shape)} "
+                    f"for valid_mask {tuple(packed['valid_mask'].shape)}."
+                )
+            return (base_prob * chunk_multipliers).clamp(0.0, 1.0)
+
         chunk_probs = self._causal_chunk_values(
             packed,
             getattr(self, 'causal_chunk_mask_probs', ()),
@@ -393,6 +425,92 @@ class SMARTDiffusion(SMART):
         if chunk_weights is None:
             return torch.ones_like(valid_mask, dtype=dtype)
         return chunk_weights
+
+    def _token_neighbor_table(self, topk, device):
+        token_size = int(self.token_size)
+        topk = max(1, int(topk))
+        cache = getattr(self, '_token_neighbor_cache', {})
+        key = (str(device), topk, token_size, int(self.future_chunk_steps))
+        if key in cache:
+            return cache[key]
+
+        table = torch.arange(token_size, device=device, dtype=torch.long)
+        table = table.view(1, token_size, 1).expand(4, token_size, topk).clone()
+        type_specs = [('veh', 0), ('ped', 1), ('cyc', 2)]
+        with torch.no_grad():
+            for token_name, type_id in type_specs:
+                vocab = self.token_vocab[token_name].to(device=device, dtype=torch.float)
+                n = min(token_size, int(vocab.shape[0]))
+                if n <= 0:
+                    continue
+                shape = vocab[:n, :self.future_chunk_steps + 1].reshape(n, -1)
+                dist = torch.cdist(shape, shape)
+                k = min(topk, n)
+                nearest = torch.topk(dist, k=k, dim=-1, largest=False).indices
+                if k < topk:
+                    pad = nearest[:, -1:].expand(-1, topk - k)
+                    nearest = torch.cat([nearest, pad], dim=-1)
+                table[type_id, :n, :] = nearest
+
+        cache[key] = table
+        self._token_neighbor_cache = cache
+        return table
+
+    def _visible_token_corruption_prob(self, packed, dtype=torch.float):
+        if getattr(self, 'visible_token_corruption_probs', ()):
+            return self._causal_chunk_values(
+                packed,
+                getattr(self, 'visible_token_corruption_probs', ()),
+                dtype=dtype,
+            ).clamp(0.0, 1.0)
+        prob = float(getattr(self, 'visible_token_corruption_prob', 0.0))
+        if prob <= 0.0:
+            return None
+        return torch.full_like(packed['valid_mask'], prob, dtype=dtype)
+
+    def _apply_visible_token_corruption(self, noisy, visible_mask, packed):
+        corruption_mask = torch.zeros_like(visible_mask)
+        if not self.training:
+            return noisy, corruption_mask
+        topk = int(getattr(self, 'visible_token_corruption_topk', 5))
+        if topk <= 0:
+            return noisy, corruption_mask
+
+        corruption_prob = self._visible_token_corruption_prob(packed, dtype=torch.float)
+        if corruption_prob is None:
+            return noisy, corruption_mask
+
+        safe_types = packed['agent_type_ids'].long().clamp(min=0, max=3)
+        candidate_mask = (
+            visible_mask
+            & packed['valid_mask'].bool()
+            & (safe_types < 3)
+            & (noisy >= 0)
+            & (noisy < self.token_size)
+            & (noisy != self.mask_token_id)
+        )
+        if not candidate_mask.any():
+            return noisy, corruption_mask
+
+        corruption_prob = corruption_prob.to(device=noisy.device, dtype=torch.float).clamp(0.0, 1.0)
+        corruption_mask = candidate_mask & (torch.rand_like(noisy.float()) < corruption_prob)
+        if not corruption_mask.any():
+            return noisy, corruption_mask
+
+        neighbor_table = self._token_neighbor_table(topk, noisy.device)
+        safe_tokens = noisy.long().clamp(min=0, max=self.token_size - 1)
+        candidates = neighbor_table[safe_types, safe_tokens]
+        sample_slot = torch.randint(
+            0,
+            int(candidates.shape[-1]),
+            noisy.shape,
+            device=noisy.device,
+        )
+        sampled_tokens = candidates.gather(-1, sample_slot.unsqueeze(-1)).squeeze(-1)
+
+        corrupted = noisy.clone()
+        corrupted[corruption_mask] = sampled_tokens[corruption_mask]
+        return corrupted, corruption_mask
 
     def _sample_training_mask(self, valid_mask, mask_prob, step=None, rank=None):
         if mask_prob.dim() == 1:
@@ -1038,6 +1156,12 @@ class SMARTDiffusion(SMART):
 
         noisy = gt.clone()
         noisy[mask] = self.mask_token_id
+        visible_context_mask = (~mask) & valid_mask
+        noisy, visible_corruption_mask = self._apply_visible_token_corruption(
+            noisy,
+            visible_context_mask,
+            packed,
+        )
 
         proposal_ids = None
         proposal_confidence = None
@@ -1101,6 +1225,11 @@ class SMARTDiffusion(SMART):
 
         if self.training:
             valid_count = valid_mask.to(dtype=torch.float).sum().clamp_min(1.0)
+            visible_context_count = visible_context_mask.to(dtype=torch.float).sum().clamp_min(1.0)
+            corruption_frac = visible_corruption_mask.to(dtype=torch.float).sum() / visible_context_count
+            corruption_changed_frac = (
+                visible_corruption_mask & (noisy != gt)
+            ).to(dtype=torch.float).sum() / visible_context_count
             proposal_frac = proposal_mask.to(dtype=torch.float).sum() / valid_count
             if proposal_mask.any():
                 proposal_acc = (
@@ -1108,6 +1237,10 @@ class SMARTDiffusion(SMART):
                 ).float().mean()
             else:
                 proposal_acc = logits.new_zeros(())
+            self.log('train_visible_token_corruption_frac', corruption_frac,
+                     prog_bar=False, on_step=True, on_epoch=True, batch_size=1)
+            self.log('train_visible_token_corruption_changed_frac', corruption_changed_frac,
+                     prog_bar=False, on_step=True, on_epoch=True, batch_size=1)
             self.log('train_self_condition_frac', proposal_frac,
                      prog_bar=False, on_step=True, on_epoch=True, batch_size=1)
             self.log('train_self_condition_input_acc', proposal_input_acc,
