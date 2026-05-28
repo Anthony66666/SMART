@@ -336,6 +336,18 @@ class SMARTAutoregressiveDiffusionTest(unittest.TestCase):
         self.assertIn('monitor_mode: "min"', text)
         self.assertNotIn('monitor_metric: "val_loss"', text)
 
+    def test_ar_configs_enable_causal_noise_schedule(self):
+        for path in [
+            Path("configs/train/train_scalable_ar_diffusion.yaml"),
+            Path("configs/train/train_scalable_ar_diffusion_local.yaml"),
+            Path("configs/validation/validation_scalable_ar_diffusion.yaml"),
+        ]:
+            text = path.read_text()
+            self.assertIn("causal_noise_schedule: true", text, str(path))
+            self.assertIn("causal_chunk_mask_probs: [0.20, 0.45, 0.70, 0.90]", text, str(path))
+            self.assertIn("causal_loss_weights: [1.0, 0.8, 0.4, 0.2]", text, str(path))
+
+
     def test_unused_self_condition_options_are_removed_from_code_and_configs(self):
         paths = [
             Path("smart/model/smart_diffusion.py"),

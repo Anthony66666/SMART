@@ -1,6 +1,13 @@
 # Progress
 
 ## 2026-05-28 CST
+- Task: Added discrete Diffusion Forcing-style causal schedules for AR diffusion training.
+- Result: SMART diffusion loss can now use per-chunk mask probabilities and loss weights; AR diffusion configs enable `[0.20, 0.45, 0.70, 0.90]` mask probabilities and `[1.0, 0.8, 0.4, 0.2]` loss weights so near tokens are trained as executable and far tokens as softer proposals.
+- Files: `smart/model/smart_diffusion.py`, `tests/test_smart_diffusion_prefix.py`, `tests/test_smart_ar_diffusion.py`, `configs/train/train_scalable_ar_diffusion*.yaml`, `configs/validation/validation_scalable_ar_diffusion.yaml`
+- Validation: Causal schedule tests passed; AR diffusion tests passed; diffusion prefix tests passed; SMART diffusion parity tests passed with the existing Waymo official dependency skip; `py_compile` passed.
+- Next: Run AR validation from the old checkpoint with receding-horizon plus causal schedules, then compare straight-vehicle predicted-token speed percentiles against the previous schedule.
+
+## 2026-05-28 CST
 - Task: Added receding-horizon proposal carry for SMART AR diffusion.
 - Result: AR rollout can now predict a 4-token window, commit 1 token per round, and carry the uncommitted tail as proposal geometry/confidence for the next diffusion window; history token pose/heading rolling now supports `commit_tokens < history_tokens`. AR train/validation configs enable `commit_tokens: 1` with `carry_tail_proposal: true`.
 - Files: `smart/model/smart_ar_diffusion.py`, `smart/model/smart_diffusion.py`, `tests/test_smart_ar_diffusion.py`, `configs/train/train_scalable_ar_diffusion*.yaml`, `configs/validation/validation_scalable_ar_diffusion.yaml`

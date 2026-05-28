@@ -105,6 +105,13 @@ class SMARTDiffusion(SMART):
         ).lower()
         self.low_variance_masking = bool(getattr(diffusion_cfg, 'low_variance_masking', True))
         self.mask_count_mode = str(getattr(diffusion_cfg, 'mask_count_mode', 'exact')).lower()
+        self.causal_noise_schedule = bool(getattr(diffusion_cfg, 'causal_noise_schedule', False))
+        self.causal_chunk_mask_probs = tuple(
+            float(x) for x in getattr(diffusion_cfg, 'causal_chunk_mask_probs', [])
+        )
+        self.causal_loss_weights = tuple(
+            float(x) for x in getattr(diffusion_cfg, 'causal_loss_weights', [])
+        )
         self.antithetic_mask_ranking = bool(getattr(diffusion_cfg, 'antithetic_mask_ranking', True))
         self.remask_sampling = bool(getattr(diffusion_cfg, 'remask_sampling', True))
         self.remask_confidence_temperature = float(getattr(diffusion_cfg, 'remask_confidence_temperature', 1.0))
@@ -348,12 +355,61 @@ class SMARTDiffusion(SMART):
             scores = 1.0 - scores
         return scores
 
+    def _causal_chunk_values(self, packed, values, dtype=torch.float):
+        if not values:
+            return None
+        value_tensor = torch.tensor(
+            values,
+            device=packed['chunk_ids'].device,
+            dtype=dtype,
+        )
+        chunk_ids = packed['chunk_ids'].long().clamp(
+            min=0,
+            max=int(value_tensor.numel()) - 1,
+        )
+        return value_tensor[chunk_ids]
+
+    def _training_mask_prob(self, mask_prob, packed):
+        if not getattr(self, 'causal_noise_schedule', False):
+            return mask_prob
+        chunk_probs = self._causal_chunk_values(
+            packed,
+            getattr(self, 'causal_chunk_mask_probs', ()),
+            dtype=mask_prob.dtype,
+        )
+        if chunk_probs is None:
+            return mask_prob
+        return chunk_probs
+
+    def _training_loss_weights(self, packed, dtype=torch.float):
+        valid_mask = packed['valid_mask']
+        if not getattr(self, 'causal_noise_schedule', False):
+            return torch.ones_like(valid_mask, dtype=dtype)
+        chunk_weights = self._causal_chunk_values(
+            packed,
+            getattr(self, 'causal_loss_weights', ()),
+            dtype=dtype,
+        )
+        if chunk_weights is None:
+            return torch.ones_like(valid_mask, dtype=dtype)
+        return chunk_weights
+
     def _sample_training_mask(self, valid_mask, mask_prob, step=None, rank=None):
+        if mask_prob.dim() == 1:
+            token_mask_prob = mask_prob.unsqueeze(-1).expand_as(valid_mask).clamp(0.0, 1.0)
+        elif mask_prob.shape == valid_mask.shape:
+            token_mask_prob = mask_prob.to(device=valid_mask.device, dtype=torch.float).clamp(0.0, 1.0)
+        else:
+            raise ValueError(
+                f"mask_prob must have shape [B] or valid_mask shape; got {tuple(mask_prob.shape)} "
+                f"for valid_mask {tuple(valid_mask.shape)}."
+            )
+
         if (
             not self.low_variance_masking
             or self.mask_count_mode != 'exact'
         ):
-            return (torch.rand_like(valid_mask.float()) < mask_prob.unsqueeze(-1)) & valid_mask
+            return (torch.rand_like(valid_mask.float()) < token_mask_prob) & valid_mask
 
         mask = torch.zeros_like(valid_mask)
         scores = self._mask_ranking_scores(valid_mask.shape, valid_mask.device, step=step, rank=rank)
@@ -362,13 +418,34 @@ class SMARTDiffusion(SMART):
             valid_count = int(valid_mask[batch_idx].sum().item())
             if valid_count <= 0:
                 continue
-            prob = float(mask_prob[batch_idx].detach().clamp(0.0, 1.0).item())
-            mask_count = int(round(prob * valid_count))
-            mask_count = min(max(mask_count, 0), valid_count)
-            if mask_count <= 0:
+            if mask_prob.dim() == 1:
+                prob = float(mask_prob[batch_idx].detach().clamp(0.0, 1.0).item())
+                mask_count = int(round(prob * valid_count))
+                mask_count = min(max(mask_count, 0), valid_count)
+                if mask_count <= 0:
+                    continue
+                selected = torch.topk(scores[batch_idx], k=mask_count, largest=False).indices
+                mask[batch_idx, selected] = True
                 continue
-            selected = torch.topk(scores[batch_idx], k=mask_count, largest=False).indices
-            mask[batch_idx, selected] = True
+
+            batch_probs = token_mask_prob[batch_idx].detach()
+            for prob in torch.unique(batch_probs[valid_mask[batch_idx]]):
+                prob_value = float(prob.item())
+                candidate = valid_mask[batch_idx] & (batch_probs == prob)
+                candidate_indices = torch.nonzero(candidate, as_tuple=False).squeeze(-1)
+                candidate_count = int(candidate_indices.numel())
+                if candidate_count <= 0:
+                    continue
+                mask_count = int(round(prob_value * candidate_count))
+                mask_count = min(max(mask_count, 0), candidate_count)
+                if mask_count <= 0:
+                    continue
+                local = torch.topk(
+                    scores[batch_idx, candidate_indices],
+                    k=mask_count,
+                    largest=False,
+                ).indices
+                mask[batch_idx, candidate_indices[local]] = True
         return mask
 
     def _apply_prefix_mask_closure(self, mask, valid_mask, token_agent_ids, chunk_ids):
@@ -941,7 +1018,8 @@ class SMARTDiffusion(SMART):
         gt = packed['token_ids']
         valid_mask = packed['valid_mask']
         loss_mask_base = packed.get('loss_mask_base', valid_mask) & valid_mask
-        mask = self._sample_training_mask(valid_mask, mask_prob)
+        training_mask_prob = self._training_mask_prob(mask_prob, packed)
+        mask = self._sample_training_mask(valid_mask, training_mask_prob)
         if self.prefix_constrained_training:
             mask = self._apply_prefix_mask_closure(
                 mask,
@@ -1012,7 +1090,8 @@ class SMARTDiffusion(SMART):
             log_p = F.log_softmax(logits, dim=-1)
             nll = -log_p.gather(-1, gt.unsqueeze(-1)).squeeze(-1)
             weight = (dsigma_t / torch.expm1(sigma_t)).unsqueeze(-1).expand_as(nll)
-            supervision_weight = loss_mask.to(dtype=nll.dtype)
+            chunk_loss_weight = self._training_loss_weights(packed, dtype=nll.dtype)
+            supervision_weight = loss_mask.to(dtype=nll.dtype) * chunk_loss_weight
             loss = (weight * nll * supervision_weight).sum()
             loss = loss / loss_mask_base.to(dtype=nll.dtype).sum().clamp_min(1.0)
             acc = (logits[loss_mask].argmax(-1) == gt[loss_mask]).float().mean()

@@ -39,7 +39,7 @@ Maintain this repository as the primary implementation repo for SMART baseline r
 3. Keep SMART-Diffusion aligned with SMART/QCNet-style graph-relative geometry: raw coordinates may be used for neighbor search, but embeddings should consume edge-relative features.
 4. Represent diffusion map context as flat/ragged tokens with packed-scene batch ids, not per-scene padding.
 5. Refresh future-token graph geometry from currently unmasked diffusion tokens during training and sampling, with training-time geometry dropout to reduce train/inference mismatch.
-6. Compare SMART-Diffusion variants with SMART parity: full-horizon joint MaskGIT denoising remains available, while `smart_ar_diffusion` now uses a receding-horizon rollout by default: 2-token history, 4-token prediction, 1-token commit, and uncommitted tail-token proposal carry into the next round.
+6. Compare SMART-Diffusion variants with SMART parity: full-horizon joint MaskGIT denoising remains available, while `smart_ar_diffusion` now uses a receding-horizon rollout by default: 2-token history, 4-token prediction, 1-token commit, uncommitted tail-token proposal carry, and causal chunk mask/loss schedules that treat near tokens as executable and far tokens as proposals.
 7. After meaningful work, update `docs/progress.md` and refresh `docs/next.md`.
 8. Update `docs/spec.md` and `docs/decisions.md` only when project direction or durable decisions change.
 

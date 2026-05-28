@@ -1,5 +1,12 @@
 # Decisions
 
+## Decision: Use causal chunk noise and loss schedules for AR diffusion
+- Date: 2026-05-28
+- Context: Uniform mask/noise over a 4-token AR diffusion window treats near executable tokens and far planning tokens equally, which can let uncertain high-speed straight tokens affect closed-loop rollout.
+- Decision: Enable an AR diffusion training schedule with lower mask probability and higher loss weight for near chunks, and higher mask probability with lower loss weight for far chunks.
+- Why: This implements the discrete-token analogue of Diffusion Forcing without changing SMART tokenization: near tokens are trained as reliable actions while far tokens remain soft proposal context.
+- Impact: The first AR chunk receives the strongest supervision, later chunks are still learned but downweighted; full-horizon `smart_diffusion` remains unchanged unless causal schedule config is explicitly enabled.
+
 ## Decision: Use receding-horizon proposal carry for SMART AR diffusion
 - Date: 2026-05-28
 - Context: The previous 4-token prediction / 2-token commit rollout could commit two jointly sampled straight-vehicle tokens before refreshing map context and motion features, amplifying high-speed straight-token errors.

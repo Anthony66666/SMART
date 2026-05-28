@@ -85,6 +85,9 @@ Model:
     prediction_tokens: 4
     commit_tokens: 1
     carry_tail_proposal: true
+    causal_noise_schedule: true
+    causal_chunk_mask_probs: [0.20, 0.45, 0.70, 0.90]
+    causal_loss_weights: [1.0, 0.8, 0.4, 0.2]
     token_steps: 5
     total_rollout_steps: 80
     local_map_refresh: rescreen
