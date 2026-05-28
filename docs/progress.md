@@ -1,5 +1,12 @@
 # Progress
 
+## 2026-05-28 CST
+- Task: Added receding-horizon proposal carry for SMART AR diffusion.
+- Result: AR rollout can now predict a 4-token window, commit 1 token per round, and carry the uncommitted tail as proposal geometry/confidence for the next diffusion window; history token pose/heading rolling now supports `commit_tokens < history_tokens`. AR train/validation configs enable `commit_tokens: 1` with `carry_tail_proposal: true`.
+- Files: `smart/model/smart_ar_diffusion.py`, `smart/model/smart_diffusion.py`, `tests/test_smart_ar_diffusion.py`, `configs/train/train_scalable_ar_diffusion*.yaml`, `configs/validation/validation_scalable_ar_diffusion.yaml`
+- Validation: AR diffusion unit tests passed; diffusion prefix tests passed; SMART diffusion parity tests passed with the existing Waymo official dependency skip; `py_compile` and `git diff --check` passed.
+- Next: Run AR validation visualization and compare straight-vehicle token speed percentiles for `commit_tokens=1 + carry_tail_proposal` against the previous 2-token commit checkpoint/code path.
+
 ## 2026-05-22 CST
 - Task: Added SMART autoregressive discrete diffusion.
 - Result: New `smart_ar_diffusion` predictor reuses SMART discrete trajectory tokens and the existing diffusion decoder with 2-token history, 4-token prediction, 2-token commit, 8-round/80-step rollout, rolling-anchor short-window training, synthetic history-state perturbation, and per-round local map token rescreening. Dedicated train/validation configs and unit tests were added.

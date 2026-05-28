@@ -20,6 +20,9 @@ def _ar_shell():
     model.ar_commit_tokens = 2
     model.ar_token_steps = 5
     model.ar_total_rollout_steps = 80
+    model.diffusion_num_steps = 32
+    model.debug_validation_logging = False
+    model.inference_token = False
     model.ar_local_map_radius = 2.0
     model.max_map_tokens = 0
     model.model_config = SimpleNamespace(decoder=SimpleNamespace(token_size=2048))
@@ -191,6 +194,72 @@ class SMARTAutoregressiveDiffusionTest(unittest.TestCase):
         self.assertEqual(out['pred_traj'].shape, (1, 80, 2))
         self.assertTrue(out['pred_valid_mask'].all())
         self.assertTrue(torch.equal(out['next_token_idx'][0, :4], torch.tensor([0, 1, 10, 11])))
+
+
+    def test_receding_horizon_commit_one_carries_tail_as_next_proposal(self):
+        model = _ar_shell()
+        model.ar_commit_tokens = 1
+        model.ar_total_rollout_steps = 10
+        model.ar_carry_tail_proposal = True
+        data = _toy_sequence(num_agents=1, num_tokens=18, num_frames=91)
+        call_state = {'count': 0}
+        captured_proposals = []
+        test_case = self
+
+        model._prepare_batch = MethodType(lambda self, batch: batch, model)
+
+        def fake_build_inputs(self, rollout_view):
+            test_case.assertEqual(rollout_view["agent"]["token_pos"].shape[1], 6)
+            packed = {
+                'agent_maps': [(0, 0, torch.tensor([0]))],
+                'valid_mask': torch.ones(1, 4, dtype=torch.bool),
+                'token_positions': torch.zeros(1, 4, 2),
+                'token_headings': torch.zeros(1, 4),
+                'token_agent_ids': torch.zeros(1, 4, dtype=torch.long),
+                'chunk_ids': torch.arange(4).unsqueeze(0),
+                'agent_context': torch.zeros(1, 4, 1),
+                'agent_type_ids': torch.zeros(1, 4, dtype=torch.long),
+                'agent_shape_embeddings': torch.zeros(1, 4, 1),
+            }
+            summary = torch.zeros(1, 1)
+            ft = torch.zeros(1, 4, dtype=torch.long)
+            fv = torch.ones(1, 4, dtype=torch.bool)
+            generation = torch.tensor([True])
+            return packed, summary, ft, fv, generation, generation, torch.zeros(1, dtype=torch.long)
+
+        def fake_sample(self, **kwargs):
+            proposal_ids = kwargs.get('initial_proposal_token_ids')
+            proposal_confidence = kwargs.get('initial_proposal_confidence')
+            captured_proposals.append((
+                None if proposal_ids is None else proposal_ids.clone(),
+                None if proposal_confidence is None else proposal_confidence.clone(),
+            ))
+            base = call_state['count'] * 10
+            call_state['count'] += 1
+            return (
+                torch.tensor([[base, base + 1, base + 2, base + 3]]),
+                torch.tensor([[0.1, 0.2, 0.3, 0.4]]),
+            )
+
+        def fake_token_world(self, token_ids, _agent_types, positions, headings):
+            step = torch.arange(1, 6, dtype=positions.dtype, device=positions.device).view(1, 5, 1)
+            world = positions[:, None, :] + torch.cat([step, torch.zeros_like(step)], dim=-1)
+            return world, headings[:, None].expand(-1, 5)
+
+        model._build_diffusion_inputs = MethodType(fake_build_inputs, model)
+        model._diffusion_sample = MethodType(fake_sample, model)
+        model._token_chunk_world = MethodType(fake_token_world, model)
+
+        out = model.inference(data)
+
+        self.assertEqual(call_state['count'], 2)
+        self.assertIsNone(captured_proposals[0][0])
+        self.assertTrue(torch.equal(captured_proposals[1][0], torch.tensor([[1, 2, 3, 0]])))
+        self.assertTrue(torch.allclose(
+            captured_proposals[1][1],
+            torch.tensor([[0.2, 0.3, 0.4, 0.0]]),
+        ))
+        self.assertTrue(torch.equal(out['next_token_idx'][0], torch.tensor([0, 10])))
 
 
     def test_non_target_generation_agent_is_not_in_loss_mask(self):

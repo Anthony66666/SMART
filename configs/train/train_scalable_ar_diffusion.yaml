@@ -83,7 +83,8 @@ Model:
     future_chunk_steps: 5
     history_tokens: 2
     prediction_tokens: 4
-    commit_tokens: 2
+    commit_tokens: 1
+    carry_tail_proposal: true
     token_steps: 5
     total_rollout_steps: 80
     local_map_refresh: rescreen

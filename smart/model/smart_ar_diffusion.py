@@ -25,6 +25,7 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
         self.ar_token_steps = int(getattr(diffusion_cfg, 'token_steps', self.future_chunk_steps))
         self.ar_total_rollout_steps = int(getattr(diffusion_cfg, 'total_rollout_steps', self.num_future_steps))
         self.ar_local_map_refresh = str(getattr(diffusion_cfg, 'local_map_refresh', 'rescreen')).lower()
+        self.ar_carry_tail_proposal = bool(getattr(diffusion_cfg, 'carry_tail_proposal', False))
         self.ar_rolling_anchor_training = bool(getattr(diffusion_cfg, 'rolling_anchor_training', True))
         self.ar_state_perturb_prob = float(getattr(diffusion_cfg, 'state_perturb_prob', 0.5))
         self.ar_state_perturb_prob = min(max(self.ar_state_perturb_prob, 0.0), 1.0)
@@ -143,6 +144,36 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
     def _roll_history_token_valid(self, history_token_valid, committed_token_valid):
         combined = torch.cat([history_token_valid, committed_token_valid], dim=1)
         return combined[:, -self.ar_history_tokens:].clone()
+
+    def _roll_history_token_state(self, history_values, committed_values):
+        combined = torch.cat([history_values, committed_values], dim=1)
+        return combined[:, -self.ar_history_tokens:].clone()
+
+    def _pack_agent_window_values(self, agent_values, packed, fill_value=0):
+        B, L = packed['valid_mask'].shape
+        if agent_values.dtype == torch.bool:
+            result = torch.full((B, L), bool(fill_value), dtype=agent_values.dtype, device=agent_values.device)
+        else:
+            result = torch.full((B, L), fill_value, dtype=agent_values.dtype, device=agent_values.device)
+        for _scene_idx, seq_idx, agent_indices in packed['agent_maps']:
+            for local_idx, agent_idx in enumerate(agent_indices.tolist()):
+                start = local_idx * self.ar_prediction_tokens
+                end = start + self.ar_prediction_tokens
+                result[seq_idx, start:end] = agent_values[agent_idx]
+        return result
+
+    def _next_tail_proposal(self, per_agent_tokens, per_agent_confidence, future_valid, generation_agents):
+        tail_len = self.ar_prediction_tokens - self.ar_commit_tokens
+        if tail_len <= 0:
+            return None, None
+        proposal_ids = torch.zeros_like(per_agent_tokens)
+        proposal_confidence = torch.zeros_like(per_agent_confidence)
+        proposal_ids[:, :tail_len] = per_agent_tokens[:, self.ar_commit_tokens:]
+        proposal_confidence[:, :tail_len] = per_agent_confidence[:, self.ar_commit_tokens:]
+        tail_valid = future_valid[:, self.ar_commit_tokens:].bool() & generation_agents[:, None].bool()
+        proposal_confidence[:, :tail_len] = proposal_confidence[:, :tail_len].masked_fill(~tail_valid, 0.0)
+        proposal_ids[:, :tail_len] = proposal_ids[:, :tail_len].masked_fill(~tail_valid, 0)
+        return proposal_ids, proposal_confidence
 
     def _select_local_map_indices(self, map_positions, map_batch, scene_idx, agent_positions, map_visible=None):
         scene_mask = map_batch == int(scene_idx)
@@ -475,6 +506,8 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
             device=device,
         )
         pred_prob = torch.zeros_like(pred_token_ids, dtype=torch.float)
+        carried_proposal_ids = None
+        carried_proposal_confidence = None
 
         for round_idx in range(rounds):
             round_start = time.perf_counter()
@@ -502,6 +535,24 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
                 f"ar_inference_round_packed round={round_idx + 1}/{rounds} "
                 f"packed_tokens={packed_tokens} map_tokens={map_tokens}"
             )
+            initial_proposal_ids = None
+            initial_proposal_confidence = None
+            if (
+                getattr(self, 'ar_carry_tail_proposal', False)
+                and carried_proposal_ids is not None
+                and carried_proposal_confidence is not None
+            ):
+                initial_proposal_ids = self._pack_agent_window_values(
+                    carried_proposal_ids,
+                    packed,
+                    fill_value=0,
+                )
+                initial_proposal_confidence = self._pack_agent_window_values(
+                    carried_proposal_confidence,
+                    packed,
+                    fill_value=0.0,
+                )
+
             sample_start = time.perf_counter()
             sampled_ids, sampled_confidence = self._diffusion_sample(
                 summary=summary,
@@ -519,6 +570,8 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
                 map_batch=packed.get('map_batch'),
                 map_valid_mask=packed.get('map_valid_mask'),
                 packed=packed,
+                initial_proposal_token_ids=initial_proposal_ids,
+                initial_proposal_confidence=initial_proposal_confidence,
             )
             self._debug_log(
                 f"ar_inference_round_sample_done round={round_idx + 1}/{rounds} "
@@ -550,10 +603,18 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
             pred_token_ids[:, token_start:token_end] = committed_tokens
             pred_prob[:, token_start:token_end] = committed_confidence
 
+            if getattr(self, 'ar_carry_tail_proposal', False):
+                carried_proposal_ids, carried_proposal_confidence = self._next_tail_proposal(
+                    per_agent_tokens,
+                    per_agent_confidence,
+                    fv,
+                    generation_agents,
+                )
+
             history_token_ids = self._roll_history_token_ids(history_token_ids, committed_tokens)
             history_token_valid = self._roll_history_token_valid(history_token_valid, committed_valid)
-            history_token_pos = commit_token_pos[:, -self.ar_history_tokens:].clone()
-            history_token_heading = commit_token_heading[:, -self.ar_history_tokens:].clone()
+            history_token_pos = self._roll_history_token_state(history_token_pos, commit_token_pos)
+            history_token_heading = self._roll_history_token_state(history_token_heading, commit_token_heading)
             history_frame_pos = torch.cat([history_frame_pos, commit_traj], dim=1)[:, -self.num_historical_steps:]
             history_frame_heading = torch.cat([history_frame_heading, commit_head], dim=1)[:, -self.num_historical_steps:]
             history_frame_valid = torch.cat([history_frame_valid, commit_valid_frames], dim=1)[:, -self.num_historical_steps:]

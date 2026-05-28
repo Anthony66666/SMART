@@ -1,5 +1,12 @@
 # Decisions
 
+## Decision: Use receding-horizon proposal carry for SMART AR diffusion
+- Date: 2026-05-28
+- Context: The previous 4-token prediction / 2-token commit rollout could commit two jointly sampled straight-vehicle tokens before refreshing map context and motion features, amplifying high-speed straight-token errors.
+- Decision: Keep 4-token diffusion windows for short-horizon planning, but commit only the first token by default and carry the uncommitted tail as proposal geometry/confidence into the next window.
+- Why: This restores 0.5s physical closed-loop correction while preserving diffusion's multi-token planning signal as a soft, reversible proposal rather than hard state.
+- Impact: AR diffusion inference uses 16 rollout rounds for 80 future steps when `commit_tokens: 1`; validation is slower than 2-token commit but should be more stable for straight-vehicle speed.
+
 ## Decision: Add SMART autoregressive discrete diffusion as a separate predictor
 - Date: 2026-05-22
 - Context: Full-horizon joint diffusion can refresh proposal geometry internally, but it cannot re-query local map context after committed agent motion the way an autoregressive rollout can.

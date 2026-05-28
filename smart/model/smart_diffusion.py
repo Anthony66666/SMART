@@ -1141,7 +1141,9 @@ class SMARTDiffusion(SMART):
                           chunk_ids, valid_mask, agent_context, agent_type_ids,
                           map_context=None, map_positions=None, map_orientations=None,
                           map_batch=None, map_valid_mask=None, agent_shape_embeddings=None,
-                          packed=None, return_trace=False):
+                          packed=None, return_trace=False,
+                          initial_proposal_token_ids=None,
+                          initial_proposal_confidence=None):
         """Iteratively denoise masked future tokens with optional remasking.
 
         Returns: ([B, L] long sampled token IDs, [B, L] token confidence).
@@ -1155,6 +1157,14 @@ class SMARTDiffusion(SMART):
         confidence_out = summary.new_zeros((B, L))
         proposal_ids = torch.zeros((B, L), dtype=torch.long, device=device)
         proposal_confidence = summary.new_zeros((B, L))
+        if initial_proposal_token_ids is not None and initial_proposal_confidence is not None:
+            proposal_ids = initial_proposal_token_ids.to(device=device, dtype=torch.long).clone()
+            proposal_ids = proposal_ids.masked_fill(~valid_mask, 0)
+            proposal_confidence = initial_proposal_confidence.to(
+                device=device,
+                dtype=summary.dtype,
+            ).clone()
+            proposal_confidence = proposal_confidence.masked_fill(~valid_mask, 0.0)
         trace = []
 
         def decode_probs(t_value):
