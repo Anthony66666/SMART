@@ -200,3 +200,10 @@
 - Files: `smart/model/smart_diffusion.py`, `smart/model/smart_ar_diffusion.py`, `smart/callbacks/validation_visualization.py`, `smart/callbacks/step_visualization.py`, AR diffusion configs
 - Validation: `python3 -m py_compile smart/model/smart_diffusion.py smart/model/smart_ar_diffusion.py smart/callbacks/validation_visualization.py smart/callbacks/step_visualization.py` passed; `git diff --check` passed for edited files.
 - Next: Use the new `[SMARTDiffusion]`, `[ValidationVisualization]`, and `[StepVisualization]` logs on the server to separate validation window loss, full AR rollout, and visualization bottlenecks.
+
+## 2026-05-29 CST
+- Task: Fixed `--pretrain_ckpt` checkpoint initialization to avoid GPU0 CUDA context pollution under DDP.
+- Result: `train.py` and `val.py` now load pretrain checkpoints with `to_cpu=True`, so weights are mapped through CPU before Lightning/DDP places model replicas on their assigned devices. A regression test asserts both entry points keep CPU-mapped pretrain loading.
+- Files: `train.py`, `val.py`, `tests/test_pretrain_checkpoint_loading.py`
+- Validation: The new pretrain checkpoint loading test passed; `py_compile` passed for both entry points and the test.
+- Next: Use `--pretrain_ckpt` rather than `--ckpt_path` for new AR diffusion finetunes, and confirm server LR is nonzero plus GPU0 no longer accumulates per-rank checkpoint-loading contexts.

@@ -51,7 +51,8 @@ if __name__ == '__main__':
         logger = Logging().log(level='DEBUG')
         model = Predictor(config.Model)
         model.load_params_from_file(filename=args.pretrain_ckpt,
-                                    logger=logger)
+                                    logger=logger,
+                                    to_cpu=True)
     trainer_config = config.Trainer
     strategy = build_strategy(trainer_config)
     monitor_metric = getattr(trainer_config, 'monitor_metric', 'val_cls_acc')
