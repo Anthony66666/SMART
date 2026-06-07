@@ -107,6 +107,33 @@ class SMARTAutoregressiveDiffusionTest(unittest.TestCase):
         self.assertTrue(torch.equal(near_zero, torch.tensor([0])))
         self.assertTrue(torch.equal(near_ten, torch.tensor([1])))
 
+    def test_rescreen_map_context_keeps_full_scene_like_smart(self):
+        model = _ar_shell()
+        model.use_map_context = True
+        model.ar_local_map_refresh = 'rescreen'
+        data = HeteroData()
+        data['pt_token']['position'] = torch.tensor([[0.0, 0.0], [10.0, 0.0], [20.0, 0.0]])
+        data['pt_token']['orientation'] = torch.zeros(3)
+        data['pt_token']['num_nodes'] = 3
+        ctx = {
+            'x_pt': torch.arange(12, dtype=torch.float).view(3, 4),
+            'pt_visibility_mask': torch.ones(3, dtype=torch.bool),
+        }
+        packed = {'agent_maps': [(0, 0, torch.tensor([0]))]}
+
+        map_context, map_positions, map_orientations, map_batch, map_valid_mask = model._pack_map_context(
+            data,
+            ctx,
+            packed,
+            agent_positions=torch.tensor([[0.5, 0.0]]),
+        )
+
+        self.assertTrue(torch.equal(map_context, ctx['x_pt']))
+        self.assertTrue(torch.equal(map_positions, data['pt_token']['position'][:, :2].float()))
+        self.assertTrue(torch.equal(map_orientations, data['pt_token']['orientation'].float()))
+        self.assertTrue(torch.equal(map_batch, torch.zeros(3, dtype=torch.long)))
+        self.assertTrue(torch.equal(map_valid_mask, torch.ones(3, dtype=torch.bool)))
+
     def test_rollout_view_preserves_history_token_valid_mask(self):
         model = _ar_shell()
         data = _toy_sequence(num_agents=1, num_tokens=18, num_frames=91)

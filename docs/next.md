@@ -2,7 +2,7 @@
 
 ## In Flight
 
-- Run AR validation inference/visualization after finetuning with receding-horizon `commit_tokens=1`, `carry_tail_proposal=true`, `causal_noise_schedule: false`, and `visible_token_corruption_prob: 0.15`; compare straight-vehicle speeds against the no-corruption and fixed causal schedule runs.
+- Run AR validation inference/visualization after switching local_map_refresh=rescreen to SMART-style full-scene map candidates; compare late-horizon ADE/FDE, map violations, throughput, and straight-vehicle speeds against the previous local-prefilter run.
 - Inspect `next_token_idx` predicted-token speed versus `next_token_idx_gt` for current-valid straight vehicles, split by `category == 3`, non-target generation agents, commit/proposal mode, visible-token corruption on/off, and causal-disabled/multiplier/fixed schedule variants.
 - Continue comparing `smart_ar_diffusion` against full-horizon `smart_diffusion` on boundary exits, collisions, map violations, and official export zero-fallback checks.
 

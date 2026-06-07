@@ -219,14 +219,11 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
         kept_positions = []
         kept_orientations = []
         kept_batch = []
-        for seq_idx, (scene_idx, _packed_seq_idx, agent_indices) in enumerate(packed['agent_maps']):
-            candidates = self._select_local_map_indices(
-                map_positions=map_positions,
-                map_batch=map_batch,
-                scene_idx=scene_idx,
-                agent_positions=agent_positions[agent_indices],
-                map_visible=map_visible,
-            )
+        for seq_idx, (scene_idx, _packed_seq_idx, _agent_indices) in enumerate(packed['agent_maps']):
+            # Match SMART inference: keep the scene map feature set available,
+            # then let map-to-token radius edges rescreen by the current pose.
+            scene_mask = (map_batch == int(scene_idx)) & map_visible
+            candidates = torch.nonzero(scene_mask, as_tuple=False).squeeze(-1)
             if candidates.numel() == 0:
                 continue
             kept_context.append(map_features[candidates])

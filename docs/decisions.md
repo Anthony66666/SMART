@@ -1,5 +1,12 @@
 # Decisions
 
+## Decision: AR diffusion rescreening should keep full scene map candidates like SMART
+- Date: 2026-06-07
+- Context: Original SMART computes map features once, then rebuilds map-to-agent radius edges from the full scene map token set at each recurrent step. AR diffusion previously prefiltered map context by current agent pose before the decoder rebuilt map-to-token edges, so future/proposal positions could not connect to map tokens outside that local subset.
+- Decision: For smart_ar_diffusion with local_map_refresh=rescreen, pack all visible map tokens for each packed scene and rely on DiffusionDecoder._build_map2token_edges() to perform the current-geometry radius search.
+- Why: This matches original SMART's map access semantics while preserving diffusion's existing map-to-token graph and static one-time x_pt map feature encoding.
+- Impact: AR diffusion may use more map memory/compute per packed scene, but late-horizon rollout should no longer be limited by an early current-pose map prefilter. If resource use is too high, add an explicit resource fallback rather than changing the default SMART-parity behavior.
+
 ## Decision: Use visible-token neighbor corruption for AR diffusion training
 - Date: 2026-05-28
 - Context: SMART's official rolling tokenization noise trains the model to continue from slightly perturbed token states, while AR diffusion training still used clean visible future-token context after masking.

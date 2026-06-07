@@ -1,5 +1,19 @@
 # Progress
 
+## 2026-06-07 CST
+- Task: Aligned AR diffusion map context rescreening with original SMART map-edge semantics.
+- Result: smart_ar_diffusion now keeps all visible map tokens for each packed scene under local_map_refresh=rescreen, so DiffusionDecoder rebuilds map-to-token radius edges from the full scene map feature set instead of a current-pose local prefilter.
+- Files: smart/model/smart_ar_diffusion.py, tests/test_smart_ar_diffusion.py
+- Validation: python3 -m py_compile smart/model/smart_ar_diffusion.py tests/test_smart_ar_diffusion.py passed; git diff --check passed; in the smart conda environment, tests.test_smart_ar_diffusion passed 15 tests, tests.test_smart_diffusion_prefix passed 8 tests, and tests.test_smart_diffusion_smart_parity passed 12 tests with 1 Waymo-dependency skip.
+- Next: Run AR validation in the smart conda environment and compare late-horizon ADE/FDE, map violations, throughput, and map-token memory against the previous local-prefilter run.
+
+## 2026-06-07 CST
+- Task: Generated visual proof artifacts for SMART-style AR diffusion map rescreening.
+- Result: Four PNG diagnostics under outputs/ar_map_context_proof_20260607 compare old current-pose local prefiltering against the new full-scene map candidate behavior and show dynamic radius edges at current and future token poses.
+- Files: outputs/ar_map_context_proof_20260607/*.png, outputs/ar_map_context_proof_20260607/proof_metadata.json
+- Validation: PNG files were created successfully with valid image headers; proof_metadata.json records old_prefilter_candidates=[0], new_packed_candidates=[0,1,2,3], old_edges_future=[], and new_edges_future=[2].
+- Next: Use these diagnostics alongside validation visualizations when comparing late-horizon AR diffusion behavior.
+
 ## 2026-05-28 CST
 - Task: Added visible-token neighbor corruption for SMART AR diffusion training.
 - Result: Diffusion training can now replace unmasked visible future tokens with same-type top-k nearest SMART trajectory-token neighbors while preserving GT labels for loss. AR train configs enable `visible_token_corruption_prob: 0.15` and `visible_token_corruption_topk: 5`; validation sets corruption probability to `0.0`.
