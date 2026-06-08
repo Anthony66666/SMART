@@ -281,7 +281,7 @@ class SMARTAgentDecoder(nn.Module):
         mask_s = temporal_mask.transpose(0, 1).reshape(-1)
         edge_index_a2a, r_a2a = self.build_interaction_edge(pos_a, head_a, head_vector_a, batch_s, mask_s)
         map_mask = temporal_mask.clone()
-        map_mask[data['agent']['type'] == 3] = False
+        map_mask[agent_category != 3] = False
         edge_index_pl2a, r_pl2a = self.build_map2agent_edge(
             data,
             num_step,

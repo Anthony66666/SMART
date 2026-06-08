@@ -1,5 +1,31 @@
 # Progress
 
+## 2026-06-08 CST
+- Task: Aligned diffusion history-context map-to-agent mask with official SMART forward semantics.
+- Result: `SMARTAgentDecoder.encode_history_context()` now masks map-to-agent attention by `category == 3`, matching official `SMARTAgentDecoder.forward()` instead of using `type != 3`. Added a focused regression test that first failed under the old type-based mask and now passes.
+- Files: `smart/modules/agent_decoder.py`, `tests/test_agent_decoder_history_context.py`
+- Validation: `tests.test_agent_decoder_history_context` passed after failing on the old behavior; `tests.test_smart_diffusion_smart_parity` passed 12 tests with 1 Waymo-dependency skip; `py_compile` and `git diff --check` passed for touched files. `tests.test_smart_ar_diffusion` has one existing config-drift failure in `configs/validation/validation_scalable_ar_diffusion.yaml`, unrelated to this code change.
+
+- Task: Added raw/proposal/sampled query visualization for AR rollout input debugging.
+- Result: `scripts/visualize_ar_map_rollout.py` now draws raw packed query nodes, proposal-refreshed query nodes produced through `_refresh_token_geometry()` with carried tail proposals, and sampled query nodes after diffusion sampling. Metadata now records raw/proposal/sampled map-edge counts plus proposal and sampled geometry confidence per round. New query-debug PNGs were generated under `outputs/ar_map_rollout_query_debug_6c1658d_epoch00/`.
+- Files: `scripts/visualize_ar_map_rollout.py`, `tests/test_visualize_ar_map_rollout.py`, `outputs/ar_map_rollout_query_debug_6c1658d_epoch00/*.png`, `outputs/ar_map_rollout_query_debug_6c1658d_epoch00/metadata.json`
+- Validation: `tests.test_visualize_ar_map_rollout` first failed on missing `proposal_query_positions`, then passed 2 tests; `python3 -m py_compile scripts/visualize_ar_map_rollout.py tests/test_visualize_ar_map_rollout.py` passed; `git diff --check` passed for the script and test; the checkpoint visualization command wrote three valid 2880x2760 PNGs.
+- Next: Use the query-debug images to verify whether raw q overlap is expected while proposal q expands from round 2 onward; run with a config matching checkpoint training settings when diagnosing `prediction_tokens: 6` checkpoints.
+
+## 2026-06-08 CST
+- Task: Upgraded AR rollout map-token visualization to inspect true recurrent inputs.
+- Result: `scripts/visualize_ar_map_rollout.py` now records sampling-before input snapshots per round, including rolled selected history, rolled current generation-agent positions, packed full-scene map tokens, input query chunk positions, input map-to-token edges, sampled map-to-token edges, and carried proposal tokens. New input-debug PNGs were generated for three fixed validation scenes under `outputs/ar_map_rollout_input_debug_6c1658d_epoch00/`.
+- Files: `scripts/visualize_ar_map_rollout.py`, `tests/test_visualize_ar_map_rollout.py`, `outputs/ar_map_rollout_input_debug_6c1658d_epoch00/*.png`, `outputs/ar_map_rollout_input_debug_6c1658d_epoch00/metadata.json`
+- Validation: `tests.test_visualize_ar_map_rollout` passed after first failing on the missing snapshot helper; `python3 -m py_compile scripts/visualize_ar_map_rollout.py tests/test_visualize_ar_map_rollout.py` passed; the checkpoint visualization command wrote three valid 2880x2760 PNGs and metadata with input/sampled map-edge counts, input agent counts, and proposal tokens.
+- Next: Inspect the input-debug panels first; if q0/rolled selected current/rolled agents are correct and map input edges are nonempty, focus the next investigation on low-diversity token sampling and early-training underfit rather than missing AR map or agent inputs.
+
+## 2026-06-08 CST
+- Task: Generated AR rollout map-token diagnostics for checkpoint `/mnt/d/6c1658d_epoch=00.ckpt`.
+- Result: Three validation scenes were rolled out with `configs/validation/validation_scalable_ar_diffusion.yaml`; each output image shows one category-3 vehicle across 16 recurrent steps with current/nearby agents, packed full-scene map tokens, per-round connected map tokens, GT future, and committed prediction.
+- Files: `scripts/visualize_ar_map_rollout.py`, `outputs/ar_map_rollout_debug_6c1658d_epoch00/*.png`, `outputs/ar_map_rollout_debug_6c1658d_epoch00/metadata.json`
+- Validation: `python3 -m py_compile scripts/visualize_ar_map_rollout.py` passed; the script loaded the checkpoint on CUDA and wrote three valid 2880x2760 PNGs plus metadata with per-round token ids and map-edge counts.
+- Next: Inspect the generated images and metadata to decide whether the epoch-0 checkpoint failure mode is map-context coverage, repeated low-diversity token choices, or normal early-training underfit.
+
 ## 2026-06-07 CST
 - Task: Aligned AR diffusion map context rescreening with original SMART map-edge semantics.
 - Result: smart_ar_diffusion now keeps all visible map tokens for each packed scene under local_map_refresh=rescreen, so DiffusionDecoder rebuilds map-to-token radius edges from the full scene map feature set instead of a current-pose local prefilter.

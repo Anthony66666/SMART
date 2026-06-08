@@ -2,13 +2,15 @@
 
 ## In Flight
 
-- Run AR validation inference/visualization after switching local_map_refresh=rescreen to SMART-style full-scene map candidates; compare late-horizon ADE/FDE, map violations, throughput, and straight-vehicle speeds against the previous local-prefilter run.
+- Inspect `outputs/ar_map_rollout_query_debug_6c1658d_epoch00/` first for `/mnt/d/6c1658d_epoch=00.ckpt`; verify raw q overlap, proposal-refreshed q expansion, sampled q placement, rolled agents/history, and raw/proposal/sampled map-edge coverage before tuning self-conditioning/corruption schedules.
+- After the history-context map mask alignment, rerun AR diffusion validation/visualizations with the checkpoint-matched config and compare agent context/map-edge coverage for category-3 targets versus non-target generation agents.
 - Inspect `next_token_idx` predicted-token speed versus `next_token_idx_gt` for current-valid straight vehicles, split by `category == 3`, non-target generation agents, commit/proposal mode, visible-token corruption on/off, and causal-disabled/multiplier/fixed schedule variants.
 - Continue comparing `smart_ar_diffusion` against full-horizon `smart_diffusion` on boundary exits, collisions, map violations, and official export zero-fallback checks.
 
 ## Blockers
 
 - Waymo official evaluation dependencies are not installed in the current environment, so official export assertion tests still skip here.
+- `tests.test_smart_ar_diffusion` currently has an unrelated config-drift failure because local `configs/validation/validation_scalable_ar_diffusion.yaml` no longer matches the test expectation for causal multipliers/prediction tokens.
 
 ## Next Actions
 
