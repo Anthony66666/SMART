@@ -371,9 +371,18 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
                          on_step=False, on_epoch=True, batch_size=1)
                 self.log('val_interaction_consistency', self.interaction_consistency,
                          prog_bar=False, on_step=False, on_epoch=True, batch_size=1)
+                self._log_additional_rollout_metrics(
+                    data,
+                    pred_out,
+                    em,
+                    eval_valid,
+                )
         self._debug_log(
             f"val_step_done batch_idx={batch_idx} total_elapsed={time.perf_counter() - val_start:.2f}s"
         )
+
+    def _log_additional_rollout_metrics(self, data, pred_out, eval_mask, eval_valid):
+        del data, pred_out, eval_mask, eval_valid
 
     def _build_ar_rollout_view(
         self,

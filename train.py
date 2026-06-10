@@ -11,6 +11,7 @@ from smart.datamodules import MultiDataModule
 from smart.model import SMART
 from smart.model import SMARTDiffusion
 from smart.model import SMARTAutoregressiveDiffusion
+from smart.model import SMARTCausalDiffusion
 from smart.utils.log import Logging
 from smart.utils.torch_compat import register_checkpoint_safe_globals
 
@@ -34,6 +35,7 @@ if __name__ == '__main__':
         "smart": SMART,
         "smart_diffusion": SMARTDiffusion,
         "smart_ar_diffusion": SMARTAutoregressiveDiffusion,
+        "smart_causal_diffusion": SMARTCausalDiffusion,
     }
     parser.add_argument('--config', type=str, default='configs/train/train_scalable.yaml')
     parser.add_argument('--pretrain_ckpt', type=str, default="")

@@ -1,5 +1,32 @@
 # Progress
 
+## 2026-06-10 CST
+- Task: Ran a real local CUDA training smoke for `smart_causal_diffusion` on the 11 Waymo demo scenes under `data/valid_demo`.
+- Result: PyTorch Lightning completed one epoch with three optimizer steps and one full 80-frame validation rollout on an RTX 4090. Decoder parameters changed (`max delta 3.0e-6`), train/validation losses were finite, prediction coverage was 1.0, and all causal rollout metrics were emitted.
+- Validation: `global_step=3`, elapsed 49.36 seconds, `train_loss_epoch=20.0784`, `val_ar_window_loss=44.8941`, `val_rollout_score=60.6912`. The untrained model's trajectory metrics are intentionally poor and are not a quality estimate.
+- Performance: Full 16-round inference took about 9.2 seconds. Existing `ConflictRate` and `InteractionConsistency` metrics added about 12.0 and 21.6 seconds respectively; the new causal rollout metrics added about 1.5 seconds.
+- Next: The training path is operational for server upload. Recalibrate retokenization thresholds on the full training set, then start the from-scratch run.
+
+## 2026-06-10 CST
+- Task: Implemented the independent SMART causal absorbing diffusion redesign.
+- Result: Added `smart_causal_diffusion` with strictly causal temporal token edges, geometric prefix corruption, chunk-correct absorbing MDLM weights, final-four-step monotonic reveal, four-token/one-token receding-horizon rollout, and separate train/validation/official-eval registration.
+- Files: `smart/model/smart_causal_diffusion.py`, `smart/modules/causal_diffusion_decoder.py`, model and entrypoint registries, causal train/validation configs.
+- Validation: New causal/config tests pass; all three configs instantiate with four chunks and encoder/decoder LR ratio 0.5; real Waymo window training and full 16-round inference smokes produced finite outputs with full prediction coverage.
+
+- Task: Added closed-loop curriculum, retokenization recovery, and calibration.
+- Result: Epoch curriculum now progresses from clean anchors to correlated perturbations and 1-4-token model-rollout states. GT continuations are retokenized from the resulting anchor; threshold-invalid targets use differentiable expected-endpoint recovery. Added a CLI for per-type empirical threshold calibration.
+- Files: `smart/model/smart_causal_diffusion.py`, `scripts/calibrate_causal_retokenization.py`, `tests/test_smart_causal_diffusion.py`.
+- Validation: A real three-token rollout-state training smoke built a `(73,31,2)` view and finite loss. A 50-scene perturbed calibration, filtered to current-valid category-3 targets, produced P99 seeds `[0.65, 0.78, 0.62]`.
+
+- Task: Added soft safety-energy reranking and rollout metrics.
+- Result: Executable frontier candidates are top-k reranked by lane distance, lane heading, dynamics, and collision energies with `(1-t)^2` guidance. Validation logs 2/4/6/8-second ADE/FDE, final-four-second ADE, energy terms, coverage, retokenization-invalid rate, and `val_rollout_score`.
+- Files: `smart/modules/trajectory_energy.py`, `smart/model/smart_causal_diffusion.py`, `smart/model/smart_ar_diffusion.py`, `tests/test_trajectory_energy.py`.
+- Validation: Energy ordering tests pass; a full CPU Waymo inference completed 16 rounds in about 28.5 seconds with `pred_traj=(73,80,2)`, finite outputs, coverage 1.0, and aggregated safety energies.
+
+- Finding: The user-modified server AR config has `Model.total_steps: 32`, but the scheduler interprets this as optimizer steps and reduces LR to zero after roughly 32 steps.
+- Impact: This is a primary explanation for an epoch-1 checkpoint remaining underfit and collapsing late in rollout despite a large reported global step. New causal configs use real optimizer-step budgets; the existing AR config was not overwritten.
+- Regression: 55 targeted/new/existing tests ran with 52 passing, 1 Waymo-dependency skip, and the same 2 pre-existing AR-config drift failures (`causal_noise_schedule` and visible corruption expectations). The 34-test regression subset excluding those stale config assertions passed.
+
 ## 2026-06-08 CST
 - Task: Aligned diffusion history-context map-to-agent mask with official SMART forward semantics.
 - Result: `SMARTAgentDecoder.encode_history_context()` now masks map-to-agent attention by `category == 3`, matching official `SMARTAgentDecoder.forward()` instead of using `type != 3`. Added a focused regression test that first failed under the old type-based mask and now passes.

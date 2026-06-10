@@ -7,6 +7,7 @@ from smart.datasets.scalable_dataset import MultiDataset
 from smart.model import SMART
 from smart.model import SMARTDiffusion
 from smart.model import SMARTAutoregressiveDiffusion
+from smart.model import SMARTCausalDiffusion
 from smart.transforms import WaymoTargetBuilder
 from smart.utils.config import load_config_act
 from smart.utils.log import Logging
@@ -39,6 +40,7 @@ if __name__ == '__main__':
         "smart": SMART,
         "smart_diffusion": SMARTDiffusion,
         "smart_ar_diffusion": SMARTAutoregressiveDiffusion,
+        "smart_causal_diffusion": SMARTCausalDiffusion,
     }
 
     data_config = config.Dataset

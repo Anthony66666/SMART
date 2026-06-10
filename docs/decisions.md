@@ -1,5 +1,33 @@
 # Decisions
 
+## Decision: Add a mathematically causal closed-loop diffusion predictor
+- Date: 2026-06-10
+- Context: Existing AR diffusion trains mostly on clean short windows but performs 16 recurrent commits at inference. Its non-causal future-token attention, proposal carry, remasking, and lack of explicit road/dynamics scoring allow early token errors to compound into late-horizon map exits.
+- Decision: Add `smart_causal_diffusion` as an independent predictor with four-token windows, one-token commits, strictly causal temporal edges, geometric absorbing-prefix corruption, chunk-correct MDLM weights, and monotonic release during the final four low-noise sampling steps.
+- Why: The executable token must not depend on uncertain future chunks or be locked at high noise. The training corruption marginal and loss weighting must describe the same stochastic process used by the model.
+- Impact: Existing SMART and diffusion predictors remain unchanged. New train/validation configs and registry entries select the causal path explicitly.
+
+## Decision: Train causal diffusion on predicted states with retokenized recovery targets
+- Date: 2026-06-10
+- Context: Clean teacher-forced token labels become geometrically inconsistent after a predicted or perturbed state drifts from the ground-truth anchor.
+- Decision: Use a 32-epoch clean/perturb/model-rollout curriculum. Commit one to four model tokens to form rollout states, transform the GT continuation into that state frame, and rematch the SMART codebook. Targets above per-type P99 error thresholds leave discrete CE and use differentiable expected-endpoint recovery instead.
+- Why: This aligns labels with the actual closed-loop state distribution without assigning impossible discrete targets.
+- Impact: `scripts/calibrate_causal_retokenization.py` computes per-type thresholds. Initial local 50-scene perturbed P99 seeds are `[0.65, 0.78, 0.62]` for vehicle/pedestrian/cyclist and must be recalibrated on the server training set.
+
+## Decision: Use late top-k safety-energy reranking without hard projection
+- Date: 2026-06-10
+- Context: Map attention alone does not guarantee that a high-probability token stays lane-aligned, dynamically feasible, or collision-free.
+- Decision: Rerank the decoder's top-k executable-token candidates with lane-distance, lane-heading, acceleration/yaw-rate, and collision energies. Scale guidance by `(1-t)^2`; do not hard-project trajectories or impose traffic-light hard rules.
+- Why: Soft reranking preserves the SMART token manifold and model diversity while making the irreversible low-noise commit explicitly safety-aware.
+- Impact: Validation logs horizon metrics, late ADE, energy terms, coverage, retokenization-invalid rate, and a safety-led `val_rollout_score`.
+
+## Decision: `Model.total_steps` is an optimizer-step budget
+- Date: 2026-06-10
+- Context: `SMART.configure_optimizers()` applies cosine decay using `Model.total_steps`. The current server AR config sets it to `32`, apparently treating it as epochs, so LR reaches zero after roughly 32 optimizer steps.
+- Decision: New causal configs use `total_steps: 120000` on the server and `10000` locally, with warmup and an encoder LR scale of 0.5.
+- Why: Training for many global steps with zero LR can look operational while leaving the model effectively at its initialization-stage quality.
+- Impact: Existing user-modified AR configs are not changed, but future runs must set `total_steps` from expected optimizer steps rather than epoch count.
+
 ## Decision: AR diffusion rescreening should keep full scene map candidates like SMART
 - Date: 2026-06-07
 - Context: Original SMART computes map features once, then rebuilds map-to-agent radius edges from the full scene map token set at each recurrent step. AR diffusion previously prefiltered map context by current agent pose before the decoder rebuilt map-to-token edges, so future/proposal positions could not connect to map tokens outside that local subset.

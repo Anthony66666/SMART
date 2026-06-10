@@ -18,6 +18,7 @@ from tqdm import tqdm
 from smart.datasets.scalable_dataset import MultiDataset
 from smart.model import SMART
 from smart.model import SMARTAutoregressiveDiffusion
+from smart.model import SMARTCausalDiffusion
 from smart.model import SMARTDiffusion
 from smart.model import SMARTJEPA
 from smart.transforms import WaymoTargetBuilder
@@ -57,6 +58,7 @@ PREDICTOR_HASH = {
     "smart": SMART,
     "smart_diffusion": SMARTDiffusion,
     "smart_ar_diffusion": SMARTAutoregressiveDiffusion,
+    "smart_causal_diffusion": SMARTCausalDiffusion,
     "smart_jepa": SMARTJEPA,
 }
 
