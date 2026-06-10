@@ -481,6 +481,232 @@ python train.py --config configs/train/train_scalable_jepa.yaml --save_ckpt_path
 python val.py --config configs/validation/validation_scalable_jepa.yaml --pretrain_ckpt <jepa_ckpt>
 ```
 
+## Causal Diffusion Server Training
+
+下面是 `smart_causal_diffusion` 的服务器训练流程。该模型应当从头训练，不要加载旧的
+`smart_ar_diffusion` checkpoint。
+
+### 1. Update the repository
+
+```bash
+cd /path/to/SMART
+git checkout codex/smart-discrete-diffusion-noblock
+git pull --ff-only origin codex/smart-discrete-diffusion-noblock
+git log --oneline -5
+```
+
+确认提交历史中包含：
+
+```text
+64aa4ed Add causal closed-loop SMART diffusion
+```
+
+### 2. Activate and verify the environment
+
+```bash
+source ~/anaconda3/etc/profile.d/conda.sh
+conda activate smart
+
+python -c "import torch; print(torch.__version__); print(torch.cuda.device_count())"
+python -c "from smart.model import SMARTCausalDiffusion; print('import ok')"
+nvidia-smi
+```
+
+检查 SMART trajectory token 文件：
+
+```bash
+ls -lh \
+  smart/tokens/cluster_frame_5_2048.pkl \
+  smart/tokens/map_traj_token5.pkl
+```
+
+### 3. Configure the training run
+
+编辑：
+
+```bash
+vim configs/train/train_scalable_causal_diffusion.yaml
+```
+
+至少确认以下字段：
+
+```yaml
+Dataset:
+  train_raw_dir: ["/path/to/waymo/training"]
+  val_raw_dir: ["/path/to/waymo/validation"]
+  train_batch_size: 4
+  val_batch_size: 1
+  num_workers: 4
+
+Trainer:
+  devices: 4
+  max_epochs: 32
+
+Model:
+  warmup_steps: 2
+  total_steps: 32
+```
+
+当前 `LambdaLR` 由 PyTorch Lightning 按 epoch 更新，因此这里的
+`warmup_steps` 和 `total_steps` 都表示 epoch。不要使用旧的
+`warmup_steps: 2000` 和 `total_steps: 120000`，否则学习率会长期过低。
+
+GPU 数量可以调整，但 `Trainer.devices` 必须与 `CUDA_VISIBLE_DEVICES`
+暴露的 GPU 数量一致。
+
+### 4. Configure standalone validation
+
+编辑：
+
+```bash
+vim configs/validation/validation_scalable_causal_diffusion.yaml
+```
+
+至少修改：
+
+```yaml
+Dataset:
+  val_raw_dir: ["/path/to/waymo/validation"]
+
+Trainer:
+  devices: 1
+
+Model:
+  warmup_steps: 2
+  total_steps: 32
+```
+
+训练和验证配置中的 `retokenization_error_thresholds` 必须保持一致。
+
+### 5. Check the dataset
+
+```bash
+find /path/to/waymo/training -maxdepth 1 -type f | head
+find /path/to/waymo/validation -maxdepth 1 -type f | head
+
+find /path/to/waymo/training -maxdepth 1 -type f | wc -l
+find /path/to/waymo/validation -maxdepth 1 -type f | wc -l
+```
+
+### 6. Run focused tests
+
+```bash
+python -m unittest \
+  tests.test_smart_causal_diffusion \
+  tests.test_trajectory_energy -v
+```
+
+### 7. Calibrate retokenization thresholds
+
+正式训练前，应当使用完整服务器训练集重新估计 vehicle、pedestrian 和
+cyclist 的 P99 retokenization error：
+
+```bash
+mkdir -p outputs/calibration
+
+python scripts/calibrate_causal_retokenization.py \
+  --config configs/train/train_scalable_causal_diffusion.yaml \
+  --split train \
+  --max_samples 10000 \
+  --quantile 0.99 \
+  --with_perturbation \
+  --output_json outputs/calibration/causal_retokenization_p99.json
+```
+
+检查结果：
+
+```bash
+cat outputs/calibration/causal_retokenization_p99.json
+```
+
+将 JSON 中的 `config_order` 按原顺序填写到训练和验证配置：
+
+```yaml
+retokenization_error_thresholds: [vehicle_p99, pedestrian_p99, cyclist_p99]
+```
+
+如果某一类的 `counts` 为 `0` 或阈值为 `null`，不要启动正式训练。应先扩大
+`--max_samples` 或检查数据中的 agent type/category 分布。
+
+### 8. Start training from scratch
+
+以下示例使用 4 张 GPU：
+
+```bash
+mkdir -p checkpoints/causal_diffusion logs
+
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+nohup python -u train.py \
+  --config configs/train/train_scalable_causal_diffusion.yaml \
+  --save_ckpt_path checkpoints/causal_diffusion \
+  > logs/causal_diffusion.log 2>&1 &
+
+echo $!
+```
+
+不要给该命令添加旧 AR checkpoint 的 `--pretrain_ckpt`。第一次正式实验应当
+从头训练，以免旧模型的非因果状态和错误训练预算影响结果。
+
+### 9. Monitor training
+
+```bash
+tail -f logs/causal_diffusion.log
+```
+
+```bash
+watch -n 2 nvidia-smi
+```
+
+```bash
+tensorboard --logdir lightning_logs --port 6006
+```
+
+重点检查：
+
+- 学习率是否按 epoch warmup 和衰减
+- `train_loss` / diffusion loss 是否为有限值
+- `train_retokenization_invalid_rate`
+- `val_rollout_score`
+- `val_minADE` 和 `val_minFDE`
+- 2/4/6/8-second ADE/FDE 和 late ADE
+- lane、dynamics 和 collision energy
+- prediction coverage
+- validation 和 step visualization 中是否仍有后段出地图现象
+
+checkpoint 选择优先使用最低的 `val_rollout_score`，不要只根据训练 loss
+或短窗口 diffusion loss 判断模型质量。
+
+### 10. Resume an interrupted run
+
+先找到需要恢复的 checkpoint：
+
+```bash
+find checkpoints/causal_diffusion -maxdepth 1 -name '*.ckpt' -print
+```
+
+然后使用 `--ckpt_path` 恢复 optimizer、scheduler、epoch 和 global step：
+
+```bash
+python -u train.py \
+  --config configs/train/train_scalable_causal_diffusion.yaml \
+  --save_ckpt_path checkpoints/causal_diffusion \
+  --ckpt_path checkpoints/causal_diffusion/epoch=XX.ckpt
+```
+
+恢复训练不要使用 `--pretrain_ckpt`，因为它只加载模型参数，不恢复 optimizer
+和训练进度。
+
+### 11. Validate a checkpoint
+
+```bash
+python val.py \
+  --config configs/validation/validation_scalable_causal_diffusion.yaml \
+  --pretrain_ckpt checkpoints/causal_diffusion/epoch=XX.ckpt
+```
+
+训练配置默认只验证有限批次以控制开销。最终比较 checkpoint 时，应使用独立
+validation 配置运行完整验证，并比较 late-horizon、地图约束和碰撞相关指标。
+
 ## Citation
 
 如果你使用原始 SMART，请引用原论文：

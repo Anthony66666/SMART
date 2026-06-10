@@ -18,6 +18,7 @@
 
 ## Next Actions
 
+- Follow the `README.md` causal diffusion server checklist; because LR scheduling is intentionally epoch-based, set `Model.warmup_steps: 2` and `Model.total_steps: 32` for the 32-epoch run.
 - Use `python scripts/calibrate_causal_retokenization.py --config configs/train/train_scalable_causal_diffusion.yaml --split train --max_samples <budget> --quantile 0.99 --with_perturbation --output_json <path>` before the first server run.
 - Start causal training with `configs/train/train_scalable_causal_diffusion.yaml`; checkpoint selection uses `val_rollout_score`, while `val_minADE`/`val_minFDE` remain baseline-comparison metrics.
 - For AR diffusion finetunes initialized from older checkpoints, prefer `--pretrain_ckpt` over `--ckpt_path`; confirm LR is nonzero and GPU0 does not retain per-rank checkpoint-loading contexts after startup.

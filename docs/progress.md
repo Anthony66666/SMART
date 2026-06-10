@@ -1,6 +1,11 @@
 # Progress
 
 ## 2026-06-10 CST
+- Task: Added a server-side `smart_causal_diffusion` runbook to `README.md`.
+- Result: Documented branch/environment checks, epoch-based LR configuration, dataset validation, retokenization calibration, from-scratch DDP launch, monitoring, checkpoint resume, and standalone validation commands.
+- Next: Apply server-specific data paths and GPU counts, calibrate full-dataset P99 thresholds, then launch the first clean causal run.
+
+## 2026-06-10 CST
 - Task: Ran a real local CUDA training smoke for `smart_causal_diffusion` on the 11 Waymo demo scenes under `data/valid_demo`.
 - Result: PyTorch Lightning completed one epoch with three optimizer steps and one full 80-frame validation rollout on an RTX 4090. Decoder parameters changed (`max delta 3.0e-6`), train/validation losses were finite, prediction coverage was 1.0, and all causal rollout metrics were emitted.
 - Validation: `global_step=3`, elapsed 49.36 seconds, `train_loss_epoch=20.0784`, `val_ar_window_loss=44.8941`, `val_rollout_score=60.6912`. The untrained model's trajectory metrics are intentionally poor and are not a quality estimate.
