@@ -7,6 +7,7 @@ from torch_geometric.data import HeteroData
 
 from smart.model.smart_causal_diffusion import SMARTCausalDiffusion
 from smart.modules.causal_diffusion_decoder import CausalDiffusionDecoder
+from smart.modules.trajectory_energy import TrajectoryEnergy
 from scripts.calibrate_causal_retokenization import compute_type_thresholds
 from smart.utils.config import load_config_act
 
@@ -48,50 +49,76 @@ class CausalDiffusionDecoderTest(unittest.TestCase):
         self.assertGreater(edge_index.shape[1], 0)
         self.assertTrue(torch.all(source_chunks < target_chunks))
 
+    def test_proposal_embedding_changes_masked_token_logits(self):
+        torch.manual_seed(0)
+        decoder = CausalDiffusionDecoder(
+            hidden_dim=16,
+            token_size=32,
+            num_future_chunks=4,
+            num_heads=2,
+            head_dim=8,
+            dropout=0.0,
+            num_freq_bands=4,
+            a2a_radius=20.0,
+            pl2a_radius=20.0,
+            time_span=None,
+            future_chunk_steps=5,
+            num_layers=1,
+            num_token_types=4,
+        )
+        common = {
+            'noisy_token_ids': torch.tensor([[32]]),
+            'token_positions': torch.zeros(1, 1, 2),
+            'token_headings': torch.zeros(1, 1),
+            'token_agent_ids': torch.zeros(1, 1, dtype=torch.long),
+            'noisy_token_chunk_ids': torch.zeros(1, 1, dtype=torch.long),
+            'scene_summary': torch.zeros(1, 16),
+            't': torch.ones(1),
+            'valid_mask': torch.ones(1, 1, dtype=torch.bool),
+            'agent_context': torch.zeros(1, 1, 16),
+            'agent_type_ids': torch.zeros(1, 1, dtype=torch.long),
+            'agent_shape_embeddings': torch.zeros(1, 1, 16),
+            'physical_token_embeddings': torch.zeros(1, 1, 16),
+        }
 
-class CausalAbsorbingProcessTest(unittest.TestCase):
-    def test_training_mask_is_a_single_absorbing_suffix_per_agent(self):
-        model = _causal_shell()
-        valid_mask = torch.tensor([[True, True, True, True, True, True, False]])
-        token_agent_ids = torch.tensor([[10, 10, 10, 10, 11, 11, -1]])
-        chunk_ids = torch.tensor([[0, 1, 2, 3, 0, 1, 0]])
-        random_values = torch.tensor([[0.1, 0.2, 0.9, 0.1, 0.8, 0.1, 0.0]])
-
-        mask = model._sample_absorbing_prefix_mask(
-            valid_mask=valid_mask,
-            survival_prob=torch.tensor([0.5]),
-            token_agent_ids=token_agent_ids,
-            chunk_ids=chunk_ids,
-            random_values=random_values,
+        without_proposal = decoder(**common)
+        with_proposal = decoder(
+            **common,
+            proposal_token_embeddings=torch.ones(1, 1, 16),
+            proposal_confidence=torch.ones(1, 1),
         )
 
-        self.assertTrue(torch.equal(
-            mask,
-            torch.tensor([[False, False, True, True, True, True, False]]),
-        ))
+        self.assertFalse(torch.allclose(without_proposal, with_proposal))
 
-    def test_reveal_schedule_is_monotonic_and_finishes_all_chunks(self):
+
+class CausalFrontierPlannerTest(unittest.TestCase):
+    def test_reveal_schedule_releases_one_chunk_per_sampling_step(self):
         model = _causal_shell()
 
         counts = [
-            model._causal_reveal_count(step, num_steps=16, num_chunks=4)
-            for step in range(16)
+            model._causal_reveal_count(step, num_steps=4, num_chunks=4)
+            for step in range(4)
         ]
 
-        self.assertEqual(counts[-1], 4)
-        self.assertTrue(all(left <= right for left, right in zip(counts, counts[1:])))
-        self.assertEqual(counts[11], 0)
-        self.assertEqual(counts[12], 1)
-        self.assertEqual(counts[14], 3)
+        self.assertEqual(counts, [1, 2, 3, 4])
+
+    def test_reveal_schedule_rejects_idle_sampling_steps(self):
+        model = _causal_shell()
+
+        with self.assertRaisesRegex(ValueError, "must equal"):
+            model._causal_reveal_count(0, num_steps=16, num_chunks=4)
 
     def test_sampling_reveals_frontiers_without_remasking(self):
         model = _causal_shell()
-        model.diffusion_num_steps = 8
+        model.diffusion_num_steps = 4
         model.min_t = 1e-3
         model.remask_confidence_temperature = 1.0
+        model.safety_energy_enabled = False
         model.diffusion_decoder = SimpleNamespace(mask_token_id=8)
+        decode_times = []
 
         def fake_decode(self, noisy, packed, summary, t, geometry_known_mask, **_kwargs):
+            decode_times.append(float(t[0]))
             logits = torch.full((*noisy.shape, 8), -20.0, device=noisy.device)
             target_ids = packed['chunk_ids'] + 1
             logits.scatter_(-1, target_ids.unsqueeze(-1), 20.0)
@@ -123,30 +150,87 @@ class CausalAbsorbingProcessTest(unittest.TestCase):
         self.assertTrue(all(left >= right for left, right in zip(masked_counts, masked_counts[1:])))
         self.assertEqual(masked_counts[-1], 0)
         self.assertTrue(all(entry['remasked'] == 0 for entry in trace))
+        self.assertEqual(decode_times, [1.0, 0.75, 0.5, 0.25])
 
-    def test_frontier_weight_is_added_to_suffix_nll(self):
+    def test_sampling_uses_carried_tail_as_revisable_conditioning(self):
+        model = _causal_shell()
+        model.diffusion_num_steps = 4
+        model.min_t = 1e-3
+        model.remask_confidence_temperature = 1.0
+        model.safety_energy_enabled = False
+        model.diffusion_decoder = SimpleNamespace(mask_token_id=8)
+        proposal_ids = torch.tensor([[4, 5, 6, 0]])
+        proposal_confidence = torch.tensor([[0.9, 0.8, 0.7, 0.0]])
+        decode_proposals = []
+
+        def fake_decode(
+            self,
+            noisy,
+            packed,
+            summary,
+            t,
+            geometry_known_mask,
+            proposal_token_ids=None,
+            proposal_confidence=None,
+        ):
+            decode_proposals.append((
+                proposal_token_ids.clone(),
+                proposal_confidence.clone(),
+                noisy.clone(),
+            ))
+            logits = torch.full((*noisy.shape, 8), -20.0)
+            logits[..., 1] = 20.0
+            return logits
+
+        model._decode_diffusion_logits = MethodType(fake_decode, model)
+        valid_mask = torch.ones(1, 4, dtype=torch.bool)
+        packed = {
+            'chunk_ids': torch.tensor([[0, 1, 2, 3]]),
+            'token_agent_ids': torch.zeros(1, 4, dtype=torch.long),
+        }
+
+        sampled, _confidence = model._diffusion_sample(
+            summary=torch.zeros(1, 4),
+            token_positions=torch.zeros(1, 4, 2),
+            token_headings=torch.zeros(1, 4),
+            token_agent_ids=packed['token_agent_ids'],
+            chunk_ids=packed['chunk_ids'],
+            valid_mask=valid_mask,
+            agent_context=torch.zeros(1, 4, 4),
+            agent_type_ids=torch.zeros(1, 4, dtype=torch.long),
+            packed=packed,
+            initial_proposal_token_ids=proposal_ids,
+            initial_proposal_confidence=proposal_confidence,
+        )
+
+        self.assertEqual(len(decode_proposals), 4)
+        for seen_ids, seen_confidence, _noisy in decode_proposals:
+            self.assertTrue(torch.equal(seen_ids, proposal_ids))
+            self.assertTrue(torch.equal(seen_confidence, proposal_confidence))
+        self.assertTrue(torch.equal(sampled, torch.ones_like(sampled)))
+        self.assertEqual(int(decode_proposals[0][2][0, 0]), model.mask_token_id)
+
+    def test_discrete_frontier_loss_supervises_only_selected_frontier(self):
         model = _causal_shell()
         model.training = False
-        model.causal_frontier_loss_weight = 2.0
+        model.causal_frontier_loss_weight = 1.0
+        model.continuous_recovery_loss_weight = 0.0
         model.diffusion_decoder = SimpleNamespace(mask_token_id=2)
-        model._sample_diffusion_timesteps = MethodType(
-            lambda self, batch_size, device: torch.full((batch_size,), 0.5, device=device),
-            model,
-        )
-        model.noise_schedule = lambda t: (
-            torch.full_like(t, torch.log(torch.tensor(2.0))),
-            torch.full_like(t, 0.5),
-            torch.ones_like(t),
-        )
-        model._sample_absorbing_prefix_mask = MethodType(
-            lambda self, **_kwargs: torch.tensor([[False, True, True, True]]),
-            model,
-        )
-        model._decode_diffusion_logits = MethodType(
-            lambda self, noisy, packed, summary, t, geometry_known_mask: torch.zeros(
-                *noisy.shape,
-                2,
+        model._sample_frontier_ids = MethodType(
+            lambda self, loss_mask_base, chunk_ids: torch.tensor(
+                [2],
+                device=chunk_ids.device,
             ),
+            model,
+        )
+        seen_noisy = []
+
+        def fake_decode(self, noisy, packed, summary, t, geometry_known_mask, **_kwargs):
+            seen_noisy.append(noisy.clone())
+            return torch.zeros(*noisy.shape, 2)
+
+        model._decode_diffusion_logits = MethodType(
+            fake_decode,
             model,
         )
         packed = {
@@ -159,53 +243,122 @@ class CausalAbsorbingProcessTest(unittest.TestCase):
 
         loss, _acc = model._compute_diffusion_loss(packed, torch.zeros(1, 4))
 
-        self.assertAlmostEqual(
-            float(loss),
-            (
-                3.0 * (2.0 / 3.0)
-                + (3.0 / 7.0)
-                + (4.0 / 15.0)
-            ) * float(torch.log(torch.tensor(2.0))) / 4.0,
-            places=5,
-        )
-
-    def test_chunk_weight_matches_absorbing_prefix_marginal(self):
-        model = _causal_shell()
-        sigma = torch.tensor([torch.log(torch.tensor(2.0))])
-        dsigma = torch.ones(1)
-        chunk_ids = torch.tensor([[0, 1, 2, 3]])
-
-        weights = model._causal_diffusion_weight(
-            sigma,
-            dsigma,
-            chunk_ids,
-        )
-
-        self.assertTrue(torch.allclose(
-            weights,
-            torch.tensor([[1.0, 2.0 / 3.0, 3.0 / 7.0, 4.0 / 15.0]]),
-            atol=1e-6,
+        self.assertAlmostEqual(float(loss), float(torch.log(torch.tensor(2.0))), places=5)
+        self.assertTrue(torch.equal(
+            seen_noisy[0],
+            torch.tensor([[0, 0, 2, 2]]),
         ))
 
-    def test_late_energy_guidance_can_override_unsafe_top_probability(self):
+    def test_all_mask_chunk_zero_remains_an_interaction_source(self):
+        model = _causal_shell()
+        model.geometry_confidence_source_threshold = 0.2
+        model.use_proposal_geometry = True
+        model.proposal_conditioning_enabled = True
+        model.causal_current_state_edges = True
+        captured = {}
+
+        model._refresh_token_geometry = MethodType(
+            lambda self, token_ids, packed, **_kwargs: (
+                packed['token_positions'],
+                packed['token_headings'],
+                torch.zeros_like(token_ids, dtype=torch.float),
+            ),
+            model,
+        )
+        model._physical_token_embeddings = MethodType(
+            lambda self, token_ids, agent_type_ids: torch.zeros(
+                *token_ids.shape,
+                4,
+            ),
+            model,
+        )
+
+        def fake_decoder(**kwargs):
+            captured.update(kwargs)
+            return torch.zeros(1, 4, 8)
+
+        model.diffusion_decoder = fake_decoder
+        packed = {
+            'valid_mask': torch.ones(1, 4, dtype=torch.bool),
+            'chunk_ids': torch.tensor([[0, 1, 2, 3]]),
+            'token_positions': torch.zeros(1, 4, 2),
+            'token_headings': torch.zeros(1, 4),
+            'token_agent_ids': torch.zeros(1, 4, dtype=torch.long),
+            'agent_context': torch.zeros(1, 4, 4),
+            'agent_type_ids': torch.zeros(1, 4, dtype=torch.long),
+            'agent_shape_embeddings': torch.zeros(1, 4, 4),
+        }
+
+        model._decode_diffusion_logits(
+            noisy=torch.full((1, 4), 8, dtype=torch.long),
+            packed=packed,
+            summary=torch.zeros(1, 4),
+            t=torch.ones(1),
+            geometry_known_mask=torch.zeros(1, 4, dtype=torch.bool),
+        )
+
+        expected = torch.tensor([[True, False, False, False]])
+        self.assertTrue(torch.equal(captured['spatial_source_mask'], expected))
+        self.assertTrue(torch.equal(captured['temporal_source_mask'], expected))
+
+    def test_commit_energy_guidance_is_active_at_the_first_sampling_step(self):
         model = _causal_shell()
         model.safety_energy_weight = 2.0
+        model.commit_safety_weight = 2.0
         log_probabilities = torch.log(torch.tensor([[0.6, 0.4]]))
         energies = torch.tensor([[3.0, 0.0]])
 
-        early = model._select_topk_by_energy(
+        commit = model._select_topk_by_energy(
             log_probabilities,
             energies,
             t_value=1.0,
+            frontier_chunk_ids=torch.tensor([0]),
         )
-        late = model._select_topk_by_energy(
+        future = model._select_topk_by_energy(
             log_probabilities,
             energies,
-            t_value=0.0,
+            t_value=1.0,
+            frontier_chunk_ids=torch.tensor([1]),
         )
 
-        self.assertEqual(int(early[0]), 0)
-        self.assertEqual(int(late[0]), 1)
+        self.assertEqual(int(commit[0]), 1)
+        self.assertEqual(int(future[0]), 0)
+
+    def test_recency_pooling_preserves_latest_motion_state(self):
+        model = _causal_shell()
+        model.history_recency_decay = 0.5
+        history = torch.tensor([[[1.0], [3.0]]])
+        valid = torch.tensor([[True, True]])
+
+        pooled = model._pool_agent_context(history, valid)
+
+        self.assertAlmostEqual(float(pooled[0, 0]), 7.0 / 3.0, places=5)
+
+    def test_dynamics_energy_penalizes_observed_to_candidate_velocity_jump(self):
+        energy = TrajectoryEnergy(
+            dt=0.1,
+            max_acceleration=6.0,
+            max_yaw_rate=1.2,
+        )
+        candidate_positions = torch.tensor([[
+            [[1.0, 0.0], [2.0, 0.0], [3.0, 0.0]],
+        ]])
+        candidate_headings = torch.zeros(1, 1, 3)
+
+        without_observation = energy.dynamics_energy(
+            candidate_positions,
+            candidate_headings,
+        )
+        with_observation = energy.dynamics_energy(
+            candidate_positions,
+            candidate_headings,
+            current_positions=torch.zeros(1, 2),
+            current_velocities=torch.zeros(1, 2),
+            current_headings=torch.zeros(1),
+        )
+
+        self.assertAlmostEqual(float(without_observation), 0.0, places=5)
+        self.assertGreater(float(with_observation), 1000.0)
 
 
 class ClosedLoopCurriculumTest(unittest.TestCase):
@@ -381,8 +534,35 @@ class CausalDiffusionConfigTest(unittest.TestCase):
             self.assertEqual(config.Model.predictor, 'smart_causal_diffusion')
             self.assertEqual(config.Model.diffusion.prediction_tokens, 4)
             self.assertEqual(config.Model.diffusion.commit_tokens, 1)
+            self.assertEqual(
+                config.Model.diffusion.num_steps,
+                config.Model.diffusion.prediction_tokens,
+            )
+            self.assertEqual(
+                config.Model.diffusion.causal_objective,
+                'discrete_frontier_v2',
+            )
+            self.assertTrue(config.Model.diffusion.carry_tail_proposal)
+            self.assertTrue(config.Model.diffusion.proposal_conditioning_enabled)
+            self.assertTrue(config.Model.diffusion.current_state_enabled)
+            self.assertTrue(config.Model.diffusion.current_state_edges)
+            self.assertEqual(
+                config.Model.diffusion.closed_loop_batch_ratio_max,
+                0.5,
+            )
             self.assertEqual(config.Model.diffusion.encoder_lr_scale, 0.5)
-            self.assertGreater(config.Model.total_steps, 32)
+            expected_epochs = config.Trainer.max_epochs
+            self.assertEqual(config.Model.total_steps, expected_epochs)
+            self.assertGreater(config.Model.warmup_steps, 0)
+            self.assertLess(config.Model.warmup_steps, expected_epochs)
+            self.assertEqual(
+                list(config.Model.diffusion.retokenization_error_thresholds),
+                [
+                    0.7379697561264038,
+                    0.8562850952148438,
+                    1.2705252170562744,
+                ],
+            )
 
     def test_horizon_metrics_slice_requested_rollout_prefix(self):
         model = _causal_shell()

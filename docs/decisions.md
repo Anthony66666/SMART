@@ -1,9 +1,30 @@
 # Decisions
 
-## Decision: Add a mathematically causal closed-loop diffusion predictor
+## Decision: Rebuild causal diffusion as a revisable receding-horizon planner
+- Date: 2026-06-11
+- Context: The v1 model discarded three of four sampled tokens, trained epoch 0 only on clean histories, had no all-mask chunk-0 interaction sources, and applied zero safety guidance to the executed token. Static vehicles became moving after model histories replaced GT histories and then never recovered.
+- Decision: Use uniform discrete frontier CE, carry uncommitted tail tokens as revisable geometry/embedding proposals, add recency-weighted history and explicit current motion, expose chunk-0 current anchors to causal/spatial attention, and apply fixed commit safety with observation-to-first-frame dynamics.
+- Why: These changes align the supervised decision with the executed action and preserve short-horizon planning without committing uncertain future tokens.
+- Impact: Causal v2 must train from scratch. SMART and `smart_ar_diffusion` interfaces remain unchanged.
+
+## Decision: Keep causal LR scheduling epoch-based
+- Date: 2026-06-11
+- Context: Lightning steps the scheduler returned by `configure_optimizers()` once per epoch. Values `2000/120000` therefore keep a 32-epoch run inside an extremely low warmup regime.
+- Decision: Server and validation configs use `warmup_steps: 2`, `total_steps: 32`; the five-epoch local config uses `1/5`.
+- Why: This matches the user's requested epoch-level LR schedule and the actual scheduler interval.
+- Impact: Do not interpret these two fields as optimizer-step counts unless the scheduler return metadata is explicitly changed to `interval: step`.
+
+## Decision: Release one causal frontier per sampling step
+- Date: 2026-06-11
+- Context: With four prediction chunks and `num_steps: 16`, the sampler skipped decoding for 12 iterations and released all chunks only at `t=0.25, 0.1875, 0.125, 0.0625`. This activated strong `(1-t)^2` safety guidance before the undertrained decoder had produced a reliable executable-token distribution and contributed to severe token mode collapse.
+- Decision: Require `diffusion.num_steps == diffusion.prediction_tokens`. Four-token causal windows therefore decode once per frontier at `t=1.0, 0.75, 0.5, 0.25`, with no idle sampling iterations.
+- Why: The all-mask state starts at high noise, each irreversible frontier release receives its own decoder call, and safety guidance ramps from weak to strong instead of dominating the first commit.
+- Impact: All causal train/validation configs use `num_steps: 4`; invalid schedules fail during model construction. Existing checkpoints remain weight-compatible when loaded into a model created from the corrected config.
+
+## Decision: Add the initial causal closed-loop diffusion predictor
 - Date: 2026-06-10
 - Context: Existing AR diffusion trains mostly on clean short windows but performs 16 recurrent commits at inference. Its non-causal future-token attention, proposal carry, remasking, and lack of explicit road/dynamics scoring allow early token errors to compound into late-horizon map exits.
-- Decision: Add `smart_causal_diffusion` as an independent predictor with four-token windows, one-token commits, strictly causal temporal edges, geometric absorbing-prefix corruption, chunk-correct MDLM weights, and monotonic release during the final four low-noise sampling steps.
+- Decision: Add `smart_causal_diffusion` as an independent predictor with four-token windows, one-token commits, strictly causal temporal edges, and monotonic frontier release. Its original continuous-time loss was subsequently replaced by the v2 discrete frontier objective above.
 - Why: The executable token must not depend on uncertain future chunks or be locked at high noise. The training corruption marginal and loss weighting must describe the same stochastic process used by the model.
 - Impact: Existing SMART and diffusion predictors remain unchanged. New train/validation configs and registry entries select the causal path explicitly.
 
@@ -12,21 +33,14 @@
 - Context: Clean teacher-forced token labels become geometrically inconsistent after a predicted or perturbed state drifts from the ground-truth anchor.
 - Decision: Use a 32-epoch clean/perturb/model-rollout curriculum. Commit one to four model tokens to form rollout states, transform the GT continuation into that state frame, and rematch the SMART codebook. Targets above per-type P99 error thresholds leave discrete CE and use differentiable expected-endpoint recovery instead.
 - Why: This aligns labels with the actual closed-loop state distribution without assigning impossible discrete targets.
-- Impact: `scripts/calibrate_causal_retokenization.py` computes per-type thresholds. Initial local 50-scene perturbed P99 seeds are `[0.65, 0.78, 0.62]` for vehicle/pedestrian/cyclist and must be recalibrated on the server training set.
+- Impact: `scripts/calibrate_causal_retokenization.py` computes per-type thresholds. The 10,000-scene perturbed P99 calibration is frozen as `[0.7379697561, 0.8562850952, 1.2705252171]`.
 
-## Decision: Use late top-k safety-energy reranking without hard projection
+## Decision: Use commit-aware top-k safety-energy reranking without hard projection
 - Date: 2026-06-10
 - Context: Map attention alone does not guarantee that a high-probability token stays lane-aligned, dynamically feasible, or collision-free.
-- Decision: Rerank the decoder's top-k executable-token candidates with lane-distance, lane-heading, acceleration/yaw-rate, and collision energies. Scale guidance by `(1-t)^2`; do not hard-project trajectories or impose traffic-light hard rules.
+- Decision: Rerank top-k candidates with lane-distance, lane-heading, acceleration/yaw-rate, and collision energies. The executable chunk uses fixed `commit_safety_weight`; later chunks retain `(1-t)^2` scaling. Dynamics includes the observed-state-to-first-frame transition.
 - Why: Soft reranking preserves the SMART token manifold and model diversity while making the irreversible low-noise commit explicitly safety-aware.
 - Impact: Validation logs horizon metrics, late ADE, energy terms, coverage, retokenization-invalid rate, and a safety-led `val_rollout_score`.
-
-## Decision: `Model.total_steps` is an optimizer-step budget
-- Date: 2026-06-10
-- Context: `SMART.configure_optimizers()` applies cosine decay using `Model.total_steps`. The current server AR config sets it to `32`, apparently treating it as epochs, so LR reaches zero after roughly 32 optimizer steps.
-- Decision: New causal configs use `total_steps: 120000` on the server and `10000` locally, with warmup and an encoder LR scale of 0.5.
-- Why: Training for many global steps with zero LR can look operational while leaving the model effectively at its initialization-stage quality.
-- Impact: Existing user-modified AR configs are not changed, but future runs must set `total_steps` from expected optimizer steps rather than epoch count.
 
 ## Decision: AR diffusion rescreening should keep full scene map candidates like SMART
 - Date: 2026-06-07

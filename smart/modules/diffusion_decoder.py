@@ -300,6 +300,8 @@ class DiffusionDecoder(nn.Module):
         geometry_confidence: Optional[torch.Tensor] = None,
         temporal_source_mask: Optional[torch.Tensor] = None,
         spatial_source_mask: Optional[torch.Tensor] = None,
+        proposal_token_embeddings: Optional[torch.Tensor] = None,
+        proposal_confidence: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         B, L = noisy_token_ids.shape
 
@@ -327,6 +329,12 @@ class DiffusionDecoder(nn.Module):
 
         if self.type_embedding is not None and agent_type_ids is not None:
             x = x + self.type_embedding(agent_type_ids.clamp(min=0, max=self.type_embedding.num_embeddings - 1))
+
+        if proposal_token_embeddings is not None and proposal_confidence is not None:
+            x = x + (
+                proposal_token_embeddings.to(dtype=x.dtype)
+                * proposal_confidence.to(dtype=x.dtype).clamp(0.0, 1.0).unsqueeze(-1)
+            )
 
         if geometry_confidence is None:
             geometry_confidence = valid_mask.new_zeros(valid_mask.shape, dtype=x.dtype)

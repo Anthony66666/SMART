@@ -40,8 +40,8 @@ Maintain this repository as the primary implementation repo for SMART baseline r
 4. Represent diffusion map context as flat/ragged tokens with packed-scene batch ids, not per-scene padding.
 5. Refresh future-token graph geometry from currently unmasked diffusion tokens during training and sampling, with training-time geometry dropout to reduce train/inference mismatch.
 6. Compare SMART-Diffusion variants with SMART parity: full-horizon joint MaskGIT denoising remains available, while `smart_ar_diffusion` now uses a receding-horizon rollout by default: 2-token history, 4-token prediction, 1-token commit, uncommitted tail-token proposal carry, and training-time visible-token neighbor corruption. Causal chunk schedules remain available as disabled ablations and must preserve the global diffusion timestep semantics when enabled.
-7. Train `smart_causal_diffusion` from scratch as the road-stability redesign: four-token causal absorbing windows, one-token commits, closed-loop state curriculum, codebook retokenization with continuous invalid-target recovery, and late-step top-k safety-energy reranking.
-8. Treat `Model.total_steps` as optimizer steps, not epochs; causal diffusion configs use a real step budget and a 0.5 encoder LR scale.
+7. Train `smart_causal_diffusion` v2 from scratch as the road-stability redesign: discrete frontier supervision, four-token revisable plans with one-token commits, proposal carry, recency/current-motion context, current-anchor interaction edges, closed-loop state curriculum, retokenization recovery, and commit-aware safety reranking.
+8. Keep causal LR scheduling epoch-based: 32-epoch server runs use `warmup_steps: 2`, `total_steps: 32`, and encoder LR scale 0.5.
 9. After meaningful work, update `docs/progress.md` and refresh `docs/next.md`.
 10. Update `docs/spec.md` and `docs/decisions.md` only when project direction or durable decisions change.
 

@@ -2,9 +2,9 @@
 
 ## In Flight
 
-- Local CUDA smoke on `data/valid_demo` passed three optimizer steps plus a full validation rollout; proceed to server setup after full-dataset retokenization calibration.
-- Calibrate `retokenization_error_thresholds` on the full server training set with `scripts/calibrate_causal_retokenization.py --with_perturbation`, then update all causal train/validation configs with the frozen vehicle/pedestrian/cyclist P99 values.
-- Launch the five from-scratch causal runs in order: clean causal, perturbation, closed-loop retokenization, safety energy, then weight/probability tuning. Keep `Model.total_steps` as an optimizer-step budget and do not initialize from the old AR checkpoint.
+- Launch causal v2 from scratch; do not resume `/mnt/d/causal_epoch=00.ckpt`, because the objective, state conditioning, proposal path, and decoder inputs changed.
+- Use the frozen 10,000-scene perturbed P99 thresholds already written to all causal configs.
+- Compare causal v2 against original SMART, the old causal checkpoint, and the current AR diffusion checkpoint using identical validation scenes.
 - Compare `val_rollout_score`, 2/4/6/8-second ADE/FDE, late ADE, lane/collision energies, map violations, and official SMART metrics against original SMART and the current AR diffusion checkpoint.
 - Inspect `outputs/ar_map_rollout_query_debug_6c1658d_epoch00/` first for `/mnt/d/6c1658d_epoch=00.ckpt`; verify raw q overlap, proposal-refreshed q expansion, sampled q placement, rolled agents/history, and raw/proposal/sampled map-edge coverage before tuning self-conditioning/corruption schedules.
 - After the history-context map mask alignment, rerun AR diffusion validation/visualizations with the checkpoint-matched config and compare agent context/map-edge coverage for category-3 targets versus non-target generation agents.
@@ -18,8 +18,10 @@
 
 ## Next Actions
 
-- Follow the `README.md` causal diffusion server checklist; because LR scheduling is intentionally epoch-based, set `Model.warmup_steps: 2` and `Model.total_steps: 32` for the 32-epoch run.
-- Use `python scripts/calibrate_causal_retokenization.py --config configs/train/train_scalable_causal_diffusion.yaml --split train --max_samples <budget> --quantile 0.99 --with_perturbation --output_json <path>` before the first server run.
+- Run the five-epoch local demo command documented in `README.md` and confirm the model can overfit the 11 scenes before launching the full server run.
+- Use `docs/train_scalable_causal_diffusion_config.md` as the field-by-field reference when editing the server causal config; verify all linked time/token fields remain consistent.
+- Follow the `README.md` causal diffusion server checklist; the committed server config already uses epoch-based `warmup_steps: 2` and `total_steps: 32`.
+- Archive `outputs/calibration/causal_retokenization_p99.json` with the run metadata; recalibrate only if the training dataset or perturbation policy changes.
 - Start causal training with `configs/train/train_scalable_causal_diffusion.yaml`; checkpoint selection uses `val_rollout_score`, while `val_minADE`/`val_minFDE` remain baseline-comparison metrics.
 - For AR diffusion finetunes initialized from older checkpoints, prefer `--pretrain_ckpt` over `--ckpt_path`; confirm LR is nonzero and GPU0 does not retain per-rank checkpoint-loading contexts after startup.
 - For AR diffusion server debugging, inspect `[SMARTDiffusion]`, `[ValidationVisualization]`, and `[StepVisualization]` stdout logs to see whether slowdowns happen in window loss, 16-round receding-horizon rollout, per-round sampling, or rank0 visualization.

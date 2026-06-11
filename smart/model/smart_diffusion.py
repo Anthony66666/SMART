@@ -1100,6 +1100,33 @@ class SMARTDiffusion(SMART):
         source_mask = packed['valid_mask'] & (
             geometry_confidence >= self.geometry_confidence_source_threshold
         )
+        current_state_source = (
+            packed['valid_mask']
+            & (packed['chunk_ids'] == 0)
+            & bool(getattr(self, 'causal_current_state_edges', False))
+        )
+        source_mask = source_mask | current_state_source
+
+        proposal_embeddings = None
+        proposal_conditioning_confidence = None
+        if (
+            bool(getattr(self, 'proposal_conditioning_enabled', False))
+            and proposal_token_ids is not None
+            and proposal_confidence is not None
+        ):
+            proposal_conditioning_confidence = proposal_confidence.to(
+                device=noisy.device,
+                dtype=summary.dtype,
+            ).clamp(0.0, 1.0)
+            proposal_conditioning_confidence = (
+                proposal_conditioning_confidence
+                * packed['valid_mask'].to(dtype=summary.dtype)
+                * (noisy == self.mask_token_id).to(dtype=summary.dtype)
+            )
+            proposal_embeddings = self._physical_token_embeddings(
+                proposal_token_ids,
+                packed['agent_type_ids'],
+            )
 
         return self.diffusion_decoder(
             noisy_token_ids=noisy,
@@ -1120,6 +1147,8 @@ class SMARTDiffusion(SMART):
             geometry_confidence=geometry_confidence,
             temporal_source_mask=source_mask,
             spatial_source_mask=source_mask,
+            proposal_token_embeddings=proposal_embeddings,
+            proposal_confidence=proposal_conditioning_confidence,
         )
 
     def _maybe_apply_geometry_dropout(self, geometry_known_mask, reference):

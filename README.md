@@ -486,6 +486,31 @@ python val.py --config configs/validation/validation_scalable_jepa.yaml --pretra
 下面是 `smart_causal_diffusion` 的服务器训练流程。该模型应当从头训练，不要加载旧的
 `smart_ar_diffusion` checkpoint。
 
+### Local small-data training
+
+本地配置默认使用仓库中的 11 个 Waymo demo：
+
+```bash
+cd /home/anthony/SimAgentJEPA/external/SMART
+source /home/anthony/anaconda3/etc/profile.d/conda.sh
+conda activate smart
+
+mkdir -p checkpoints/causal_v2_local
+
+CUDA_VISIBLE_DEVICES=0 python -u train.py \
+  --config configs/train/train_scalable_causal_diffusion_local.yaml \
+  --save_ckpt_path checkpoints/causal_v2_local
+```
+
+该配置训练 5 个 epoch、每个 epoch 只验证 1 个 batch，并默认关闭额外
+visualization rollout。训练日志可用下面的命令查看：
+
+```bash
+tensorboard --logdir lightning_logs --port 6006
+```
+
+这是训练链路和过拟合能力检查，不用于判断完整 Waymo 数据集上的最终效果。
+
 ### 1. Update the repository
 
 ```bash
@@ -545,6 +570,17 @@ Trainer:
 Model:
   warmup_steps: 2
   total_steps: 32
+  diffusion:
+    causal_objective: discrete_frontier_v2
+    prediction_tokens: 4
+    commit_tokens: 1
+    carry_tail_proposal: true
+    proposal_conditioning_enabled: true
+    current_state_enabled: true
+    current_state_edges: true
+    closed_loop_batch_ratio_max: 0.5
+    retokenization_error_thresholds:
+      [0.7379697561264038, 0.8562850952148438, 1.2705252170562744]
 ```
 
 当前 `LambdaLR` 由 PyTorch Lightning 按 epoch 更新，因此这里的
@@ -598,8 +634,8 @@ python -m unittest \
 
 ### 7. Calibrate retokenization thresholds
 
-正式训练前，应当使用完整服务器训练集重新估计 vehicle、pedestrian 和
-cyclist 的 P99 retokenization error：
+当前配置已经写入这次 10,000 scene 标定的 vehicle、pedestrian 和 cyclist
+P99。数据集或 perturbation 策略变化时，使用下面的命令重新估计：
 
 ```bash
 mkdir -p outputs/calibration
@@ -619,10 +655,11 @@ python scripts/calibrate_causal_retokenization.py \
 cat outputs/calibration/causal_retokenization_p99.json
 ```
 
-将 JSON 中的 `config_order` 按原顺序填写到训练和验证配置：
+将 JSON 中的 `config_order` 按原顺序填写到训练和验证配置。当前结果为：
 
 ```yaml
-retokenization_error_thresholds: [vehicle_p99, pedestrian_p99, cyclist_p99]
+retokenization_error_thresholds:
+  [0.7379697561264038, 0.8562850952148438, 1.2705252170562744]
 ```
 
 如果某一类的 `counts` 为 `0` 或阈值为 `null`，不要启动正式训练。应先扩大
@@ -665,6 +702,8 @@ tensorboard --logdir lightning_logs --port 6006
 
 - 学习率是否按 epoch warmup 和衰减
 - `train_loss` / diffusion loss 是否为有限值
+- `train_frontier_chunk_0_frac` 到 `train_frontier_chunk_3_frac` 是否都被采样
+- `train_state_mode` 和 `train_rollout_depth` 是否按 curriculum 变化
 - `train_retokenization_invalid_rate`
 - `val_rollout_score`
 - `val_minADE` 和 `val_minFDE`

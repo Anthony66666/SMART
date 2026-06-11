@@ -1,15 +1,17 @@
 import math
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 from smart.model.smart_ar_diffusion import SMARTAutoregressiveDiffusion
 from smart.modules.causal_diffusion_decoder import CausalDiffusionDecoder
 from smart.modules.trajectory_energy import TrajectoryEnergy
+from smart.utils import wrap_angle
 
 
 class SMARTCausalDiffusion(SMARTAutoregressiveDiffusion):
-    """Causal absorbing diffusion over short SMART trajectory-token windows."""
+    """Causal discrete-frontier planning over short SMART token windows."""
 
     def __init__(self, model_config) -> None:
         super().__init__(model_config)
@@ -21,16 +23,38 @@ class SMARTCausalDiffusion(SMARTAutoregressiveDiffusion):
             raise ValueError(
                 "SMART causal diffusion requires diffusion.commit_tokens == 1."
             )
-        if self.diffusion_num_steps < self.num_future_chunks:
+        if self.diffusion_num_steps != self.num_future_chunks:
             raise ValueError(
-                "SMART causal diffusion requires num_steps >= prediction_tokens."
+                "SMART causal diffusion requires num_steps == prediction_tokens "
+                "so every sampling step releases exactly one causal frontier."
             )
 
         diffusion_cfg = model_config.diffusion
+        self.causal_objective = str(
+            getattr(diffusion_cfg, 'causal_objective', 'discrete_frontier_v2')
+        ).lower()
+        if self.causal_objective != 'discrete_frontier_v2':
+            raise ValueError(
+                "SMART causal diffusion requires "
+                "diffusion.causal_objective == 'discrete_frontier_v2'."
+            )
         self.causal_frontier_loss_weight = float(
             getattr(diffusion_cfg, 'frontier_loss_weight', 1.0)
         )
         self.causal_frontier_loss_weight = max(self.causal_frontier_loss_weight, 0.0)
+        self.closed_loop_batch_ratio_max = min(
+            1.0,
+            max(
+                0.0,
+                float(
+                    getattr(
+                        diffusion_cfg,
+                        'closed_loop_batch_ratio_max',
+                        0.5,
+                    )
+                ),
+            ),
+        )
         self.closed_loop_max_depth = max(
             1,
             min(4, int(getattr(diffusion_cfg, 'closed_loop_max_depth', 4))),
@@ -67,6 +91,32 @@ class SMARTCausalDiffusion(SMARTAutoregressiveDiffusion):
             0.0,
             float(getattr(diffusion_cfg, 'safety_energy_weight', 1.0)),
         )
+        self.commit_safety_weight = max(
+            0.0,
+            float(
+                getattr(
+                    diffusion_cfg,
+                    'commit_safety_weight',
+                    self.safety_energy_weight,
+                )
+            ),
+        )
+        self.proposal_conditioning_enabled = bool(
+            getattr(diffusion_cfg, 'proposal_conditioning_enabled', True)
+        )
+        self.current_state_enabled = bool(
+            getattr(diffusion_cfg, 'current_state_enabled', True)
+        )
+        self.causal_current_state_edges = bool(
+            getattr(diffusion_cfg, 'current_state_edges', True)
+        )
+        self.history_recency_decay = min(
+            1.0,
+            max(
+                1e-3,
+                float(getattr(diffusion_cfg, 'history_recency_decay', 0.5)),
+            ),
+        )
         self.lane_distance_energy_weight = max(
             0.0,
             float(getattr(diffusion_cfg, 'lane_distance_energy_weight', 1.0)),
@@ -100,6 +150,11 @@ class SMARTCausalDiffusion(SMARTAutoregressiveDiffusion):
             ),
         }
         self._token_center_vocab_cache = None
+        self.current_state_projection = nn.Sequential(
+            nn.Linear(5, self.hidden_dim),
+            nn.SiLU(),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+        )
         self.trajectory_energy = TrajectoryEnergy(
             dt=float(getattr(diffusion_cfg, 'trajectory_dt', 0.1)),
             max_acceleration=float(
@@ -111,9 +166,8 @@ class SMARTCausalDiffusion(SMARTAutoregressiveDiffusion):
             ),
         )
 
-        # Causal diffusion has one monotonic state path. Legacy remasking,
-        # proposal carry, and independently corrupted visible tokens would
-        # violate that state definition.
+        # Executed tokens remain monotonic. Uncommitted tail tokens are carried
+        # only as revisable proposal conditioning for the next rollout window.
         self.remask_sampling = False
         self.prefix_constrained_sampling = True
         self.prefix_constrained_training = True
@@ -121,8 +175,10 @@ class SMARTCausalDiffusion(SMARTAutoregressiveDiffusion):
         self.visible_token_corruption_prob = 0.0
         self.visible_token_corruption_probs = ()
         self.self_condition_prob = 0.0
-        self.use_proposal_geometry = False
-        self.ar_carry_tail_proposal = False
+        self.use_proposal_geometry = self.proposal_conditioning_enabled
+        self.ar_carry_tail_proposal = bool(
+            getattr(diffusion_cfg, 'carry_tail_proposal', True)
+        )
 
         token_size = int(getattr(model_config.decoder, 'token_size', 2048))
         self.diffusion_decoder = CausalDiffusionDecoder(
@@ -193,72 +249,161 @@ class SMARTCausalDiffusion(SMARTAutoregressiveDiffusion):
         )
         return [optimizer], [scheduler]
 
-    def _sample_absorbing_prefix_mask(
-        self,
-        valid_mask,
-        survival_prob,
-        token_agent_ids,
-        chunk_ids,
-        random_values=None,
-    ):
-        """Sample a visible prefix and absorbing masked suffix for each agent."""
-        if random_values is None:
-            random_values = torch.rand_like(valid_mask, dtype=torch.float)
-        survival_prob = survival_prob.to(
-            device=valid_mask.device,
-            dtype=random_values.dtype,
-        )
-        if survival_prob.dim() == 0:
-            survival_prob = survival_prob.expand(valid_mask.shape[0])
-        if survival_prob.dim() != 1 or survival_prob.shape[0] != valid_mask.shape[0]:
-            raise ValueError("survival_prob must be scalar or have shape [batch].")
-
-        mask = torch.zeros_like(valid_mask)
-        for batch_idx in range(valid_mask.shape[0]):
-            agent_ids = torch.unique(token_agent_ids[batch_idx][valid_mask[batch_idx]])
-            for agent_id in agent_ids.tolist():
-                if agent_id < 0:
-                    continue
-                agent_nodes = torch.nonzero(
-                    valid_mask[batch_idx]
-                    & (token_agent_ids[batch_idx] == agent_id),
-                    as_tuple=False,
-                ).squeeze(-1)
-                order = torch.argsort(chunk_ids[batch_idx, agent_nodes])
-                agent_nodes = agent_nodes[order]
-                survives = random_values[batch_idx, agent_nodes] < survival_prob[batch_idx]
-                failure = torch.nonzero(~survives, as_tuple=False)
-                if failure.numel() > 0:
-                    first_masked = int(failure[0, 0].item())
-                    mask[batch_idx, agent_nodes[first_masked:]] = True
-        return mask & valid_mask
-
     @staticmethod
     def _causal_reveal_count(step, num_steps, num_chunks):
         if num_steps <= 0 or num_chunks <= 0:
             return 0
+        if int(num_steps) != int(num_chunks):
+            raise ValueError(
+                "Causal diffusion num_steps must equal the number of future chunks."
+            )
         step = min(max(int(step), 0), int(num_steps) - 1)
-        first_reveal_step = max(0, int(num_steps) - int(num_chunks))
-        return min(int(num_chunks), max(0, step - first_reveal_step + 1))
+        return step + 1
 
-    @staticmethod
-    def _causal_diffusion_weight(sigma_t, dsigma_t, chunk_ids):
-        chunk_order = chunk_ids.to(dtype=sigma_t.dtype) + 1.0
-        scaled_sigma = sigma_t.unsqueeze(-1) * chunk_order
-        numerator = dsigma_t.unsqueeze(-1) * chunk_order
-        return numerator / torch.expm1(scaled_sigma).clamp_min(1e-12)
+    def _sample_frontier_ids(self, loss_mask_base, chunk_ids):
+        frontier_ids = torch.full(
+            (loss_mask_base.shape[0],),
+            -1,
+            dtype=torch.long,
+            device=chunk_ids.device,
+        )
+        for batch_idx in range(loss_mask_base.shape[0]):
+            available = torch.unique(
+                chunk_ids[batch_idx][loss_mask_base[batch_idx]]
+            )
+            available = available[
+                (available >= 0) & (available < self.num_future_chunks)
+            ]
+            if available.numel() == 0:
+                continue
+            selected = torch.randint(
+                available.numel(),
+                (1,),
+                device=chunk_ids.device,
+            )
+            frontier_ids[batch_idx] = available[selected]
+        return frontier_ids
 
-    @staticmethod
-    def _closed_loop_curriculum(epoch):
+    def _closed_loop_curriculum(self, epoch):
         epoch = max(0, int(epoch))
+        maximum = float(
+            getattr(self, 'closed_loop_batch_ratio_max', 0.5)
+        )
         if epoch <= 3:
             return 0.0, 0.0
         if epoch <= 7:
             return 0.25, 0.0
         if epoch <= 15:
-            rollout_prob = 0.10 + (epoch - 8) * (0.20 / 7.0)
+            phase_end = min(0.30, maximum)
+            phase_start = min(0.10, phase_end)
+            rollout_prob = phase_start + (
+                epoch - 8
+            ) * ((phase_end - phase_start) / 7.0)
             return 0.25, rollout_prob
-        return 0.25, 0.50
+        return 0.25, maximum
+
+    def _pool_agent_context(self, hist_tokens, hist_mask):
+        """Pool ordered history with greater weight on the latest token."""
+        num_history = int(hist_tokens.shape[1])
+        recency = torch.arange(
+            num_history - 1,
+            -1,
+            -1,
+            device=hist_tokens.device,
+            dtype=hist_tokens.dtype,
+        )
+        recency = self.history_recency_decay ** recency
+        weights = (
+            hist_mask.to(dtype=hist_tokens.dtype)
+            * recency.unsqueeze(0)
+        ).unsqueeze(-1)
+        return (hist_tokens * weights).sum(dim=1) / weights.sum(
+            dim=1
+        ).clamp_min(1.0)
+
+    def _current_state_motion(self, data):
+        agent = data['agent']
+        current_index = self.num_historical_steps - 1
+        previous_index = max(0, current_index - 1)
+        current_position = agent['position'][:, current_index, :2].float()
+        previous_position = agent['position'][:, previous_index, :2].float()
+        current_heading = agent['heading'][:, current_index].float()
+        previous_heading = agent['heading'][:, previous_index].float()
+        current_valid = agent['valid_mask'][:, current_index].bool()
+        previous_valid = agent['valid_mask'][:, previous_index].bool()
+        finite_difference_valid = current_valid & previous_valid
+
+        velocity = (current_position - previous_position) / 0.1
+        if 'velocity' in agent:
+            observed_velocity = agent['velocity'][
+                :,
+                min(current_index, agent['velocity'].shape[1] - 1),
+                :2,
+            ].float()
+            velocity = torch.where(
+                finite_difference_valid.unsqueeze(-1),
+                velocity,
+                observed_velocity,
+            )
+        velocity = velocity.masked_fill(~current_valid.unsqueeze(-1), 0.0)
+
+        cos_heading = current_heading.cos()
+        sin_heading = current_heading.sin()
+        longitudinal = velocity[:, 0] * cos_heading + velocity[:, 1] * sin_heading
+        lateral = -velocity[:, 0] * sin_heading + velocity[:, 1] * cos_heading
+        speed = torch.norm(velocity, dim=-1)
+        yaw_rate = wrap_angle(current_heading - previous_heading) / 0.1
+        yaw_rate = yaw_rate.masked_fill(~finite_difference_valid, 0.0)
+        features = torch.stack(
+            [
+                longitudinal / 20.0,
+                lateral / 20.0,
+                speed / 20.0,
+                yaw_rate / 2.0,
+                current_valid.to(dtype=velocity.dtype),
+            ],
+            dim=-1,
+        )
+        return velocity, current_heading, features
+
+    def _build_diffusion_inputs(self, data, rollout_valid=False):
+        result = super()._build_diffusion_inputs(
+            data,
+            rollout_valid=rollout_valid,
+        )
+        packed = result[0]
+        if packed is None:
+            return result
+
+        velocity, current_heading, state_features = self._current_state_motion(data)
+        state_embeddings = self.current_state_projection(state_features)
+        if self.current_state_enabled:
+            for _scene_idx, sequence_idx, agent_indices in packed['agent_maps']:
+                for local_idx, agent_idx in enumerate(agent_indices.tolist()):
+                    start = local_idx * self.ar_prediction_tokens
+                    end = start + self.ar_prediction_tokens
+                    packed['agent_context'][sequence_idx, start:end] += (
+                        state_embeddings[agent_idx]
+                    )
+
+        expanded_velocity = velocity[:, None, :].expand(
+            -1,
+            self.ar_prediction_tokens,
+            -1,
+        )
+        expanded_heading = current_heading[:, None].expand(
+            -1,
+            self.ar_prediction_tokens,
+        )
+        packed['current_velocities'] = self._pack_agent_chunk_values(
+            expanded_velocity,
+            packed,
+        )
+        packed['current_headings'] = self._pack_agent_chunk_values(
+            expanded_heading,
+            packed,
+        )
+        return result
 
     def _token_center_vocabs(self):
         if self._token_center_vocab_cache is None:
@@ -421,13 +566,32 @@ class SMARTCausalDiffusion(SMARTAutoregressiveDiffusion):
             reduction='mean',
         )
 
-    def _select_topk_by_energy(self, topk_log_probabilities, energies, t_value):
-        guidance_scale = getattr(
+    def _select_topk_by_energy(
+        self,
+        topk_log_probabilities,
+        energies,
+        t_value,
+        frontier_chunk_ids=None,
+    ):
+        guidance_scale = float(getattr(
             self,
             'safety_energy_weight',
             0.0,
-        ) * (1.0 - float(t_value)) ** 2
-        adjusted_score = topk_log_probabilities - guidance_scale * energies
+        )) * (1.0 - float(t_value)) ** 2
+        if frontier_chunk_ids is None:
+            scale = guidance_scale
+        else:
+            scale = energies.new_full(
+                (energies.shape[0], 1),
+                guidance_scale,
+            )
+            commit_mask = frontier_chunk_ids.to(
+                device=energies.device,
+            ) == 0
+            scale[commit_mask] = float(
+                getattr(self, 'commit_safety_weight', guidance_scale)
+            )
+        adjusted_score = topk_log_probabilities - scale * energies
         return adjusted_score.argmax(dim=-1)
 
     @staticmethod
@@ -509,6 +673,7 @@ class SMARTCausalDiffusion(SMARTAutoregressiveDiffusion):
         flat_positions = anchor_positions.reshape(-1, 2)[flat_frontier]
         flat_headings = anchor_headings.reshape(-1)[flat_frontier]
         flat_agent_types = packed['agent_type_ids'].reshape(-1)[flat_frontier]
+        frontier_chunk_ids = packed['chunk_ids'].reshape(-1)[flat_frontier]
         num_frontier = int(flat_frontier.numel())
         repeated_positions = flat_positions[:, None].expand(
             -1,
@@ -559,7 +724,41 @@ class SMARTCausalDiffusion(SMARTAutoregressiveDiffusion):
             candidate_positions,
             candidate_headings,
         )
-        nominal_other = candidate_positions[:, 0]
+        commit_mask = frontier_chunk_ids == 0
+        if commit_mask.any() and packed.get('current_velocities') is not None:
+            current_velocities = packed['current_velocities'].reshape(
+                -1,
+                2,
+            )[flat_frontier]
+            current_headings = packed.get(
+                'current_headings',
+                anchor_headings,
+            ).reshape(-1)[flat_frontier]
+            transition_dynamics = self.trajectory_energy.dynamics_energy(
+                candidate_positions,
+                candidate_headings,
+                current_positions=flat_positions,
+                current_velocities=current_velocities,
+                current_headings=current_headings,
+            )
+            dynamics[commit_mask] = transition_dynamics[commit_mask]
+
+        preliminary_energy = (
+            self.lane_distance_energy_weight * lane_distance
+            + self.lane_heading_energy_weight * lane_heading
+            + self.dynamics_energy_weight * dynamics
+        )
+        preliminary_selection = self._select_topk_by_energy(
+            topk_log_probabilities,
+            preliminary_energy,
+            t_value,
+            frontier_chunk_ids=frontier_chunk_ids,
+        )
+        row = torch.arange(
+            num_frontier,
+            device=topk_ids.device,
+        )
+        nominal_other = candidate_positions[row, preliminary_selection]
         frontier_agent_ids = packed['token_agent_ids'].reshape(-1)[flat_frontier]
         collision = self.trajectory_energy.collision_energy(
             candidate_positions,
@@ -579,10 +778,7 @@ class SMARTCausalDiffusion(SMARTAutoregressiveDiffusion):
             topk_log_probabilities,
             total_energy,
             t_value,
-        )
-        row = torch.arange(
-            num_frontier,
-            device=topk_ids.device,
+            frontier_chunk_ids=frontier_chunk_ids,
         )
         selected_ids = topk_ids[row, selected_topk]
         selected_confidence = probabilities[frontier].gather(
@@ -1002,10 +1198,6 @@ class SMARTCausalDiffusion(SMARTAutoregressiveDiffusion):
         return loss
 
     def _compute_diffusion_loss(self, packed, summary):
-        batch_size = summary.shape[0]
-        t = self._sample_diffusion_timesteps(batch_size, summary.device)
-        sigma_t, mask_prob, dsigma_t = self.noise_schedule(t)
-
         gt = packed['token_ids']
         valid_mask = packed['valid_mask']
         raw_loss_mask_base = packed.get('loss_mask_base', valid_mask) & valid_mask
@@ -1014,41 +1206,31 @@ class SMARTCausalDiffusion(SMARTAutoregressiveDiffusion):
             torch.ones_like(valid_mask),
         ).bool()
         loss_mask_base = raw_loss_mask_base & retokenization_valid
-        mask = self._sample_absorbing_prefix_mask(
-            valid_mask=valid_mask,
-            survival_prob=1.0 - mask_prob,
-            token_agent_ids=packed['token_agent_ids'],
-            chunk_ids=packed['chunk_ids'],
-        )
-        for batch_idx in range(mask.shape[0]):
-            if raw_loss_mask_base[batch_idx].any() and not (
-                mask[batch_idx] & raw_loss_mask_base[batch_idx]
-            ).any():
-                eligible = torch.nonzero(
-                    raw_loss_mask_base[batch_idx],
-                    as_tuple=False,
-                ).squeeze(-1)
-                farthest = eligible[
-                    torch.argmax(packed['chunk_ids'][batch_idx, eligible])
-                ]
-                agent_id = packed['token_agent_ids'][batch_idx, farthest]
-                chunk_id = packed['chunk_ids'][batch_idx, farthest]
-                mask[batch_idx] |= (
-                    valid_mask[batch_idx]
-                    & (packed['token_agent_ids'][batch_idx] == agent_id)
-                    & (packed['chunk_ids'][batch_idx] >= chunk_id)
-                )
-
-        frontier_mask = self._prefix_frontier_mask(
-            mask,
-            valid_mask,
-            packed['token_agent_ids'],
+        frontier_ids = self._sample_frontier_ids(
+            raw_loss_mask_base,
             packed['chunk_ids'],
-        ) & loss_mask_base
-        suffix_loss_mask = mask & loss_mask_base
+        )
+        selected_frontier = frontier_ids.unsqueeze(-1)
+        has_frontier = selected_frontier >= 0
+        mask = (
+            valid_mask
+            & has_frontier
+            & (packed['chunk_ids'] >= selected_frontier)
+        )
+        frontier_raw_mask = (
+            mask
+            & (packed['chunk_ids'] == selected_frontier)
+            & raw_loss_mask_base
+        )
+        frontier_mask = frontier_raw_mask & loss_mask_base
         noisy = gt.clone()
         noisy[mask] = self.mask_token_id
         geometry_known_mask = (~mask) & valid_mask
+        t = (
+            1.0
+            - frontier_ids.clamp_min(0).to(dtype=summary.dtype)
+            / float(self.num_future_chunks)
+        ).clamp_min(float(getattr(self, 'min_t', 1e-3)))
         logits = self._decode_diffusion_logits(
             noisy,
             packed,
@@ -1060,25 +1242,17 @@ class SMARTCausalDiffusion(SMARTAutoregressiveDiffusion):
         recovery_loss = self._continuous_recovery_loss(
             logits,
             packed,
-            masked_supervision=mask,
+            masked_supervision=frontier_raw_mask,
         )
-        if suffix_loss_mask.any():
+        if frontier_mask.any():
             log_p = F.log_softmax(logits, dim=-1)
             nll = -log_p.gather(-1, gt.unsqueeze(-1)).squeeze(-1)
-            diffusion_weight = self._causal_diffusion_weight(
-                sigma_t,
-                dsigma_t,
-                packed['chunk_ids'],
+            loss = (
+                nll[frontier_mask].mean()
+                * self.causal_frontier_loss_weight
             )
-            supervision_weight = suffix_loss_mask.to(dtype=nll.dtype)
-            supervision_weight = supervision_weight + (
-                self.causal_frontier_loss_weight
-                * frontier_mask.to(dtype=nll.dtype)
-            )
-            loss = (diffusion_weight * nll * supervision_weight).sum()
-            loss = loss / loss_mask_base.to(dtype=nll.dtype).sum().clamp_min(1.0)
             acc = (
-                logits[suffix_loss_mask].argmax(-1) == gt[suffix_loss_mask]
+                logits[frontier_mask].argmax(-1) == gt[frontier_mask]
             ).float().mean()
         else:
             loss = logits.sum() * 0.0
@@ -1107,6 +1281,20 @@ class SMARTCausalDiffusion(SMARTAutoregressiveDiffusion):
                 on_epoch=True,
                 batch_size=1,
             )
+            sampled_frontiers = frontier_ids >= 0
+            frontier_denominator = sampled_frontiers.float().sum().clamp_min(1.0)
+            for chunk_idx in range(self.num_future_chunks):
+                self.log(
+                    f'train_frontier_chunk_{chunk_idx}_frac',
+                    (
+                        (frontier_ids == chunk_idx).float().sum()
+                        / frontier_denominator
+                    ),
+                    prog_bar=False,
+                    on_step=True,
+                    on_epoch=True,
+                    batch_size=1,
+                )
             invalid_count = (
                 raw_loss_mask_base & ~retokenization_valid
             ).float().sum()
@@ -1151,7 +1339,6 @@ class SMARTCausalDiffusion(SMARTAutoregressiveDiffusion):
         initial_proposal_token_ids=None,
         initial_proposal_confidence=None,
     ):
-        del initial_proposal_token_ids, initial_proposal_confidence
         batch_size, sequence_length = valid_mask.shape
         device = summary.device
         sampled = torch.full(
@@ -1202,6 +1389,8 @@ class SMARTCausalDiffusion(SMARTAutoregressiveDiffusion):
                         summary,
                         t_batch,
                         geometry_known_mask=(~mask) & valid_mask,
+                        proposal_token_ids=initial_proposal_token_ids,
+                        proposal_confidence=initial_proposal_confidence,
                     )
                 else:
                     logits = self.diffusion_decoder(

@@ -89,16 +89,48 @@ class TrajectoryEnergy(nn.Module):
         self,
         candidate_positions: torch.Tensor,
         candidate_headings: torch.Tensor,
+        current_positions: Optional[torch.Tensor] = None,
+        current_velocities: Optional[torch.Tensor] = None,
+        current_headings: Optional[torch.Tensor] = None,
     ):
-        if candidate_positions.shape[2] < 2:
+        num_candidates, topk, num_steps, _ = candidate_positions.shape
+        if current_positions is not None:
+            current_positions = current_positions.to(
+                device=candidate_positions.device,
+                dtype=candidate_positions.dtype,
+            )
+            positions = torch.cat(
+                [
+                    current_positions[:, None, None, :].expand(-1, topk, 1, -1),
+                    candidate_positions,
+                ],
+                dim=2,
+            )
+        else:
+            positions = candidate_positions
+
+        if positions.shape[2] < 2:
             return candidate_positions.new_zeros(candidate_positions.shape[:2])
-        velocity = (
-            candidate_positions[:, :, 1:]
-            - candidate_positions[:, :, :-1]
-        ) / self.dt
-        if velocity.shape[2] >= 2:
+        velocity = (positions[:, :, 1:] - positions[:, :, :-1]) / self.dt
+
+        if current_velocities is not None:
+            current_velocities = current_velocities.to(
+                device=candidate_positions.device,
+                dtype=candidate_positions.dtype,
+            )
+            velocity_for_acceleration = torch.cat(
+                [
+                    current_velocities[:, None, None, :].expand(-1, topk, 1, -1),
+                    velocity,
+                ],
+                dim=2,
+            )
+        else:
+            velocity_for_acceleration = velocity
+        if velocity_for_acceleration.shape[2] >= 2:
             acceleration = (
-                velocity[:, :, 1:] - velocity[:, :, :-1]
+                velocity_for_acceleration[:, :, 1:]
+                - velocity_for_acceleration[:, :, :-1]
             ) / self.dt
             acceleration_excess = F.relu(
                 torch.norm(acceleration, dim=-1) - self.max_acceleration
@@ -107,9 +139,26 @@ class TrajectoryEnergy(nn.Module):
             acceleration_excess = candidate_positions.new_zeros(
                 candidate_positions.shape[:2]
             )
+
+        if current_headings is not None:
+            current_headings = current_headings.to(
+                device=candidate_headings.device,
+                dtype=candidate_headings.dtype,
+            )
+            headings = torch.cat(
+                [
+                    current_headings[:, None, None].expand(-1, topk, 1),
+                    candidate_headings,
+                ],
+                dim=2,
+            )
+        else:
+            headings = candidate_headings
+        if headings.shape[2] < 2:
+            yaw_excess = candidate_positions.new_zeros((num_candidates, topk))
+            return acceleration_excess + yaw_excess
         yaw_rate = wrap_angle(
-            candidate_headings[:, :, 1:]
-            - candidate_headings[:, :, :-1]
+            headings[:, :, 1:] - headings[:, :, :-1]
         ).abs() / self.dt
         yaw_excess = F.relu(
             yaw_rate - self.max_yaw_rate

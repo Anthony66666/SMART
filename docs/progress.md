@@ -1,5 +1,27 @@
 # Progress
 
+## 2026-06-11 CST
+- Task: Implemented causal diffusion v2 as a revisable four-token receding-horizon planner.
+- Result: Replaced continuous-time weighted suffix loss with uniform discrete frontier CE; enabled tail proposal carry and confidence-weighted proposal embeddings; added recency/current-motion context and all-mask chunk-0 interaction sources; made commit safety active at the first sampling step; and extended dynamics energy across the observed-to-candidate transition.
+- Config: Causal configs now use epoch LR schedules (`2/32` server, `1/5` local) and the calibrated P99 thresholds `[0.7379697561, 0.8562850952, 1.2705252171]`.
+- Local workflow: `train_scalable_causal_diffusion_local.yaml` now trains directly on the 11 `data/valid_demo` scenes, limits rollout validation to one batch, and disables extra visualization by default.
+- Validation: 21 causal tests pass. A three-step RTX 4090 smoke on all 11 `valid_demo` scenes produced finite losses `16.3 -> 15.1 -> 14.3`; a complete 16-round, 80-frame rollout finished in 29.1 seconds with finite outputs and wrote `outputs/causal_v2_smoke/idx_00000.png`.
+- Note: The three-step visualization is an execution smoke, not a trajectory-quality result. Causal v2 must be trained from scratch.
+
+## 2026-06-11 CST
+- Task: Diagnosed and fixed epoch-0 causal diffusion token mode collapse.
+- Result: The sampler now requires one decoding step per causal frontier. Four-token windows decode at `t=[1.0, 0.75, 0.5, 0.25]`; schedules such as 16 steps for 4 chunks fail fast instead of idling for 12 iterations and releasing only at low noise.
+- Evidence: `/mnt/d/causal_epoch=00.ckpt` had completed 4349 optimizer steps, but three demo scenes used only 36/2048 predicted tokens, repeated adjacent tokens 71.8% of the time, and concentrated 95.5% of predictions in ten tokens. Changing the sampling schedule from 16 to 4 steps reduced mean ADE/FDE from 10.24/24.27 m to 6.89/16.08 m on those scenes.
+- Files: `smart/model/smart_causal_diffusion.py`, causal train/local/validation configs, `tests/test_smart_causal_diffusion.py`.
+- Validation: All 17 causal tests passed; `py_compile` and `git diff --check` passed. The corrected validation config loaded the epoch-0 checkpoint with zero missing/unexpected keys and produced ADE 2.045 m / FDE 4.826 m on demo scene 1.
+- Next: Revalidate the existing epoch-0 checkpoint with the corrected config, then resume or restart training while comparing identical scenes and token-diversity diagnostics.
+
+## 2026-06-10 CST
+- Task: Documented every field in `configs/train/train_scalable_causal_diffusion.yaml`.
+- Result: Added `docs/train_scalable_causal_diffusion_config.md` with code-traced runtime behavior, units, tuning effects, inactive/overridden fields, formulas, constraints, and server recommendations.
+- Finding: Several compatibility fields are not active in the causal path, including YAML `Trainer.ckpt_path`, `eval_inference_batches`, and causal `geometry_dropout_prob`; visible corruption remains disabled, while proposal carry is enabled in v2.
+- Next: Use the reference when freezing the server config and record the calibrated P99 retokenization thresholds.
+
 ## 2026-06-10 CST
 - Task: Added a server-side `smart_causal_diffusion` runbook to `README.md`.
 - Result: Documented branch/environment checks, epoch-based LR configuration, dataset validation, retokenization calibration, from-scratch DDP launch, monitoring, checkpoint resume, and standalone validation commands.
@@ -14,7 +36,7 @@
 
 ## 2026-06-10 CST
 - Task: Implemented the independent SMART causal absorbing diffusion redesign.
-- Result: Added `smart_causal_diffusion` with strictly causal temporal token edges, geometric prefix corruption, chunk-correct absorbing MDLM weights, final-four-step monotonic reveal, four-token/one-token receding-horizon rollout, and separate train/validation/official-eval registration.
+- Result: Added `smart_causal_diffusion` with strictly causal temporal token edges, geometric prefix corruption, chunk-correct absorbing MDLM weights, monotonic frontier reveal, four-token/one-token receding-horizon rollout, and separate train/validation/official-eval registration.
 - Files: `smart/model/smart_causal_diffusion.py`, `smart/modules/causal_diffusion_decoder.py`, model and entrypoint registries, causal train/validation configs.
 - Validation: New causal/config tests pass; all three configs instantiate with four chunks and encoder/decoder LR ratio 0.5; real Waymo window training and full 16-round inference smokes produced finite outputs with full prediction coverage.
 
@@ -28,8 +50,7 @@
 - Files: `smart/modules/trajectory_energy.py`, `smart/model/smart_causal_diffusion.py`, `smart/model/smart_ar_diffusion.py`, `tests/test_trajectory_energy.py`.
 - Validation: Energy ordering tests pass; a full CPU Waymo inference completed 16 rounds in about 28.5 seconds with `pred_traj=(73,80,2)`, finite outputs, coverage 1.0, and aggregated safety energies.
 
-- Finding: The user-modified server AR config has `Model.total_steps: 32`, but the scheduler interprets this as optimizer steps and reduces LR to zero after roughly 32 steps.
-- Impact: This is a primary explanation for an epoch-1 checkpoint remaining underfit and collapsing late in rollout despite a large reported global step. New causal configs use real optimizer-step budgets; the existing AR config was not overwritten.
+- Correction: Lightning steps the bare `LambdaLR` once per epoch in this training path. Causal configs now intentionally use epoch units; the separate user-modified AR config remains outside this task.
 - Regression: 55 targeted/new/existing tests ran with 52 passing, 1 Waymo-dependency skip, and the same 2 pre-existing AR-config drift failures (`causal_noise_schedule` and visible corruption expectations). The 34-test regression subset excluding those stale config assertions passed.
 
 ## 2026-06-08 CST
