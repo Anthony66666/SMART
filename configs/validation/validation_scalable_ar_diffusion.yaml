@@ -61,12 +61,12 @@ Model:
   diffusion:
     future_chunk_steps: 5
     history_tokens: 2
-    prediction_tokens: 4
+    prediction_tokens: 6
     commit_tokens: 1
     carry_tail_proposal: true
     causal_noise_schedule: false
-    causal_chunk_mask_multipliers: [0.70, 0.90, 1.10, 1.30]
-    causal_loss_weights: [1.0, 1.0, 0.75, 0.5]
+    causal_chunk_mask_multipliers: [1, 1, 1, 1,1,1]
+    causal_loss_weights: [1.0, 1.0, 1.0, 1.0,1.0,1.0]
     token_steps: 5
     total_rollout_steps: 80
     local_map_refresh: rescreen

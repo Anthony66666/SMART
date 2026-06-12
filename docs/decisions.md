@@ -1,5 +1,33 @@
 # Decisions
 
+## Decision: Use SMART-style speed-referenced commit reranking for causal diffusion
+- Date: 2026-06-12
+- Context: Causal v2 safe sampling remained conservative because commit selection could prefer low-speed tokens and then use the slowed predicted history as the next speed reference.
+- Decision: Keep four-token causal diffusion proposals, but add a commit-only speed energy that compares token-internal median frame speed against a decaying initial observed speed reference. Only the first executable chunk is hard-constrained; uncommitted tail tokens remain revisable proposals for guidance/editing.
+- Why: This preserves diffusion-based scene editing while making the executed token closer to official SMART's stable closed-loop state update.
+- Impact: Causal configs expose `commit_speed_energy_weight`, `commit_min_speed_ratio`, `commit_speed_threshold`, and `commit_speed_reference_decay`; validation logs `commit_speed_energy`.
+
+## Decision: Use generic ego-risk guidance instead of predefined event targets
+- Date: 2026-06-11
+- Context: The paper direction should edit a real scene into a safety-critical counterfactual for the ego/SDC, not require the user to predeclare a cut-in, lead-hard-brake, or other scenario template. The previous cut-in target could produce nonzero scalar event scores while the visual result did not clearly read as a cut-in.
+- Decision: Make `target_spec: ego_risk` the default for causal guidance. Ego stress/edit modes now score candidate tokens with a generic ego-risk reward that combines low TTC, close ego-target distance, ego path intrusion, route proximity, conflict timing, and required deceleration while masking hard collisions. `target_event_eta` can be set to `0.0` for generic runs, and legacy event specs remain available only as ablations.
+- Why: This better matches safety-critical scene editing: choose an editable real target agent and optimize for making the ego's future interaction riskier while preserving the ego and non-target agents, instead of forcing a named maneuver class.
+- Impact: Causal configs and smoke/visualization scripts default to `ego_risk`; validation logs `ego_risk_min_ttc`, `ego_risk_reward`, and `ego_risk_success_rate`; Pareto criticality uses ego-risk plus near-miss success instead of target-event success; visualization only draws the old corridor-entry marker for legacy cut-in specs.
+
+## Decision: Replace global stress/edit guidance with ego-centric interaction guidance
+- Date: 2026-06-11
+- Context: The first stress/edit guidance used global arbitrary agent-pair min distance / TTC as the main criticality reward. That can generate or score risks unrelated to the ego/SDC and is a weak fit for safety-critical counterfactual scenario editing.
+- Decision: Use `guidance.mode = none | safe | ego_stress | ego_edit`. Ego modes score top-k candidate tokens with ego/SDC-only interaction reward, target-event reward, invalid-energy penalty, and edit-distance penalty. The first implemented event targets are `cut_in` and `lead_hard_brake`; `crossing_conflict` and `yield_failure` have basic event hooks for follow-up.
+- Why: The paper direction should demonstrate minimal, interpretable target-agent edits that create risk for ego while preserving ego and non-target agents, instead of trying to beat official SMART on displacement metrics or rewarding unrelated scene-wide danger.
+- Impact: Causal configs expose `ego_stress_topk`, `ego_edit_topk`, `ego_interaction_alpha`, `target_event_eta`, `path_corridor_width`, `conflict_tta_threshold`, and `target_spec`. Smoke and visualization scripts default to `seed,none,safe,ego_stress,ego_edit`.
+
+## Decision: Add inference-time guidance modes for causal diffusion editing and stress testing
+- Date: 2026-06-11
+- Context: `smart_causal_diffusion` may not beat official SMART on displacement metrics, but its discrete diffusion sampler is useful for controllable trajectory editing and safety-critical counterfactual generation with existing checkpoints.
+- Decision: Keep the causal training objective unchanged and add inference-time `guidance.mode = none | safe | stress | edit`. `none` uses unguided token sampling, `safe` preserves the existing safety-energy rerank, `stress` rewards collision-free near misses/low TTC while penalizing invalid trajectories, and `edit` locks seed tokens outside the target agent/time window while minimizing edit distance.
+- Why: This reuses the four-token causal frontier sampler, tail proposal carry, current-state conditioning, and top-k reranking path without retraining.
+- Impact: Causal configs now expose nested `diffusion.guidance` fields. Existing safe behavior remains the default; stress/edit are inference-time modes for scenario generation and pressure testing.
+
 ## Decision: Rebuild causal diffusion as a revisable receding-horizon planner
 - Date: 2026-06-11
 - Context: The v1 model discarded three of four sampled tokens, trained epoch 0 only on clean histories, had no all-mask chunk-0 interaction sources, and applied zero safety guidance to the executed token. Static vehicles became moving after model histories replaced GT histories and then never recovered.

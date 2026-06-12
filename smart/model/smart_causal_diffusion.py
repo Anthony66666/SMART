@@ -83,9 +83,126 @@ class SMARTCausalDiffusion(SMARTAutoregressiveDiffusion):
         self.safety_energy_enabled = bool(
             getattr(diffusion_cfg, 'safety_energy_enabled', True)
         )
+        guidance_cfg = getattr(diffusion_cfg, 'guidance', None)
+        configured_guidance_mode = getattr(guidance_cfg, 'mode', None)
+        configured_guidance_mode = getattr(
+            diffusion_cfg,
+            'guidance_mode',
+            configured_guidance_mode,
+        )
+        if configured_guidance_mode is None:
+            configured_guidance_mode = 'safe' if self.safety_energy_enabled else 'none'
+        self.guidance_mode = str(configured_guidance_mode).lower()
+        if self.guidance_mode not in ('none', 'safe', 'ego_stress', 'ego_edit'):
+            raise ValueError(
+                "diffusion.guidance.mode must be one of none/safe/ego_stress/ego_edit."
+            )
         self.safety_topk = max(
             1,
             int(getattr(diffusion_cfg, 'safety_topk', 16)),
+        )
+        self.guidance_safe_topk = max(
+            1,
+            int(getattr(guidance_cfg, 'safe_topk', self.safety_topk)),
+        )
+        self.guidance_ego_stress_topk = max(
+            1,
+            int(getattr(
+                guidance_cfg,
+                'ego_stress_topk',
+                getattr(diffusion_cfg, 'ego_stress_topk', 64),
+            )),
+        )
+        self.guidance_ego_edit_topk = max(
+            1,
+            int(getattr(
+                guidance_cfg,
+                'ego_edit_topk',
+                getattr(diffusion_cfg, 'ego_edit_topk', 64),
+            )),
+        )
+        self.guidance_ego_interaction_alpha = max(
+            0.0,
+            float(getattr(
+                guidance_cfg,
+                'ego_interaction_alpha',
+                getattr(diffusion_cfg, 'ego_interaction_alpha', 1.0),
+            )),
+        )
+        self.guidance_target_event_eta = max(
+            0.0,
+            float(getattr(
+                guidance_cfg,
+                'target_event_eta',
+                getattr(diffusion_cfg, 'target_event_eta', 1.0),
+            )),
+        )
+        self.guidance_invalid_beta = max(
+            0.0,
+            float(getattr(guidance_cfg, 'invalid_beta', getattr(diffusion_cfg, 'invalid_beta', 1.0))),
+        )
+        self.guidance_edit_gamma = max(
+            0.0,
+            float(getattr(guidance_cfg, 'edit_gamma', getattr(diffusion_cfg, 'edit_gamma', 1.0))),
+        )
+        self.guidance_near_miss_distance = max(
+            0.0,
+            float(getattr(guidance_cfg, 'near_miss_distance', getattr(diffusion_cfg, 'near_miss_distance', 2.0))),
+        )
+        self.guidance_ttc_threshold = max(
+            1e-3,
+            float(getattr(guidance_cfg, 'ttc_threshold', getattr(diffusion_cfg, 'ttc_threshold', 3.0))),
+        )
+        self.guidance_offroad_distance = max(
+            0.0,
+            float(getattr(guidance_cfg, 'offroad_distance', getattr(diffusion_cfg, 'offroad_distance', 4.0))),
+        )
+        self.guidance_hard_collision_weight = max(
+            0.0,
+            float(getattr(guidance_cfg, 'hard_collision_weight', getattr(diffusion_cfg, 'hard_collision_weight', 10.0))),
+        )
+        self.guidance_path_corridor_width = max(
+            1e-3,
+            float(getattr(guidance_cfg, 'path_corridor_width', getattr(diffusion_cfg, 'path_corridor_width', 2.0))),
+        )
+        self.guidance_conflict_tta_threshold = max(
+            1e-3,
+            float(getattr(guidance_cfg, 'conflict_tta_threshold', getattr(diffusion_cfg, 'conflict_tta_threshold', 1.0))),
+        )
+        ego_agent_id = getattr(
+            guidance_cfg,
+            'ego_agent_id',
+            getattr(diffusion_cfg, 'ego_agent_id', None),
+        )
+        self.guidance_ego_agent_id = (
+            None
+            if ego_agent_id is None
+            else int(ego_agent_id)
+        )
+        target_agents = getattr(
+            guidance_cfg,
+            'target_agents',
+            getattr(diffusion_cfg, 'target_agents', ()),
+        )
+        if target_agents is None:
+            target_agents = ()
+        if isinstance(target_agents, int):
+            target_agents = (target_agents,)
+        self.guidance_target_agents = tuple(int(agent) for agent in target_agents)
+        target_time_window = getattr(
+            guidance_cfg,
+            'target_time_window',
+            getattr(diffusion_cfg, 'target_time_window', None),
+        )
+        self.guidance_target_time_window = (
+            None
+            if target_time_window is None
+            else tuple(int(value) for value in target_time_window)
+        )
+        self.guidance_target_spec = getattr(
+            guidance_cfg,
+            'target_spec',
+            getattr(diffusion_cfg, 'target_spec', 'ego_risk'),
         )
         self.safety_energy_weight = max(
             0.0,
@@ -128,6 +245,28 @@ class SMARTCausalDiffusion(SMARTAutoregressiveDiffusion):
         self.dynamics_energy_weight = max(
             0.0,
             float(getattr(diffusion_cfg, 'dynamics_energy_weight', 0.25)),
+        )
+        self.commit_speed_energy_weight = max(
+            0.0,
+            float(getattr(diffusion_cfg, 'commit_speed_energy_weight', 2.0)),
+        )
+        self.commit_min_speed_ratio = min(
+            1.0,
+            max(
+                0.0,
+                float(getattr(diffusion_cfg, 'commit_min_speed_ratio', 0.55)),
+            ),
+        )
+        self.commit_speed_threshold = max(
+            0.0,
+            float(getattr(diffusion_cfg, 'commit_speed_threshold', 1.0)),
+        )
+        self.commit_speed_reference_decay = min(
+            1.0,
+            max(
+                0.0,
+                float(getattr(diffusion_cfg, 'commit_speed_reference_decay', 0.92)),
+            ),
         )
         self.collision_energy_weight = max(
             0.0,
@@ -366,6 +505,263 @@ class SMARTCausalDiffusion(SMARTAutoregressiveDiffusion):
         )
         return velocity, current_heading, features
 
+    def _scene_ego_indices(self, data, agent_batch):
+        agent = data['agent']
+        device = agent_batch.device
+        num_agents = int(agent_batch.shape[0])
+        num_scenes = (
+            int(agent_batch.max().item()) + 1
+            if agent_batch.numel() > 0
+            else 1
+        )
+        ego_indices = torch.full(
+            (num_scenes,),
+            -1,
+            dtype=torch.long,
+            device=device,
+        )
+        configured = getattr(self, 'guidance_ego_agent_id', None)
+        if configured is not None:
+            ego_indices[:] = int(configured)
+        elif 'ego_agent_id' in agent:
+            value = agent['ego_agent_id']
+            if not torch.is_tensor(value):
+                value = torch.tensor([int(value)], device=device)
+            value = value.to(device=device, dtype=torch.long).reshape(-1)
+            if value.numel() == 1:
+                ego_indices[:] = value[0]
+            elif value.numel() >= num_scenes:
+                ego_indices[:] = value[:num_scenes]
+        elif 'av_index' in agent:
+            value = agent['av_index']
+            if not torch.is_tensor(value):
+                value = torch.tensor([int(value)], device=device)
+            value = value.to(device=device, dtype=torch.long).reshape(-1)
+            if value.numel() == 1:
+                ego_indices[:] = value[0]
+            elif value.numel() >= num_scenes:
+                ego_indices[:] = value[:num_scenes]
+
+        for scene_idx in range(num_scenes):
+            scene_agents = torch.nonzero(
+                agent_batch == scene_idx,
+                as_tuple=False,
+            ).squeeze(-1)
+            if scene_agents.numel() == 0:
+                continue
+            ego_idx = int(ego_indices[scene_idx].item())
+            if ego_idx < 0 or ego_idx >= num_agents or not bool(
+                (agent_batch[ego_idx] == scene_idx).item()
+            ):
+                ego_indices[scene_idx] = scene_agents[0]
+        return ego_indices
+
+    def _select_ego_reference_value(
+        self,
+        value,
+        scene_idx,
+        ego_idx,
+        num_scenes,
+        num_agents,
+        flatten_chunks=False,
+    ):
+        if not torch.is_tensor(value):
+            return None
+        if flatten_chunks and value.dim() == 4:
+            if value.shape[0] == num_agents:
+                return value[ego_idx].reshape(-1, value.shape[-1])
+            if value.shape[0] == num_scenes:
+                return value[scene_idx].reshape(-1, value.shape[-1])
+            if value.shape[0] == 1:
+                return value[0].reshape(-1, value.shape[-1])
+        if value.dim() == 1:
+            return value
+        if value.dim() == 2:
+            if value.shape[-1] != 2:
+                if value.shape[0] == num_agents:
+                    return value[ego_idx]
+                if value.shape[0] == num_scenes:
+                    return value[scene_idx]
+                if value.shape[0] == 1:
+                    return value[0]
+            return value
+        if value.dim() == 3:
+            if value.shape[0] == num_agents:
+                return value[ego_idx]
+            if value.shape[0] == num_scenes:
+                return value[scene_idx]
+            if value.shape[0] == 1:
+                return value[0]
+        return None
+
+    @staticmethod
+    def _pad_reference_sequence(reference, length, fallback):
+        output = fallback.new_zeros((length,) + tuple(fallback.shape[1:]))
+        if reference is not None and reference.numel() > 0:
+            reference = reference.to(device=fallback.device, dtype=fallback.dtype)
+            count = min(length, int(reference.shape[0]))
+            if count > 0:
+                output[:count] = reference[:count]
+                if count < length:
+                    output[count:] = output[count - 1]
+                return output
+        output[:] = fallback[0]
+        return output
+
+    def _attach_ego_reference_to_packed(self, data, packed, agent_batch):
+        agent = data['agent']
+        device = packed['token_positions'].device
+        dtype = packed['token_positions'].dtype
+        num_agents = int(agent['position'].shape[0])
+        num_scenes = (
+            int(agent_batch.max().item()) + 1
+            if agent_batch.numel() > 0
+            else 1
+        )
+        ego_indices = self._scene_ego_indices(data, agent_batch)
+        frame_count = int(self.ar_prediction_tokens) * int(self.ar_token_steps)
+        future_start = int(self.num_historical_steps)
+        future_end = future_start + frame_count
+        ref_positions = agent['position'].new_zeros(num_agents, frame_count, 2).to(
+            device=device,
+            dtype=dtype,
+        )
+        ref_headings = agent['heading'].new_zeros(num_agents, frame_count).to(
+            device=device,
+            dtype=dtype,
+        )
+        route_source = agent.get('ego_route_corridor', None)
+        route_values = None
+        route_length = 0
+        if torch.is_tensor(route_source):
+            if route_source.dim() == 4:
+                route_length = int(route_source.shape[1] * route_source.shape[2])
+            elif route_source.dim() >= 2:
+                route_length = int(route_source.shape[-2])
+            if route_length > 0:
+                route_values = agent['position'].new_zeros(
+                    num_agents,
+                    route_length,
+                    2,
+                ).to(device=device, dtype=dtype)
+
+        for agent_idx in range(num_agents):
+            scene_idx = int(agent_batch[agent_idx].item())
+            ego_idx = int(ego_indices[scene_idx].item())
+            explicit_traj = (
+                self._select_ego_reference_value(
+                    agent['ego_ref_traj'],
+                    scene_idx,
+                    ego_idx,
+                    num_scenes,
+                    num_agents,
+                    flatten_chunks=True,
+                )
+                if 'ego_ref_traj' in agent
+                else None
+            )
+            if explicit_traj is None and 'seed_trajs' in agent:
+                explicit_traj = self._select_ego_reference_value(
+                    agent['seed_trajs'],
+                    scene_idx,
+                    ego_idx,
+                    num_scenes,
+                    num_agents,
+                    flatten_chunks=True,
+                )
+            if explicit_traj is None:
+                explicit_traj = agent['position'][
+                    ego_idx,
+                    future_start:min(future_end, agent['position'].shape[1]),
+                    :2,
+                ]
+            fallback_pos = agent['position'][
+                ego_idx,
+                min(future_start, agent['position'].shape[1] - 1):min(future_start + 1, agent['position'].shape[1]),
+                :2,
+            ].to(device=device, dtype=dtype)
+            ref_positions[agent_idx] = self._pad_reference_sequence(
+                explicit_traj,
+                frame_count,
+                fallback_pos,
+            )
+
+            explicit_heading = (
+                self._select_ego_reference_value(
+                    agent['ego_ref_heading'],
+                    scene_idx,
+                    ego_idx,
+                    num_scenes,
+                    num_agents,
+                    flatten_chunks=True,
+                )
+                if 'ego_ref_heading' in agent
+                else None
+            )
+            if explicit_heading is None:
+                explicit_heading = agent['heading'][
+                    ego_idx,
+                    future_start:min(future_end, agent['heading'].shape[1]),
+                ]
+            fallback_heading = agent['heading'][
+                ego_idx,
+                min(future_start, agent['heading'].shape[1] - 1):min(future_start + 1, agent['heading'].shape[1]),
+            ].to(device=device, dtype=dtype)
+            ref_headings[agent_idx] = self._pad_reference_sequence(
+                explicit_heading,
+                frame_count,
+                fallback_heading,
+            )
+
+            if route_values is not None:
+                route = self._select_ego_reference_value(
+                    route_source,
+                    scene_idx,
+                    ego_idx,
+                    num_scenes,
+                    num_agents,
+                    flatten_chunks=True,
+                )
+                route_values[agent_idx] = self._pad_reference_sequence(
+                    route,
+                    route_length,
+                    ref_positions[agent_idx, :1],
+                )
+
+        ego_chunks = ref_positions.reshape(
+            num_agents,
+            int(self.ar_prediction_tokens),
+            int(self.ar_token_steps),
+            2,
+        )
+        ego_heading_chunks = ref_headings.reshape(
+            num_agents,
+            int(self.ar_prediction_tokens),
+            int(self.ar_token_steps),
+        )
+        packed['ego_ref_positions'] = self._pack_agent_window_values(
+            ego_chunks,
+            packed,
+            fill_value=0.0,
+        )
+        packed['ego_ref_headings'] = self._pack_agent_window_values(
+            ego_heading_chunks,
+            packed,
+            fill_value=0.0,
+        )
+        if route_values is not None:
+            expanded_route = route_values[:, None].expand(
+                -1,
+                int(self.ar_prediction_tokens),
+                -1,
+                -1,
+            )
+            packed['ego_route_corridor'] = self._pack_agent_window_values(
+                expanded_route,
+                packed,
+                fill_value=0.0,
+            )
+
     def _build_diffusion_inputs(self, data, rollout_valid=False):
         result = super()._build_diffusion_inputs(
             data,
@@ -403,6 +799,21 @@ class SMARTCausalDiffusion(SMARTAutoregressiveDiffusion):
             expanded_heading,
             packed,
         )
+        if 'commit_speed_reference' in data['agent']:
+            reference_speed = data['agent']['commit_speed_reference'].to(
+                device=velocity.device,
+                dtype=velocity.dtype,
+            )
+            expanded_reference_speed = reference_speed[:, None].expand(
+                -1,
+                self.ar_prediction_tokens,
+            )
+            packed['commit_speed_reference'] = self._pack_agent_chunk_values(
+                expanded_reference_speed,
+                packed,
+            )
+        agent_batch = result[6]
+        self._attach_ego_reference_to_packed(data, packed, agent_batch)
         return result
 
     def _token_center_vocabs(self):
@@ -594,6 +1005,209 @@ class SMARTCausalDiffusion(SMARTAutoregressiveDiffusion):
         adjusted_score = topk_log_probabilities - scale * energies
         return adjusted_score.argmax(dim=-1)
 
+    def _commit_speed_energy(
+        self,
+        candidate_positions,
+        anchor_positions,
+        current_velocities,
+        frontier_chunk_ids,
+        reference_speeds=None,
+    ):
+        energy = candidate_positions.new_zeros(candidate_positions.shape[:2])
+        if current_velocities is None or candidate_positions.numel() == 0:
+            return energy
+        commit_mask = frontier_chunk_ids.to(
+            device=candidate_positions.device,
+        ) == 0
+        if not commit_mask.any():
+            return energy
+        current_velocities = current_velocities.to(
+            device=candidate_positions.device,
+            dtype=candidate_positions.dtype,
+        )
+        anchor_positions = anchor_positions.to(
+            device=candidate_positions.device,
+            dtype=candidate_positions.dtype,
+        )
+        current_speed = torch.norm(current_velocities, dim=-1)
+        if reference_speeds is not None:
+            reference_speeds = reference_speeds.to(
+                device=candidate_positions.device,
+                dtype=candidate_positions.dtype,
+            )
+            current_speed = torch.maximum(
+                current_speed,
+                reference_speeds.clamp_min(0.0),
+            )
+        moving_mask = (
+            commit_mask
+            & (current_speed >= float(getattr(self, 'commit_speed_threshold', 1.0)))
+        )
+        if not moving_mask.any():
+            return energy
+
+        dt = float(getattr(getattr(self, 'trajectory_energy', None), 'dt', 0.1))
+        step_dt = max(dt, 1e-3)
+        anchor = anchor_positions[:, None, None, :].expand(
+            -1,
+            candidate_positions.shape[1],
+            1,
+            -1,
+        )
+        position_chain = torch.cat([anchor, candidate_positions], dim=-2)
+        step_speed = torch.norm(
+            position_chain[:, :, 1:] - position_chain[:, :, :-1],
+            dim=-1,
+        ) / step_dt
+        candidate_speed = step_speed.median(dim=-1).values
+        minimum_speed = (
+            current_speed
+            * float(getattr(self, 'commit_min_speed_ratio', 0.45))
+        ).unsqueeze(-1)
+        speed_deficit = (minimum_speed - candidate_speed).clamp_min(0.0)
+        scale = max(float(getattr(self, 'commit_speed_threshold', 1.0)), 1.0)
+        energy[moving_mask] = (speed_deficit[moving_mask] / scale) ** 2
+        return energy
+
+    def _guidance_topk(self):
+        mode = str(getattr(self, 'guidance_mode', 'safe')).lower()
+        if mode == 'ego_stress':
+            return int(getattr(self, 'guidance_ego_stress_topk', 64))
+        if mode == 'ego_edit':
+            return int(getattr(self, 'guidance_ego_edit_topk', 64))
+        return int(getattr(self, 'guidance_safe_topk', getattr(self, 'safety_topk', 16)))
+
+    def _select_topk_by_guidance(
+        self,
+        topk_log_probabilities,
+        guidance,
+        t_value,
+        frontier_chunk_ids=None,
+    ):
+        mode = str(getattr(self, 'guidance_mode', 'safe')).lower()
+        if mode == 'safe':
+            return self._select_topk_by_energy(
+                topk_log_probabilities,
+                guidance['safe_energy'],
+                t_value,
+                frontier_chunk_ids=frontier_chunk_ids,
+            )
+        if mode in ('ego_stress', 'ego_edit'):
+            ego_reward = guidance.get(
+                'ego_risk_reward',
+                guidance.get('ego_interaction_reward', 0.0),
+            )
+            target_reward = guidance.get('target_event_reward', 0.0)
+            adjusted_score = (
+                topk_log_probabilities
+                + float(getattr(self, 'guidance_ego_interaction_alpha', 1.0))
+                * ego_reward
+                + float(getattr(self, 'guidance_target_event_eta', 1.0))
+                * target_reward
+                - float(getattr(self, 'guidance_invalid_beta', 1.0))
+                * guidance.get('invalid_energy', guidance['safe_energy'])
+                - float(getattr(self, 'guidance_edit_gamma', 1.0))
+                * guidance.get('edit_distance', 0.0)
+            )
+            return adjusted_score.argmax(dim=-1)
+        return topk_log_probabilities.argmax(dim=-1)
+
+    def _zero_guidance_diagnostics(self, reference):
+        zero = reference.sum() * 0.0
+        return {
+            'lane_distance': zero.clone(),
+            'lane_heading': zero.clone(),
+            'dynamics': zero.clone(),
+            'dynamics_energy': zero.clone(),
+            'commit_speed_energy': zero.clone(),
+            'collision': zero.clone(),
+            'min_ttc': zero.clone(),
+            'ego_min_ttc': zero.clone(),
+            'ego_risk_min_ttc': zero.clone(),
+            'ego_min_distance': zero.clone(),
+            'ego_required_decel': zero.clone(),
+            'ego_path_intrusion_rate': zero.clone(),
+            'ego_conflict_tta_error': zero.clone(),
+            'ego_risk_reward': zero.clone(),
+            'ego_risk_success_rate': zero.clone(),
+            'ego_near_miss_success_rate': zero.clone(),
+            'near_miss_rate': zero.clone(),
+            'hard_collision_rate': zero.clone(),
+            'offroad_rate': zero.clone(),
+            'edit_distance': zero.clone(),
+            'target_success_rate': zero.clone(),
+            'target_event_success_rate': zero.clone(),
+        }
+
+    def _candidate_edit_distance(
+        self,
+        candidate_positions,
+        topk_ids,
+        flat_frontier,
+        seed_token_ids=None,
+        seed_trajs=None,
+    ):
+        if seed_trajs is not None:
+            seed_trajs = seed_trajs.to(
+                device=candidate_positions.device,
+                dtype=candidate_positions.dtype,
+            )
+            if seed_trajs.dim() != 4:
+                raise ValueError("seed_trajs must have shape [B,L,T,2].")
+            seed_flat = seed_trajs.reshape(
+                -1,
+                seed_trajs.shape[-2],
+                2,
+            )[flat_frontier]
+            step_count = min(
+                int(candidate_positions.shape[-2]),
+                int(seed_flat.shape[-2]),
+            )
+            if step_count <= 0:
+                return candidate_positions.new_zeros(topk_ids.shape)
+            return torch.norm(
+                candidate_positions[:, :, :step_count]
+                - seed_flat[:, None, :step_count],
+                dim=-1,
+            ).mean(dim=-1)
+        if seed_token_ids is None:
+            return candidate_positions.new_zeros(topk_ids.shape)
+        seed_frontier_ids = seed_token_ids.reshape(-1)[flat_frontier]
+        return (
+            topk_ids != seed_frontier_ids.unsqueeze(-1)
+        ).to(dtype=candidate_positions.dtype)
+
+    def _criticality_against_nominal_other_agents(
+        self,
+        candidate_positions,
+        nominal_other_positions,
+        candidate_batch,
+        candidate_agent_ids,
+    ):
+        criticality = self.trajectory_energy.criticality_metrics(
+            candidate_positions,
+            None,
+            near_miss_distance=getattr(self, 'guidance_near_miss_distance', 2.0),
+            ttc_threshold=getattr(self, 'guidance_ttc_threshold', 3.0),
+        )
+        for candidate_idx in range(int(candidate_positions.shape[0])):
+            other_mask = (
+                candidate_batch == candidate_batch[candidate_idx]
+            ) & (
+                candidate_agent_ids != candidate_agent_ids[candidate_idx]
+            )
+            if not other_mask.any():
+                continue
+            row_metrics = self.trajectory_energy.criticality_metrics(
+                candidate_positions[candidate_idx:candidate_idx + 1],
+                nominal_other_positions[other_mask],
+                near_miss_distance=getattr(self, 'guidance_near_miss_distance', 2.0),
+                ttc_threshold=getattr(self, 'guidance_ttc_threshold', 3.0),
+            )
+            for key, value in row_metrics.items():
+                criticality[key][candidate_idx] = value[0]
+        return criticality
+
     @staticmethod
     def _horizon_displacement_metrics(
         prediction,
@@ -651,9 +1265,11 @@ class SMARTCausalDiffusion(SMARTAutoregressiveDiffusion):
         packed,
         sampled,
         t_value,
+        seed_token_ids=None,
+        seed_trajs=None,
     ):
         frontier_logits = logits[frontier]
-        topk = min(self.safety_topk, int(frontier_logits.shape[-1]))
+        topk = min(self._guidance_topk(), int(frontier_logits.shape[-1]))
         topk_log_probabilities, topk_ids = F.log_softmax(
             frontier_logits,
             dim=-1,
@@ -725,11 +1341,19 @@ class SMARTCausalDiffusion(SMARTAutoregressiveDiffusion):
             candidate_headings,
         )
         commit_mask = frontier_chunk_ids == 0
+        commit_speed_energy = candidate_positions.new_zeros(
+            candidate_positions.shape[:2]
+        )
         if commit_mask.any() and packed.get('current_velocities') is not None:
             current_velocities = packed['current_velocities'].reshape(
                 -1,
                 2,
             )[flat_frontier]
+            reference_speeds = None
+            if packed.get('commit_speed_reference') is not None:
+                reference_speeds = packed['commit_speed_reference'].reshape(
+                    -1,
+                )[flat_frontier]
             current_headings = packed.get(
                 'current_headings',
                 anchor_headings,
@@ -742,11 +1366,19 @@ class SMARTCausalDiffusion(SMARTAutoregressiveDiffusion):
                 current_headings=current_headings,
             )
             dynamics[commit_mask] = transition_dynamics[commit_mask]
+            commit_speed_energy = self._commit_speed_energy(
+                candidate_positions,
+                flat_positions,
+                current_velocities,
+                frontier_chunk_ids,
+                reference_speeds=reference_speeds,
+            )
 
         preliminary_energy = (
             self.lane_distance_energy_weight * lane_distance
             + self.lane_heading_energy_weight * lane_heading
             + self.dynamics_energy_weight * dynamics
+            + self.commit_speed_energy_weight * commit_speed_energy
         )
         preliminary_selection = self._select_topk_by_energy(
             topk_log_probabilities,
@@ -768,15 +1400,93 @@ class SMARTCausalDiffusion(SMARTAutoregressiveDiffusion):
             candidate_agent_ids=frontier_agent_ids,
             other_agent_ids=frontier_agent_ids,
         )
+        criticality = self._criticality_against_nominal_other_agents(
+            candidate_positions,
+            nominal_other,
+            candidate_batch,
+            frontier_agent_ids,
+        )
+        ego_ref_positions = packed.get('ego_ref_positions')
+        if ego_ref_positions is not None:
+            ego_positions = ego_ref_positions.reshape(
+                -1,
+                ego_ref_positions.shape[-2],
+                2,
+            )[flat_frontier]
+        else:
+            ego_positions = None
+        ego_ref_headings = packed.get('ego_ref_headings')
+        if ego_ref_headings is not None:
+            ego_headings = ego_ref_headings.reshape(
+                -1,
+                ego_ref_headings.shape[-1],
+            )[flat_frontier]
+        else:
+            ego_headings = None
+        ego_route_corridor = packed.get('ego_route_corridor')
+        if ego_route_corridor is not None:
+            ego_route = ego_route_corridor.reshape(
+                -1,
+                ego_route_corridor.shape[-2],
+                2,
+            )[flat_frontier]
+        else:
+            ego_route = None
+        guidance_target_spec = getattr(self, 'guidance_target_spec', 'ego_risk')
+        ego_metrics = self.trajectory_energy.ego_interaction_metrics(
+            candidate_positions,
+            ego_positions,
+            ego_headings=ego_headings,
+            ego_route_corridor=ego_route,
+            path_corridor_width=getattr(self, 'guidance_path_corridor_width', 2.0),
+            near_miss_distance=getattr(self, 'guidance_near_miss_distance', 2.0),
+            ttc_threshold=getattr(self, 'guidance_ttc_threshold', 3.0),
+            conflict_tta_threshold=getattr(self, 'guidance_conflict_tta_threshold', 1.0),
+            target_spec=guidance_target_spec,
+        )
         total_energy = (
             self.lane_distance_energy_weight * lane_distance
             + self.lane_heading_energy_weight * lane_heading
             + self.dynamics_energy_weight * dynamics
+            + self.commit_speed_energy_weight * commit_speed_energy
             + self.collision_energy_weight * collision
         )
-        selected_topk = self._select_topk_by_energy(
+        offroad = lane_distance > float(getattr(self, 'guidance_offroad_distance', 4.0))
+        hard_collision = criticality['hard_collision'] | ego_metrics['hard_collision']
+        invalid_energy = (
+            total_energy
+            + offroad.to(dtype=total_energy.dtype) * self.lane_distance_energy_weight
+            + hard_collision.to(dtype=total_energy.dtype)
+            * float(getattr(self, 'guidance_hard_collision_weight', 10.0))
+        )
+        edit_distance = self._candidate_edit_distance(
+            candidate_positions,
+            topk_ids,
+            flat_frontier,
+            seed_token_ids=seed_token_ids,
+            seed_trajs=seed_trajs,
+        )
+        risk_spec = str(guidance_target_spec or '').lower().replace('-', '_') in (
+            'ego_risk',
+            'risk',
+            'low_ttc',
+            'ttc',
+        )
+        target_event_reward = ego_metrics['target_event_reward']
+        if risk_spec:
+            target_event_reward = torch.zeros_like(target_event_reward)
+        guidance_terms = {
+            'safe_energy': total_energy,
+            'invalid_energy': invalid_energy,
+            'critical_reward': criticality['critical_reward'],
+            'ego_interaction_reward': ego_metrics['ego_interaction_reward'],
+            'ego_risk_reward': ego_metrics['ego_risk_reward'],
+            'target_event_reward': target_event_reward,
+            'edit_distance': edit_distance,
+        }
+        selected_topk = self._select_topk_by_guidance(
             topk_log_probabilities,
-            total_energy,
+            guidance_terms,
             t_value,
             frontier_chunk_ids=frontier_chunk_ids,
         )
@@ -785,11 +1495,89 @@ class SMARTCausalDiffusion(SMARTAutoregressiveDiffusion):
             -1,
             selected_ids.unsqueeze(-1),
         ).squeeze(-1)
+        selected_ego_ttc = ego_metrics['ego_min_ttc'][row, selected_topk]
+        selected_ego_ttc_for_min = torch.nan_to_num(
+            selected_ego_ttc,
+            nan=float('inf'),
+            posinf=float('inf'),
+            neginf=float('inf'),
+        )
+        finite_selected_ego_ttc = selected_ego_ttc_for_min[
+            torch.isfinite(selected_ego_ttc_for_min)
+        ]
+        if finite_selected_ego_ttc.numel() > 0:
+            ego_risk_min_ttc = finite_selected_ego_ttc.amin()
+        else:
+            ego_risk_min_ttc = torch.full_like(
+                selected_ego_ttc.sum(),
+                float('inf'),
+            )
         diagnostics = {
             'lane_distance': lane_distance[row, selected_topk].mean(),
             'lane_heading': lane_heading[row, selected_topk].mean(),
             'dynamics': dynamics[row, selected_topk].mean(),
+            'dynamics_energy': dynamics[row, selected_topk].mean(),
+            'commit_speed_energy': commit_speed_energy[row, selected_topk].mean(),
             'collision': collision[row, selected_topk].mean(),
+            'min_ttc': (
+                finite_selected_ego_ttc.mean()
+                if finite_selected_ego_ttc.numel() > 0
+                else torch.full_like(selected_ego_ttc.sum(), float('inf'))
+            ),
+            'ego_min_ttc': (
+                finite_selected_ego_ttc.mean()
+                if finite_selected_ego_ttc.numel() > 0
+                else torch.full_like(selected_ego_ttc.sum(), float('inf'))
+            ),
+            'ego_risk_min_ttc': ego_risk_min_ttc,
+            'ego_min_distance': ego_metrics['ego_min_distance'][
+                row,
+                selected_topk,
+            ].mean(),
+            'ego_required_decel': ego_metrics['ego_required_decel'][
+                row,
+                selected_topk,
+            ].mean(),
+            'ego_path_intrusion_rate': ego_metrics['ego_path_intrusion_rate'][
+                row,
+                selected_topk,
+            ].mean(),
+            'ego_conflict_tta_error': ego_metrics['ego_conflict_tta_error'][
+                row,
+                selected_topk,
+            ].mean(),
+            'ego_risk_reward': ego_metrics['ego_risk_reward'][
+                row,
+                selected_topk,
+            ].mean(),
+            'ego_risk_success_rate': ego_metrics['ego_risk_success'][
+                row,
+                selected_topk,
+            ].to(dtype=total_energy.dtype).mean(),
+            'near_miss_rate': ego_metrics['ego_near_miss_success'][
+                row,
+                selected_topk,
+            ].to(dtype=total_energy.dtype).mean(),
+            'ego_near_miss_success_rate': ego_metrics['ego_near_miss_success'][
+                row,
+                selected_topk,
+            ].to(dtype=total_energy.dtype).mean(),
+            'hard_collision_rate': hard_collision[
+                row,
+                selected_topk,
+            ].to(dtype=total_energy.dtype).mean(),
+            'offroad_rate': offroad[row, selected_topk].to(
+                dtype=total_energy.dtype,
+            ).mean(),
+            'edit_distance': edit_distance[row, selected_topk].mean(),
+            'target_success_rate': ego_metrics['target_event_success'][
+                row,
+                selected_topk,
+            ].to(dtype=total_energy.dtype).mean(),
+            'target_event_success_rate': ego_metrics['target_event_success'][
+                row,
+                selected_topk,
+            ].to(dtype=total_energy.dtype).mean(),
         }
         return selected_ids, selected_confidence, diagnostics
 
@@ -897,6 +1685,302 @@ class SMARTCausalDiffusion(SMARTAutoregressiveDiffusion):
                 end = start + self.ar_prediction_tokens
                 result[sequence_idx, start:end] = agent_values[agent_idx]
         return result
+
+    def _window_from_token_source(self, token_source, round_idx, fill_value=0):
+        num_agents = int(token_source.shape[0])
+        start = int(getattr(self, 'ar_history_tokens', 0)) + int(round_idx)
+        if token_source.shape[1] <= start:
+            start = int(round_idx)
+        end = start + int(self.ar_prediction_tokens)
+        window = torch.full(
+            (num_agents, int(self.ar_prediction_tokens)),
+            fill_value,
+            dtype=token_source.dtype,
+            device=token_source.device,
+        )
+        available = token_source[:, start:min(end, token_source.shape[1])]
+        if available.numel() > 0:
+            window[:, :available.shape[1]] = available
+        return window
+
+    def _window_from_seed_trajs(self, seed_trajs, round_idx):
+        num_agents = int(seed_trajs.shape[0])
+        if seed_trajs.dim() == 4:
+            start = int(getattr(self, 'ar_history_tokens', 0)) + int(round_idx)
+            if seed_trajs.shape[1] <= start:
+                start = int(round_idx)
+            end = start + int(self.ar_prediction_tokens)
+            window = seed_trajs.new_zeros(
+                num_agents,
+                int(self.ar_prediction_tokens),
+                int(self.ar_token_steps),
+                2,
+            )
+            available = seed_trajs[:, start:min(end, seed_trajs.shape[1])]
+            if available.numel() > 0:
+                step_count = min(int(self.ar_token_steps), int(available.shape[2]))
+                window[:, :available.shape[1], :step_count] = available[:, :, :step_count, :2]
+            return window
+        if seed_trajs.dim() != 3:
+            raise ValueError("seed_trajs must have shape [A,T,2] or [A,K,S,2].")
+        start = int(round_idx) * int(self.ar_token_steps)
+        frame_count = int(self.ar_prediction_tokens) * int(self.ar_token_steps)
+        end = start + frame_count
+        window_frames = seed_trajs.new_zeros(num_agents, frame_count, 2)
+        available = seed_trajs[:, start:min(end, seed_trajs.shape[1]), :2]
+        if available.numel() > 0:
+            window_frames[:, :available.shape[1]] = available
+        return window_frames.reshape(
+            num_agents,
+            int(self.ar_prediction_tokens),
+            int(self.ar_token_steps),
+            2,
+        )
+
+    def _window_from_seed_headings(self, seed_headings, round_idx):
+        num_agents = int(seed_headings.shape[0])
+        if seed_headings.dim() == 3:
+            start = int(getattr(self, 'ar_history_tokens', 0)) + int(round_idx)
+            if seed_headings.shape[1] <= start:
+                start = int(round_idx)
+            end = start + int(self.ar_prediction_tokens)
+            window = seed_headings.new_zeros(
+                num_agents,
+                int(self.ar_prediction_tokens),
+                int(self.ar_token_steps),
+            )
+            available = seed_headings[:, start:min(end, seed_headings.shape[1])]
+            if available.numel() > 0:
+                step_count = min(int(self.ar_token_steps), int(available.shape[2]))
+                window[:, :available.shape[1], :step_count] = available[:, :, :step_count]
+            return window
+        if seed_headings.dim() != 2:
+            raise ValueError("seed headings must have shape [A,T] or [A,K,S].")
+        start = int(round_idx) * int(self.ar_token_steps)
+        frame_count = int(self.ar_prediction_tokens) * int(self.ar_token_steps)
+        end = start + frame_count
+        window_frames = seed_headings.new_zeros(num_agents, frame_count)
+        available = seed_headings[:, start:min(end, seed_headings.shape[1])]
+        if available.numel() > 0:
+            window_frames[:, :available.shape[1]] = available
+        return window_frames.reshape(
+            num_agents,
+            int(self.ar_prediction_tokens),
+            int(self.ar_token_steps),
+        )
+
+    def _apply_guidance_seed_commit_overrides(
+        self,
+        data,
+        round_idx,
+        edit_window_mask,
+        commit_traj,
+        commit_head,
+        commit_valid_frames,
+        commit_token_pos,
+        commit_token_heading,
+        current_pos,
+        current_heading,
+    ):
+        if edit_window_mask is None or 'seed_trajs' not in data['agent']:
+            return (
+                commit_traj,
+                commit_head,
+                commit_valid_frames,
+                commit_token_pos,
+                commit_token_heading,
+                current_pos,
+                current_heading,
+            )
+        commit_tokens = int(getattr(self, 'ar_commit_tokens', 1))
+        locked = ~edit_window_mask[:, :commit_tokens].bool()
+        if not locked.any():
+            return (
+                commit_traj,
+                commit_head,
+                commit_valid_frames,
+                commit_token_pos,
+                commit_token_heading,
+                current_pos,
+                current_heading,
+            )
+        seed_window = self._window_from_seed_trajs(
+            data['agent']['seed_trajs'],
+            round_idx,
+        ).to(device=commit_traj.device, dtype=commit_traj.dtype)
+        seed_commit = seed_window[:, :commit_tokens].reshape(
+            commit_traj.shape[0],
+            commit_tokens * int(self.ar_token_steps),
+            2,
+        )
+        frame_locked = locked.unsqueeze(-1).expand(
+            -1,
+            -1,
+            int(self.ar_token_steps),
+        ).reshape(commit_traj.shape[0], -1)
+        commit_traj = torch.where(
+            frame_locked.unsqueeze(-1),
+            seed_commit,
+            commit_traj,
+        )
+        if 'seed_headings' in data['agent']:
+            seed_heading_window = self._window_from_seed_headings(
+                data['agent']['seed_headings'],
+                round_idx,
+            )
+        else:
+            future_start = int(self.num_historical_steps)
+            future_heading = data['agent']['heading'][:, future_start:]
+            seed_heading_window = self._window_from_seed_headings(
+                future_heading,
+                round_idx,
+            )
+        seed_heading_window = seed_heading_window.to(
+            device=commit_head.device,
+            dtype=commit_head.dtype,
+        )
+        seed_commit_head = seed_heading_window[:, :commit_tokens].reshape(
+            commit_head.shape[0],
+            commit_tokens * int(self.ar_token_steps),
+        )
+        commit_head = torch.where(
+            frame_locked,
+            seed_commit_head,
+            commit_head,
+        )
+        seed_valid = torch.ones_like(commit_valid_frames)
+        if 'valid_mask' in data['agent']:
+            future_start = int(self.num_historical_steps)
+            future_valid = data['agent']['valid_mask'][:, future_start:]
+            seed_valid_window = self._window_from_seed_headings(
+                future_valid.to(dtype=commit_valid_frames.dtype),
+                round_idx,
+            ).bool()
+            seed_valid = seed_valid_window[:, :commit_tokens].reshape_as(
+                commit_valid_frames,
+            ).to(device=commit_valid_frames.device)
+        commit_valid_frames = torch.where(
+            frame_locked,
+            seed_valid,
+            commit_valid_frames,
+        )
+        seed_token_pos = seed_window[:, :commit_tokens, -1]
+        commit_token_pos = torch.where(
+            locked.unsqueeze(-1),
+            seed_token_pos,
+            commit_token_pos,
+        )
+        seed_token_heading = seed_heading_window[:, :commit_tokens, -1]
+        commit_token_heading = torch.where(
+            locked,
+            seed_token_heading,
+            commit_token_heading,
+        )
+        latest_locked = locked[:, -1]
+        current_pos = torch.where(
+            latest_locked.unsqueeze(-1),
+            seed_token_pos[:, -1],
+            current_pos,
+        )
+        current_heading = torch.where(
+            latest_locked,
+            seed_token_heading[:, -1],
+            current_heading,
+        )
+        return (
+            commit_traj,
+            commit_head,
+            commit_valid_frames,
+            commit_token_pos,
+            commit_token_heading,
+            current_pos,
+            current_heading,
+        )
+
+    def _build_guidance_edit_controls(
+        self,
+        data,
+        round_idx,
+        future_valid,
+        generation_agents,
+    ):
+        agent = data['agent']
+        token_source = agent.get('seed_token_ids', agent['token_idx']).long()
+        seed_tokens = self._window_from_token_source(
+            token_source,
+            round_idx,
+            fill_value=0,
+        )
+        editable = future_valid.bool() & generation_agents[:, None].bool()
+        target_mask = self._guidance_target_agent_mask(
+            data,
+            generation_agents,
+        )
+        editable = editable & target_mask[:, None]
+        ego_mask = self._guidance_ego_agent_mask(
+            data,
+            generation_agents,
+        )
+        editable = editable & ~ego_mask[:, None]
+
+        target_time_window = getattr(self, 'guidance_target_time_window', None)
+        if target_time_window is not None:
+            start, end = target_time_window
+            chunk_ids = (
+                torch.arange(
+                    int(self.ar_prediction_tokens),
+                    device=future_valid.device,
+                )
+                + int(round_idx)
+            )
+            time_mask = (chunk_ids >= int(start)) & (chunk_ids < int(end))
+            editable = editable & time_mask.unsqueeze(0)
+
+        if 'edit_mask' in agent:
+            explicit = self._window_from_token_source(
+                agent['edit_mask'].bool(),
+                round_idx,
+                fill_value=False,
+            ).bool()
+            editable = editable & explicit
+        return seed_tokens, editable
+
+    def _guidance_target_agent_mask(self, data, fallback_mask):
+        target_agents = tuple(getattr(self, 'guidance_target_agents', ()))
+        if target_agents:
+            target_mask = torch.zeros_like(fallback_mask, dtype=torch.bool)
+            for agent_idx in target_agents:
+                if 0 <= int(agent_idx) < int(target_mask.shape[0]):
+                    target_mask[int(agent_idx)] = True
+            return target_mask
+        agent = data['agent']
+        if 'target_agents' in agent:
+            value = agent['target_agents']
+            if value.dtype == torch.bool and value.shape == fallback_mask.shape:
+                return value.to(device=fallback_mask.device, dtype=torch.bool)
+            target_mask = torch.zeros_like(fallback_mask, dtype=torch.bool)
+            for agent_idx in value.reshape(-1).tolist():
+                if 0 <= int(agent_idx) < int(target_mask.shape[0]):
+                    target_mask[int(agent_idx)] = True
+            return target_mask
+        return fallback_mask.bool()
+
+    def _guidance_ego_agent_mask(self, data, fallback_mask):
+        agent = data['agent']
+        if 'batch' in agent:
+            agent_batch = agent['batch']
+        else:
+            agent_batch = torch.zeros(
+                int(fallback_mask.shape[0]),
+                dtype=torch.long,
+                device=fallback_mask.device,
+            )
+        ego_indices = self._scene_ego_indices(data, agent_batch)
+        ego_mask = torch.zeros_like(fallback_mask, dtype=torch.bool)
+        for ego_idx in ego_indices.reshape(-1).tolist():
+            if 0 <= int(ego_idx) < int(ego_mask.shape[0]):
+                ego_mask[int(ego_idx)] = True
+        return ego_mask.to(device=fallback_mask.device) & fallback_mask.bool()
 
     def _select_closed_loop_anchor(self, data, rollout_depth):
         token_count = int(data['agent']['token_idx'].shape[1])
@@ -1338,23 +2422,41 @@ class SMARTCausalDiffusion(SMARTAutoregressiveDiffusion):
         return_trace=False,
         initial_proposal_token_ids=None,
         initial_proposal_confidence=None,
+        seed_token_ids=None,
+        seed_trajs=None,
+        editable_mask=None,
     ):
         batch_size, sequence_length = valid_mask.shape
         device = summary.device
-        sampled = torch.full(
-            (batch_size, sequence_length),
-            self.mask_token_id,
-            dtype=torch.long,
-            device=device,
-        )
         confidence = summary.new_zeros((batch_size, sequence_length))
+        if seed_token_ids is not None:
+            seed_token_ids = seed_token_ids.to(
+                device=device,
+                dtype=torch.long,
+            )
+            if seed_token_ids.shape != valid_mask.shape:
+                raise ValueError("seed_token_ids must match valid_mask shape.")
+            if editable_mask is None:
+                editable_mask = torch.zeros_like(valid_mask, dtype=torch.bool)
+            editable_mask = editable_mask.to(device=device, dtype=torch.bool) & valid_mask
+            sampled = seed_token_ids.clone().masked_fill(~valid_mask, 0)
+            sampled[editable_mask] = self.mask_token_id
+            confidence = confidence.masked_fill(valid_mask & ~editable_mask, 1.0)
+        else:
+            editable_mask = valid_mask
+            sampled = torch.full(
+                (batch_size, sequence_length),
+                self.mask_token_id,
+                dtype=torch.long,
+                device=device,
+            )
         trace = []
-        previous_reveal_count = 0
-        energy_totals = {
-            'lane_distance': summary.new_zeros(()),
-            'lane_heading': summary.new_zeros(()),
-            'dynamics': summary.new_zeros(()),
-            'collision': summary.new_zeros(()),
+        energy_totals = self._zero_guidance_diagnostics(summary)
+        energy_min_keys = {'ego_risk_min_ttc'}
+        energy_minimums = {
+            key: torch.full_like(summary.sum(), float('inf'))
+            for key in energy_min_keys
+            if key in energy_totals
         }
         energy_events = 0
 
@@ -1365,16 +2467,15 @@ class SMARTCausalDiffusion(SMARTAutoregressiveDiffusion):
                 self.num_future_chunks,
             )
             newly_revealed = 0
-            while previous_reveal_count < reveal_count:
-                mask = valid_mask & (sampled == self.mask_token_id)
-                frontier = self._prefix_frontier_mask(
-                    mask,
-                    valid_mask,
-                    token_agent_ids,
-                    chunk_ids,
-                )
-                if not frontier.any():
-                    break
+            mask = valid_mask & editable_mask & (sampled == self.mask_token_id)
+            prefix_frontier = self._prefix_frontier_mask(
+                mask,
+                valid_mask,
+                token_agent_ids,
+                chunk_ids,
+            )
+            frontier = prefix_frontier & (chunk_ids == step)
+            if frontier.any():
                 t_value = max(1.0 - step / self.diffusion_num_steps, self.min_t)
                 t_batch = torch.full(
                     (batch_size,),
@@ -1420,8 +2521,15 @@ class SMARTCausalDiffusion(SMARTAutoregressiveDiffusion):
                     dim=-1,
                 )
                 if (
-                    getattr(self, 'safety_energy_enabled', False)
+                    str(
+                        getattr(
+                            self,
+                            'guidance_mode',
+                            'safe' if getattr(self, 'safety_energy_enabled', False) else 'none',
+                        )
+                    ).lower() != 'none'
                     and packed is not None
+                    and 'valid_mask' in packed
                 ):
                     (
                         frontier_ids,
@@ -1434,9 +2542,25 @@ class SMARTCausalDiffusion(SMARTAutoregressiveDiffusion):
                         packed,
                         sampled,
                         t_value,
+                        seed_token_ids=seed_token_ids,
+                        seed_trajs=seed_trajs,
                     )
                     for key in energy_totals:
-                        energy_totals[key] += energy_diagnostics[key]
+                        if key in energy_minimums:
+                            value = torch.nan_to_num(
+                                energy_diagnostics[key],
+                                nan=float('inf'),
+                                posinf=float('inf'),
+                                neginf=float('inf'),
+                            )
+                            energy_minimums[key] = torch.minimum(
+                                energy_minimums[key],
+                                value,
+                            )
+                        else:
+                            energy_totals[key] = (
+                                energy_totals[key] + energy_diagnostics[key]
+                            )
                     energy_events += 1
                 else:
                     frontier_probabilities = probabilities[frontier].clamp_min(
@@ -1452,8 +2576,7 @@ class SMARTCausalDiffusion(SMARTAutoregressiveDiffusion):
                     ).squeeze(-1)
                 sampled[frontier] = frontier_ids
                 confidence[frontier] = frontier_confidence
-                newly_revealed += int(frontier.sum().item())
-                previous_reveal_count += 1
+                newly_revealed = int(frontier.sum().item())
 
             if return_trace:
                 remaining = valid_mask & (sampled == self.mask_token_id)
@@ -1465,7 +2588,7 @@ class SMARTCausalDiffusion(SMARTAutoregressiveDiffusion):
                     'remasked': 0,
                 })
 
-        remaining = valid_mask & (sampled == self.mask_token_id)
+        remaining = valid_mask & editable_mask & (sampled == self.mask_token_id)
         if remaining.any():
             raise RuntimeError("Causal diffusion sampling ended with masked valid tokens.")
         denominator = max(energy_events, 1)
@@ -1473,6 +2596,8 @@ class SMARTCausalDiffusion(SMARTAutoregressiveDiffusion):
             key: (value / denominator).detach()
             for key, value in energy_totals.items()
         }
+        for key, value in energy_minimums.items():
+            self._last_sampling_energy[key] = value.detach()
         if hasattr(self, '_sampling_energy_accumulator'):
             self._sampling_energy_accumulator.append(self._last_sampling_energy)
         sampled = sampled.masked_fill(~valid_mask, 0)
@@ -1488,21 +2613,37 @@ class SMARTCausalDiffusion(SMARTAutoregressiveDiffusion):
         if output is None:
             return None
         if self._sampling_energy_accumulator:
-            output['safety_energy'] = {
-                key: torch.stack([
+            guidance_metrics = {}
+            for key in self._sampling_energy_accumulator[0]:
+                values = torch.stack([
                     entry[key]
                     for entry in self._sampling_energy_accumulator
-                ]).mean()
-                for key in self._sampling_energy_accumulator[0]
-            }
+                ])
+                if key == 'ego_risk_min_ttc':
+                    values = torch.nan_to_num(
+                        values,
+                        nan=float('inf'),
+                        posinf=float('inf'),
+                        neginf=float('inf'),
+                    )
+                    finite_values = values[torch.isfinite(values)]
+                    if finite_values.numel() > 0:
+                        guidance_metrics[key] = finite_values.amin()
+                    else:
+                        guidance_metrics[key] = torch.full_like(
+                            values.sum(),
+                            float('inf'),
+                        )
+                else:
+                    guidance_metrics[key] = values.mean()
         else:
             zero = output['pred_traj'].sum() * 0.0
-            output['safety_energy'] = {
-                'lane_distance': zero,
-                'lane_heading': zero,
-                'dynamics': zero,
-                'collision': zero,
-            }
+            guidance_metrics = self._zero_guidance_diagnostics(zero)
+        output['guidance_metrics'] = guidance_metrics
+        output['safety_energy'] = {
+            key: guidance_metrics[key]
+            for key in ('lane_distance', 'lane_heading', 'dynamics', 'collision')
+        }
         return output
 
     @torch.no_grad()
@@ -1607,6 +2748,36 @@ class SMARTCausalDiffusion(SMARTAutoregressiveDiffusion):
                 on_epoch=True,
                 batch_size=1,
             )
+        guidance_metrics = pred_out.get('guidance_metrics', {})
+        for key in (
+            'min_ttc',
+            'ego_min_ttc',
+            'ego_risk_min_ttc',
+            'ego_min_distance',
+            'ego_required_decel',
+            'ego_path_intrusion_rate',
+            'ego_conflict_tta_error',
+            'ego_risk_reward',
+            'ego_risk_success_rate',
+            'ego_near_miss_success_rate',
+            'near_miss_rate',
+            'hard_collision_rate',
+            'offroad_rate',
+            'dynamics_energy',
+            'commit_speed_energy',
+            'edit_distance',
+            'target_success_rate',
+            'target_event_success_rate',
+        ):
+            if key in guidance_metrics:
+                self.log(
+                    f'val_{key}',
+                    guidance_metrics[key],
+                    prog_bar=False,
+                    on_step=False,
+                    on_epoch=True,
+                    batch_size=1,
+                )
         coverage = pred_out['pred_valid_mask'][eval_mask].float().mean()
         invalid_rate = self._validation_retokenization_invalid_rate(
             data,
@@ -1628,6 +2799,38 @@ class SMARTCausalDiffusion(SMARTAutoregressiveDiffusion):
             on_epoch=True,
             batch_size=1,
         )
+        if str(getattr(self, 'guidance_mode', 'safe')).lower() in (
+            'ego_stress',
+            'ego_edit',
+        ):
+            target_mask = self._guidance_target_agent_mask(
+                data,
+                eval_mask,
+            ).to(device=eval_mask.device)
+            non_target = eval_mask & ~target_mask
+            if non_target.any():
+                non_target_valid = eval_valid[non_target]
+                if non_target_valid.any():
+                    non_target_distance = torch.norm(
+                        pred_out['pred_traj'][non_target]
+                        - pred_out['gt'][non_target],
+                        dim=-1,
+                    )
+                    non_target_preservation_ade = (
+                        non_target_distance[non_target_valid].mean()
+                    )
+                else:
+                    non_target_preservation_ade = prediction.sum() * 0.0
+            else:
+                non_target_preservation_ade = prediction.sum() * 0.0
+            self.log(
+                'val_non_target_preservation_ADE',
+                non_target_preservation_ade,
+                prog_bar=False,
+                on_step=False,
+                on_epoch=True,
+                batch_size=1,
+            )
         rollout_score = self._rollout_score(
             ade_8s=horizon_metrics[8][0],
             late_ade=late_ade,

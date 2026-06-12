@@ -49,6 +49,195 @@ class TrajectoryEnergyTest(unittest.TestCase):
 
         self.assertGreater(float(collision[0, 0]), float(collision[0, 1]))
 
+    def test_criticality_rewards_near_miss_without_counting_collision_success(self):
+        energy = TrajectoryEnergy(dt=0.1, collision_distance=1.0)
+        near_miss = torch.tensor([
+            [0.0, 1.2],
+            [0.5, 1.2],
+            [1.0, 1.2],
+            [1.5, 1.2],
+        ])
+        hard_collision = torch.tensor([
+            [0.0, 0.2],
+            [0.5, 0.2],
+            [1.0, 0.2],
+            [1.5, 0.2],
+        ])
+        far_safe = torch.tensor([
+            [0.0, 5.0],
+            [0.5, 5.0],
+            [1.0, 5.0],
+            [1.5, 5.0],
+        ])
+        candidates = torch.stack([near_miss, hard_collision, far_safe]).view(1, 3, 4, 2)
+        other = torch.stack([
+            torch.tensor([0.5, 0.0]),
+            torch.tensor([0.8, 0.0]),
+            torch.tensor([1.1, 0.0]),
+            torch.tensor([1.4, 0.0]),
+        ]).view(1, 4, 2)
+
+        metrics = energy.criticality_metrics(
+            candidates,
+            other,
+            near_miss_distance=2.0,
+            ttc_threshold=3.0,
+        )
+
+        self.assertGreater(
+            float(metrics['critical_reward'][0, 0]),
+            float(metrics['critical_reward'][0, 2]),
+        )
+        self.assertEqual(float(metrics['critical_reward'][0, 1]), 0.0)
+        self.assertFalse(bool(metrics['hard_collision'][0, 0]))
+        self.assertTrue(bool(metrics['hard_collision'][0, 1]))
+
+    def test_criticality_supports_multiple_reference_agents(self):
+        energy = TrajectoryEnergy(dt=0.1, collision_distance=1.0)
+        candidate = torch.tensor([[
+            [[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]],
+        ]])
+        references = torch.tensor([
+            [[10.0, 0.0], [10.0, 0.0], [10.0, 0.0]],
+            [[4.0, 1.2], [3.0, 1.2], [2.0, 1.2]],
+        ])
+
+        metrics = energy.criticality_metrics(
+            candidate,
+            references,
+            near_miss_distance=1.5,
+            ttc_threshold=3.0,
+        )
+
+        self.assertTrue(bool(metrics['near_miss'][0, 0]))
+        self.assertFalse(bool(metrics['hard_collision'][0, 0]))
+
+    def test_ego_interaction_rewards_target_intruding_ego_path_corridor(self):
+        energy = TrajectoryEnergy(dt=1.0, collision_distance=0.5)
+        ego = torch.tensor([
+            [0.0, 0.0],
+            [2.0, 0.0],
+            [4.0, 0.0],
+            [6.0, 0.0],
+        ])
+        intrusive = torch.tensor([
+            [1.0, 1.8],
+            [2.0, 0.8],
+            [3.0, 0.2],
+            [4.0, 0.2],
+        ])
+        far = torch.tensor([
+            [1.0, 5.0],
+            [2.0, 5.0],
+            [3.0, 5.0],
+            [4.0, 5.0],
+        ])
+        candidates = torch.stack([intrusive, far]).view(1, 2, 4, 2)
+
+        metrics = energy.ego_interaction_metrics(
+            candidates,
+            ego,
+            path_corridor_width=1.0,
+            near_miss_distance=2.0,
+            ttc_threshold=5.0,
+            target_spec='cut_in',
+        )
+
+        self.assertGreater(
+            float(metrics['ego_path_intrusion_rate'][0, 0]),
+            float(metrics['ego_path_intrusion_rate'][0, 1]),
+        )
+        self.assertLess(
+            float(metrics['ego_route_lateral_distance'][0, 0]),
+            float(metrics['ego_route_lateral_distance'][0, 1]),
+        )
+        self.assertGreater(
+            float(metrics['ego_interaction_reward'][0, 0]),
+            float(metrics['ego_interaction_reward'][0, 1]),
+        )
+        self.assertTrue(bool(metrics['target_event_success'][0, 0]))
+
+    def test_ego_risk_rewards_low_ttc_without_predefined_event(self):
+        energy = TrajectoryEnergy(dt=1.0, collision_distance=0.5)
+        ego = torch.tensor([
+            [0.0, 0.0],
+            [2.0, 0.0],
+            [4.0, 0.0],
+            [6.0, 0.0],
+        ])
+        closing = torch.tensor([
+            [10.0, 0.0],
+            [8.0, 0.0],
+            [6.0, 0.0],
+            [4.0, 0.0],
+        ])
+        distant = torch.tensor([
+            [20.0, 8.0],
+            [21.0, 8.0],
+            [22.0, 8.0],
+            [23.0, 8.0],
+        ])
+        candidates = torch.stack([closing, distant]).view(1, 2, 4, 2)
+
+        metrics = energy.ego_interaction_metrics(
+            candidates,
+            ego,
+            path_corridor_width=2.0,
+            near_miss_distance=8.0,
+            ttc_threshold=3.0,
+            conflict_tta_threshold=2.0,
+            target_spec='ego_risk',
+        )
+
+        self.assertIn('ego_risk_reward', metrics)
+        self.assertIn('ego_risk_success', metrics)
+        self.assertGreater(
+            float(metrics['ego_risk_reward'][0, 0]),
+            float(metrics['ego_risk_reward'][0, 1]),
+        )
+        self.assertTrue(bool(metrics['ego_risk_success'][0, 0]))
+        self.assertFalse(bool(metrics['ego_risk_success'][0, 1]))
+        self.assertTrue(bool(metrics['target_event_success'][0, 0]))
+        self.assertGreater(float(metrics['target_event_reward'][0, 0]), 0.0)
+
+    def test_ego_interaction_rewards_lead_hard_brake_event(self):
+        energy = TrajectoryEnergy(dt=1.0, collision_distance=0.5)
+        ego = torch.tensor([
+            [0.0, 0.0],
+            [2.0, 0.0],
+            [4.0, 0.0],
+            [6.0, 0.0],
+        ])
+        hard_brake = torch.tensor([
+            [5.0, 0.0],
+            [6.5, 0.0],
+            [7.0, 0.0],
+            [7.1, 0.0],
+        ])
+        cruising_lead = torch.tensor([
+            [5.0, 2.5],
+            [7.0, 2.5],
+            [9.0, 2.5],
+            [11.0, 2.5],
+        ])
+        candidates = torch.stack([hard_brake, cruising_lead]).view(1, 2, 4, 2)
+
+        metrics = energy.ego_interaction_metrics(
+            candidates,
+            ego,
+            path_corridor_width=1.0,
+            near_miss_distance=3.0,
+            ttc_threshold=5.0,
+            target_spec='lead_hard_brake',
+        )
+
+        self.assertGreater(
+            float(metrics['ego_required_decel'][0, 0]),
+            float(metrics['ego_required_decel'][0, 1]),
+        )
+        self.assertTrue(bool(metrics['target_event_success'][0, 0]))
+        self.assertFalse(bool(metrics['target_event_success'][0, 1]))
+
 
 if __name__ == '__main__':
     unittest.main()

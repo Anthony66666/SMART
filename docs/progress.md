@@ -1,5 +1,93 @@
 # Progress
 
+## 2026-06-12 CST
+- Task: Fixed three causal diffusion review issues in sampler and guidance metrics.
+- Result: Seed-locked ego/edit sampling now preserves global chunk timestep semantics, so editable later chunks decode at their own causal frontier `t`; no-finite ego TTC diagnostics now remain infinite instead of becoming zero; smoke and visualization token-change rates now divide by valid token count only.
+- Evidence: Added regression coverage for seed-locked chunk-2 timestep, direct and sampled infinite `ego_risk_min_ttc`, and valid-token edit-rate denominator. `tests.test_smart_causal_diffusion`, `tests.test_trajectory_energy`, `tests.test_causal_guidance_smoke`, and `tests.test_visualize_causal_guidance_modes` pass 77 tests; touched files pass `py_compile` and `git diff --check`.
+- Note: Existing smoke/visual outputs that compare `ego_risk_min_ttc` or `token_change_rate_vs_gt` should be regenerated before drawing conclusions.
+
+## 2026-06-12 CST
+- Task: Implemented a hybrid SMART-style commit speed constraint for causal diffusion.
+- Result: `smart_causal_diffusion` now keeps diffusion tail proposals for editing but reranks executable chunk-0 candidates with a speed-reference energy. The reference starts from observed history speed and decays through the AR loop, so a slowed generated history cannot immediately erase the speed floor.
+- Evidence: Added unit coverage for static-token penalty, token-internal speed instead of endpoint-only speed, and reference-speed use after history slowdown. `tests.test_smart_causal_diffusion` passes 39 tests; `py_compile` and `git diff --check` pass. On all 11 `data/valid_demo` scenes with `/mnt/d/causal_v2_epoch=02.ckpt`, `safe` improved versus the endpoint-only attempt: ADE `2.6516 -> 2.5450`, FDE `5.8995 -> 5.5614`, pred speed `0.7893 -> 0.8537`, moving speed ratio p10 `0.0316 -> 0.0839`, and p50 `0.4498 -> 0.4921`.
+- Note: The improvement is measurable but not a full fix; `safe` is still slower than `none` (`pred_speed 0.8537` vs `0.9505`) and offroad/hard-collision guidance metrics are effectively unchanged on this smoke.
+
+## 2026-06-12 CST
+- Task: Fixed causal guidance smoke FDE and added speed-collapse diagnostics.
+- Result: `scripts/smoke_causal_guidance_modes.py` now computes FDE from the last actual valid frame instead of `valid.sum()-1`, preventing invalid gaps with zero GT coordinates from inflating FDE. The smoke records `pred_speed`, `gt_speed`, moving-frame speed ratios, and moving-pair counts for checkpoint comparisons.
+- Evidence: Added regression tests for non-contiguous valid masks and moving speed ratios in `tests/test_causal_guidance_smoke.py`. On Waymo validation scene 72 with `/mnt/d/causal_v2_epoch=02.ckpt`, fixed `safe` FDE is `12.95m` instead of the earlier invalid-gap artifact near `684m`; `safe` moving speed ratio median is `0.0355`, confirming severe low-speed collapse.
+- Note: The checkpoint metadata says epoch 1 was best (`val_rollout_score=22.7363`), but the referenced causal v2 epoch-1 path is server-local and not available in this workspace. Local `/mnt/d/90113f8*epoch=01.ckpt` files are AR diffusion, not causal v2.
+
+## 2026-06-11 CST
+- Task: Screened real Waymo validation scenes for visually clear generic ego-risk edits.
+- Result: Ran ego-risk numeric sweeps over the first 100 scenes from `/home/anthony/SimAgentJEPA/data/waymo/validation` in two 50-scene chunks, merged the results, and ranked candidates by clean invalidity, ego-risk success, near-miss success, risk reward, distance, edit size, and dynamics energy.
+- Outputs: Combined records are in `outputs/causal_ego_risk_waymo_val_sweep_chunks/records_000_099.csv`; ranked candidates are in `outputs/causal_ego_risk_waymo_val_sweep_chunks/ranked_candidates_000_099.csv`; visual comparisons are in `outputs/causal_ego_risk_waymo_val_visual_top6/` and `outputs/causal_ego_risk_waymo_val_visual_top4_extra/`.
+- Finding: The best visual candidates so far are scene indices 72, 87, 31, 17, 41, and 33. Scene 20 was the strongest numeric candidate but not visually obvious enough for a main figure.
+- Documentation: Added `docs/ego_risk_waymo_validation_candidates.md` with figure paths, metric snapshots, and rejected high-metric examples.
+
+## 2026-06-11 CST
+- Task: Replaced predefined cut-in guidance with generic ego-risk scene editing.
+- Result: `smart_causal_diffusion` now defaults to `target_spec: ego_risk` for `ego_stress` and `ego_edit`. Guidance scores use `ego_risk_reward` instead of a predefined target-event score, and diagnostics/logging include `ego_risk_min_ttc`, `ego_risk_reward`, and `ego_risk_success_rate`. Cut-in and lead-hard-brake remain as legacy ablation target specs.
+- Scripts: `scripts/smoke_causal_guidance_modes.py` and `scripts/visualize_causal_guidance_modes.py` default to `ego_risk`; Pareto criticality no longer depends on target-event success, and the visualization no longer draws a cut-in corridor-entry marker unless a legacy cut-in spec is explicitly requested.
+- Evidence: A generic ego-risk smoke over all 11 `data/valid_demo` scenes wrote `outputs/causal_ego_risk_guidance/smoke_metrics.json`. A visual ego-risk comparison for scene index 10 wrote `outputs/causal_ego_risk_guidance_visual/idx_00010_1ce0b4bbd35a6ad1_guidance_modes.png` and records nonzero `guidance_ego_risk_success_rate` with zero hard-collision/offroad in the selected ego modes.
+- Validation: 67 focused tests passed; `py_compile` passed for the touched Python files; `git diff --check` passed; the generated ego-risk comparison PNG verifies as RGBA `3720x930`.
+- Next: Treat this as a smoke artifact, not paper-scale evidence. Sweep more scenes and improve target-agent/window selection around ego interactions before choosing final AAAI figures.
+
+## 2026-06-11 CST
+- Task: Improved ego-centric cut-in visualization for causal guidance.
+- Result: `scripts/visualize_causal_guidance_modes.py` now explicitly draws the ego/SDC current marker, ego history/future, ego corridor band, controlled target marker, controlled target future markers, target-ego closest relation, and first ego-corridor entry marker. Plot extents now include both ego and controlled target paths.
+- Evidence: Added focused visualization helper tests and regenerated marked cut-in comparisons. The clearer visual artifact is `outputs/causal_ego_guidance_cut_in_scene9_agent4_marked/idx_00009_1d3daf744e65dd7c_guidance_modes.png`; ego modes have nonzero target-event success (`0.0208`) with zero hard collision/offroad. The older scene-3 artifact remains stronger numerically (`0.1146`) but uses a visually static default target.
+- Next: For paper figures, prefer geometry-visible target/window choices like scene 9 agent 4 over the default target selector, and continue scanning beyond the 11 demo scenes for stronger visible cut-in cases.
+
+## 2026-06-11 CST
+- Task: Replaced global stress/edit guidance with ego-centric interaction guidance.
+- Result: `smart_causal_diffusion` now supports `guidance.mode = none | safe | ego_stress | ego_edit`, packs ego/SDC reference trajectory, heading, and optional route corridor into candidate-token reranking, scores ego modes with ego interaction reward plus target-event reward minus invalid/edit penalties, and logs ego-only metrics including ego min distance/TTC, required decel, path intrusion, conflict TTA error, target-event success, hard collision, offroad, dynamics, and edit distance.
+- Controls: Ego and non-target agents are seed-locked by default for ego modes at both token and committed raw-trajectory levels; only target agents inside the configured target token window remain editable. The smoke target selector now excludes `av_index`/`ego_agent_id` by default.
+- Scripts: `scripts/smoke_causal_guidance_modes.py` and `scripts/visualize_causal_guidance_modes.py` default to `seed,none,safe,ego_stress,ego_edit`, expose runtime overrides for target spec and guidance weights, and use ego near-miss plus target-event success as Pareto criticality.
+- Evidence: 58 focused tests passed; `py_compile` and `git diff --check` passed. CUDA sweeps over all 11 `data/valid_demo` scenes loaded the checkpoint with `missing=0`, `unexpected=0`.
+- Finding: A cut-in sweep found a successful ego-centric counterfactual on demo scene index 3 (`target_event_success_rate=0.1146`, `non_target_preservation_ADE=0`, `token_change_rate_vs_gt=0.0051`) and wrote a visual comparison under `outputs/causal_ego_guidance_cut_in_success/`. A lead-hard-brake sweep did not trigger target-event success on the 11 demo scenes.
+
+## 2026-06-11 CST
+- Task: Added causal guidance visual comparison examples.
+- Result: Added `scripts/visualize_causal_guidance_modes.py`, which reruns selected scenes for `seed`, `none`, `safe`, `stress`, and `edit`, plots one multi-panel PNG per scene, and writes `manifest.json`, `records.csv`, `summary.csv`, and `summary.json`.
+- Evidence: Generated three checkpoint examples for demo scene indices `[0, 1, 2]` under `outputs/causal_guidance_visual_examples/`. Each PNG is valid RGBA image data at `3720x930`; the manifest records checkpoint load with `missing=0` and `unexpected=0`.
+- Validation: `tests.test_visualize_causal_guidance_modes` passes 8 tests, the combined script test set passes 15 tests, and `py_compile` passes for the new script and tests.
+- Finding: The visual examples match the scalar sweep finding: `edit` stays close to the seed/GT with very small edit distance, while `stress`/`safe` change more trajectory tokens but still show zero near-miss success on these three demo scenes.
+- Next: Inspect the three PNGs, then run broader scene/window/alpha sweeps and regenerate visuals for cases with nonzero criticality.
+
+## 2026-06-11 CST
+- Task: Extended the causal guidance smoke into a multi-scene Pareto sweep.
+- Result: `scripts/smoke_causal_guidance_modes.py` now supports `--indices` and `--num-scenes`, writes per-record CSV, per-mode summary CSV, JSON summaries, and generation-mode Pareto candidates while keeping `seed` as a baseline rather than a Pareto candidate.
+- Metrics: The sweep records ADE/FDE, token change rate, `min_ttc`, `near_miss_rate`, `hard_collision_rate`, `offroad_rate`, `dynamics_energy`, `edit_distance`, `non_target_preservation_ADE`, and `target_success_rate`.
+- Evidence: A CUDA sweep over demo scene indices `[0, 1, 2]` with `checkpoints/causal_diffusion/epoch=00.ckpt` completed 15 runs (`seed`, `none`, `safe`, `stress`, `edit` per scene) and wrote `outputs/causal_guidance_sweep/metrics.json`, `records.csv`, and `summary.csv`.
+- Finding: On these three demo scenes, the current checkpoint did not produce collision-free near-miss successes (`near_miss_rate=0` and `target_success_rate=0` for all modes); `edit` dominates the generation-mode Pareto set because it stays closest to the GT seed with zero invalidity under the tested target window.
+- Next: Sweep more scenes and target windows, then visualize selected stress/edit cases to inspect whether stronger `stress_alpha` or broader edit windows can create valid critical interactions.
+
+## 2026-06-11 CST
+- Task: Added and ran a checkpoint smoke for causal guidance modes.
+- Result: Added `scripts/smoke_causal_guidance_modes.py` to compare `seed`, `none`, `safe`, `stress`, and `edit` on the same demo scene/checkpoint. The script attaches GT seed tokens/trajectories for edit mode, selects a target agent, supports a target token window, and writes JSON metrics.
+- Fixes: Real smoke exposed two guidance bugs: seed trajectory packing did not support extra `[token_steps, 2]` dimensions, and guidance diagnostics aliased the same zero tensor across metric keys. A third semantic issue made criticality compare candidates against the same agent's nominal trajectory; criticality now uses same-scene other-agent nominal trajectories and excludes self-agent references.
+- Evidence: `python scripts/smoke_causal_guidance_modes.py --config configs/train/train_scalable_causal_diffusion_local.yaml --ckpt checkpoints/causal_diffusion/epoch=00.ckpt --raw-dir data/valid_demo --index 0 --output outputs/causal_guidance_smoke/metrics.json` completed on CUDA with zero missing/unexpected checkpoint keys. The final JSON includes all five modes for scenario `1c83f56236e33b4`.
+- Validation: `tests.test_trajectory_energy` and `tests.test_smart_causal_diffusion` pass 34 tests; `py_compile` and `git diff --check` pass for touched code and smoke script.
+- Next: Run the smoke over multiple scenes and target windows, then aggregate realism-criticality-minimality Pareto tables and visualizations.
+
+## 2026-06-11 CST
+- Task: Added first-pass inference-time guidance modes for `smart_causal_diffusion`.
+- Result: Implemented `guidance.mode = none | safe | stress | edit`, mode-specific top-k config, stress/edit scoring with collision-free near-miss/low-TTC criticality reward, invalid trajectory penalties, edit-distance penalties, seed-token locking through `editable_mask`, target-agent/time-window edit controls, optional `seed_trajs` edit distance, and validation logging for guidance metrics.
+- Files: `smart/model/smart_causal_diffusion.py`, `smart/model/smart_ar_diffusion.py`, `smart/modules/trajectory_energy.py`, causal configs, and focused causal/energy tests.
+- Validation: `tests.test_trajectory_energy` and `tests.test_smart_causal_diffusion` pass 30 tests; `py_compile` passes for touched Python files.
+- Next: Run a checkpoint inference smoke for `none`, `safe`, `stress`, and `edit` on identical scenes, then inspect the realism-criticality-minimality Pareto metrics and visualizations.
+
+## 2026-06-11 CST
+- Task: Saved an AAAI-style Chinese Method draft for causal diffusion.
+- Result: Added `docs/aaai_causal_diffusion_method_zh.md` explaining Causal SMART-Token Diffusion in paper-style sections: overview, token representation, causal decoder, discrete frontier objective, closed-loop retokenization, receding-horizon sampling, safety reranking, and validation.
+- Next: Use this as the Chinese architecture draft before converting the method section into final English AAAI prose.
+
+## 2026-06-11 CST
+- Task: Wrote a current Chinese architecture/function overview for `smart_causal_diffusion`.
+- Result: Added `docs/smart_causal_diffusion_overview.md` covering the implementation structure, inheritance, input packing, causal decoder, discrete frontier v2 loss, closed-loop training curriculum, retokenization, sampling, proposal carry, safety-energy reranking, validation metrics, configs, and current limitations.
+- Next: Use this overview with `docs/train_scalable_causal_diffusion_config.md` when launching or debugging causal v2 training.
+
 ## 2026-06-11 CST
 - Task: Implemented causal diffusion v2 as a revisable four-token receding-horizon planner.
 - Result: Replaced continuous-time weighted suffix loss with uniform discrete frontier CE; enabled tail proposal carry and confidence-weighted proposal embeddings; added recency/current-motion context and all-mask chunk-0 interaction sources; made commit safety active at the first sampling step; and extended dynamics energy across the observed-to-candidate transition.

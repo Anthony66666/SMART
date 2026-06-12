@@ -8,7 +8,7 @@ time_info: &time_info
 Dataset:
   root:
   train_batch_size: 4
-  val_batch_size: 4
+  val_batch_size: 1
   test_batch_size: 1
   shuffle: True
   num_workers: 4
@@ -44,14 +44,13 @@ Visualization:
   enabled: true
   interval_epochs: 1
   sample_indices: [0, 1, 2, 3]
-  output_dir: "./outputs/val_visualizations"
+  output_dir: "./outputs/val_visualizations_90113f8_v2"
   max_agents: 0
   step_viz:
     enabled: true
     interval_steps: 2000
     sample_indices: [110, 111, 112, 113]
-    output_dir: "./outputs/step_visualizations"
-
+    output_dir: "./outputs/step_visualizations_90113f8_v2"
 
 Model:
   mode: "train"
@@ -68,7 +67,7 @@ Model:
   num_freq_bands: 64
   lr: 0.0005
   warmup_steps: 0
-  total_steps: 60000
+  total_steps: 32
   inference_token: True
   rollout_num: 1
   decoder:
@@ -78,16 +77,22 @@ Model:
     a2a_radius: 60
     pl2pl_radius: 10
     pl2a_radius: 30
+    # pl2a_radius: 60
     time_span: 30
   diffusion:
     future_chunk_steps: 5
     history_tokens: 2
-    prediction_tokens: 4
+    prediction_tokens: 6
     commit_tokens: 1
     carry_tail_proposal: true
-    causal_noise_schedule: false
-    causal_chunk_mask_multipliers: [0.70, 0.90, 1.10, 1.30]
-    causal_loss_weights: [1.0, 1.0, 0.75, 0.5]
+    # causal_noise_schedule: true
+    # # causal_chunk_mask_multipliers: [0.70, 0.90, 1.10, 1.30]
+    # causal_chunk_mask_multipliers: [1, 1, 1, 1,1,1]
+    # # causal_loss_weights: [1.0, 1.0, 1.0, 1.0,1.0,1.0]
+    # causal_loss_weights: [3.0, 1.0, 0.5, 0.25, 0.20, 0.15]
+    causal_noise_schedule: true
+    causal_chunk_mask_multipliers: [0.80, 0.90, 1.00, 1.10, 1.20, 1.30]
+    causal_loss_weights: [1.5, 1.25, 1.0, 0.9, 0.8, 0.7]
     token_steps: 5
     total_rollout_steps: 80
     local_map_refresh: rescreen
@@ -105,7 +110,7 @@ Model:
     use_map_context: true
     max_map_tokens: 0  # 0 disables scene-level truncation and follows SMART radius map-agent selection.
     geometry_dropout_prob: 0.25
-    visible_token_corruption_prob: 0.15
+    visible_token_corruption_prob: 0
     visible_token_corruption_topk: 5
     target_category_only: true
     agent_selection_mode: smart_inference
@@ -119,7 +124,7 @@ Model:
     prefix_constrained_sampling: false
     prefix_constrained_training: false
     use_proposal_geometry: true
-    geometry_confidence_source_threshold: 0.35
-    self_condition_prob: 1.0
+    geometry_confidence_source_threshold: 0.2
+    self_condition_prob: 0.75
     self_condition_mode: "argmax"
     freeze_encoder: false

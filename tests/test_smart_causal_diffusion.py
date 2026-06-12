@@ -360,6 +360,824 @@ class CausalFrontierPlannerTest(unittest.TestCase):
         self.assertAlmostEqual(float(without_observation), 0.0, places=5)
         self.assertGreater(float(with_observation), 1000.0)
 
+    def test_commit_speed_energy_penalizes_static_token_for_moving_agent(self):
+        model = _causal_shell()
+        model.ar_token_steps = 5
+        model.commit_min_speed_ratio = 0.5
+        model.commit_speed_threshold = 1.0
+        object.__setattr__(model, 'trajectory_energy', TrajectoryEnergy(dt=0.1))
+
+        anchor_positions = torch.zeros(2, 2)
+        current_velocities = torch.tensor([
+            [10.0, 0.0],
+            [10.0, 0.0],
+        ])
+        candidate_positions = torch.tensor([
+            [
+                [[0.1, 0.0], [0.1, 0.0], [0.1, 0.0], [0.1, 0.0], [0.1, 0.0]],
+                [[1.0, 0.0], [2.0, 0.0], [3.0, 0.0], [4.0, 0.0], [5.0, 0.0]],
+            ],
+            [
+                [[0.1, 0.0], [0.1, 0.0], [0.1, 0.0], [0.1, 0.0], [0.1, 0.0]],
+                [[1.0, 0.0], [2.0, 0.0], [3.0, 0.0], [4.0, 0.0], [5.0, 0.0]],
+            ],
+        ])
+
+        energy = model._commit_speed_energy(
+            candidate_positions,
+            anchor_positions,
+            current_velocities,
+            frontier_chunk_ids=torch.tensor([0, 1]),
+        )
+
+        self.assertGreater(float(energy[0, 0]), float(energy[0, 1]) + 1.0)
+        self.assertAlmostEqual(float(energy[0, 1]), 0.0, places=5)
+        self.assertTrue(torch.equal(energy[1], torch.zeros(2)))
+
+    def test_commit_speed_energy_uses_within_token_speed_not_only_endpoint(self):
+        model = _causal_shell()
+        model.ar_token_steps = 5
+        model.commit_min_speed_ratio = 0.5
+        model.commit_speed_threshold = 1.0
+        object.__setattr__(model, 'trajectory_energy', TrajectoryEnergy(dt=0.1))
+
+        anchor_positions = torch.zeros(1, 2)
+        current_velocities = torch.tensor([[10.0, 0.0]])
+        candidate_positions = torch.tensor([[
+            [[0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [5.0, 0.0]],
+            [[1.0, 0.0], [2.0, 0.0], [3.0, 0.0], [4.0, 0.0], [5.0, 0.0]],
+        ]])
+
+        energy = model._commit_speed_energy(
+            candidate_positions,
+            anchor_positions,
+            current_velocities,
+            frontier_chunk_ids=torch.tensor([0]),
+        )
+
+        self.assertGreater(float(energy[0, 0]), float(energy[0, 1]) + 1.0)
+        self.assertAlmostEqual(float(energy[0, 1]), 0.0, places=5)
+
+    def test_commit_speed_energy_uses_reference_speed_after_history_slows(self):
+        model = _causal_shell()
+        model.ar_token_steps = 5
+        model.commit_min_speed_ratio = 0.5
+        model.commit_speed_threshold = 1.0
+        object.__setattr__(model, 'trajectory_energy', TrajectoryEnergy(dt=0.1))
+
+        candidate_positions = torch.tensor([[
+            [[0.1, 0.0], [0.1, 0.0], [0.1, 0.0], [0.1, 0.0], [0.1, 0.0]],
+            [[1.0, 0.0], [2.0, 0.0], [3.0, 0.0], [4.0, 0.0], [5.0, 0.0]],
+        ]])
+
+        energy = model._commit_speed_energy(
+            candidate_positions,
+            anchor_positions=torch.zeros(1, 2),
+            current_velocities=torch.tensor([[0.2, 0.0]]),
+            frontier_chunk_ids=torch.tensor([0]),
+            reference_speeds=torch.tensor([10.0]),
+        )
+
+        self.assertGreater(float(energy[0, 0]), float(energy[0, 1]) + 1.0)
+        self.assertAlmostEqual(float(energy[0, 1]), 0.0, places=5)
+
+    def test_safe_guidance_prefers_moving_commit_over_static_high_prob_token(self):
+        model = _causal_shell()
+        model.ar_token_steps = 5
+        model.diffusion_decoder = SimpleNamespace(mask_token_id=8)
+        model.guidance_mode = 'safe'
+        model.guidance_safe_topk = 2
+        model.safety_topk = 2
+        model.safety_energy_weight = 1.0
+        model.commit_safety_weight = 1.0
+        model.lane_distance_energy_weight = 0.0
+        model.lane_heading_energy_weight = 0.0
+        model.dynamics_energy_weight = 0.0
+        model.commit_speed_energy_weight = 1.0
+        model.collision_energy_weight = 0.0
+        model.commit_min_speed_ratio = 0.5
+        model.commit_speed_threshold = 1.0
+        object.__setattr__(model, 'trajectory_energy', TrajectoryEnergy(dt=0.1))
+
+        def fake_refresh(self, token_ids, packed, **_kwargs):
+            return (
+                packed['token_positions'],
+                packed['token_headings'],
+                torch.ones_like(token_ids, dtype=torch.float),
+            )
+
+        def fake_token_world(self, token_ids, agent_types, positions, headings):
+            del agent_types, headings
+            steps = torch.arange(
+                1,
+                6,
+                device=positions.device,
+                dtype=positions.dtype,
+            )
+            world = positions[:, None, :].expand(-1, 5, -1).clone()
+            moving = token_ids == 3
+            world[moving, :, 0] += steps
+            world[~moving, :, 0] += 0.1
+            return world, torch.zeros(token_ids.shape[0], 5, device=positions.device)
+
+        model._refresh_token_geometry = MethodType(fake_refresh, model)
+        model._token_chunk_world = MethodType(fake_token_world, model)
+        logits = torch.full((1, 1, 8), -20.0)
+        logits[0, 0, 2] = 4.0
+        logits[0, 0, 3] = 3.0
+        probabilities = torch.softmax(logits, dim=-1)
+        packed = {
+            'valid_mask': torch.ones(1, 1, dtype=torch.bool),
+            'token_positions': torch.zeros(1, 1, 2),
+            'token_headings': torch.zeros(1, 1),
+            'token_agent_ids': torch.zeros(1, 1, dtype=torch.long),
+            'agent_type_ids': torch.zeros(1, 1, dtype=torch.long),
+            'chunk_ids': torch.zeros(1, 1, dtype=torch.long),
+            'current_velocities': torch.tensor([[[10.0, 0.0]]]),
+            'current_headings': torch.zeros(1, 1),
+        }
+
+        selected_ids, _confidence, diagnostics = model._guided_frontier_tokens(
+            logits,
+            probabilities,
+            frontier=torch.ones(1, 1, dtype=torch.bool),
+            packed=packed,
+            sampled=torch.full((1, 1), model.mask_token_id, dtype=torch.long),
+            t_value=1.0,
+        )
+
+        self.assertEqual(int(selected_ids[0]), 3)
+        self.assertIn('commit_speed_energy', diagnostics)
+
+    def test_guidance_mode_none_uses_plain_sampling_without_safe_rerank(self):
+        model = _causal_shell()
+        model.diffusion_num_steps = 4
+        model.min_t = 1e-3
+        model.remask_confidence_temperature = 1.0
+        model.safety_energy_enabled = True
+        model.guidance_mode = 'none'
+        model.diffusion_decoder = SimpleNamespace(mask_token_id=8)
+
+        def fake_decode(self, noisy, packed, summary, t, geometry_known_mask, **_kwargs):
+            logits = torch.full((*noisy.shape, 8), -20.0, device=noisy.device)
+            logits[..., 3] = 20.0
+            return logits
+
+        def forbidden_guidance(self, *_args, **_kwargs):
+            raise AssertionError("none guidance must not call guided rerank")
+
+        model._decode_diffusion_logits = MethodType(fake_decode, model)
+        model._guided_frontier_tokens = MethodType(forbidden_guidance, model)
+        valid_mask = torch.ones(1, 4, dtype=torch.bool)
+        packed = {
+            'chunk_ids': torch.tensor([[0, 1, 2, 3]]),
+            'token_agent_ids': torch.zeros(1, 4, dtype=torch.long),
+        }
+
+        sampled, _confidence = model._diffusion_sample(
+            summary=torch.zeros(1, 4),
+            token_positions=torch.zeros(1, 4, 2),
+            token_headings=torch.zeros(1, 4),
+            token_agent_ids=packed['token_agent_ids'],
+            chunk_ids=packed['chunk_ids'],
+            valid_mask=valid_mask,
+            agent_context=torch.zeros(1, 4, 4),
+            agent_type_ids=torch.zeros(1, 4, dtype=torch.long),
+            packed=packed,
+        )
+
+        self.assertTrue(torch.equal(sampled, torch.full((1, 4), 3)))
+
+    def test_ego_stress_guidance_prefers_valid_ego_interaction_candidate(self):
+        model = _causal_shell()
+        model.guidance_mode = 'ego_stress'
+        model.guidance_ego_interaction_alpha = 2.0
+        model.guidance_target_event_eta = 1.0
+        model.guidance_invalid_beta = 10.0
+        model.guidance_edit_gamma = 0.0
+        model.safety_energy_weight = 0.0
+        log_probabilities = torch.log(torch.tensor([[0.70, 0.20, 0.10]]))
+        guidance = {
+            'safe_energy': torch.tensor([[0.0, 0.0, 0.0]]),
+            'invalid_energy': torch.tensor([[0.0, 3.0, 0.0]]),
+            'critical_reward': torch.tensor([[0.5, 10.0, 0.0]]),
+            'ego_interaction_reward': torch.tensor([[0.5, 10.0, 0.0]]),
+            'target_event_reward': torch.tensor([[0.0, 0.0, 0.0]]),
+            'edit_distance': torch.zeros(1, 3),
+        }
+
+        selected = model._select_topk_by_guidance(
+            log_probabilities,
+            guidance,
+            t_value=1.0,
+            frontier_chunk_ids=torch.tensor([0]),
+        )
+
+        self.assertEqual(int(selected[0]), 0)
+
+    def test_ego_edit_guidance_penalizes_distance_from_seed(self):
+        model = _causal_shell()
+        model.guidance_mode = 'ego_edit'
+        model.guidance_ego_interaction_alpha = 0.0
+        model.guidance_target_event_eta = 0.0
+        model.guidance_invalid_beta = 0.0
+        model.guidance_edit_gamma = 2.0
+        log_probabilities = torch.log(torch.tensor([[0.5, 0.5]]))
+        guidance = {
+            'safe_energy': torch.zeros(1, 2),
+            'invalid_energy': torch.zeros(1, 2),
+            'ego_interaction_reward': torch.zeros(1, 2),
+            'target_event_reward': torch.zeros(1, 2),
+            'edit_distance': torch.tensor([[0.0, 1.0]]),
+        }
+
+        selected = model._select_topk_by_guidance(
+            log_probabilities,
+            guidance,
+            t_value=1.0,
+            frontier_chunk_ids=torch.tensor([0]),
+        )
+
+        self.assertEqual(int(selected[0]), 0)
+
+    def test_ego_stress_guidance_uses_ego_terms_not_global_criticality(self):
+        model = _causal_shell()
+        model.guidance_mode = 'ego_stress'
+        model.guidance_ego_interaction_alpha = 2.0
+        model.guidance_target_event_eta = 1.0
+        model.guidance_invalid_beta = 0.0
+        model.guidance_edit_gamma = 0.0
+        log_probabilities = torch.log(torch.tensor([[0.5, 0.5]]))
+        guidance = {
+            'safe_energy': torch.zeros(1, 2),
+            'invalid_energy': torch.zeros(1, 2),
+            'critical_reward': torch.tensor([[100.0, 0.0]]),
+            'ego_interaction_reward': torch.tensor([[0.0, 1.0]]),
+            'target_event_reward': torch.tensor([[0.0, 0.0]]),
+            'edit_distance': torch.zeros(1, 2),
+        }
+
+        selected = model._select_topk_by_guidance(
+            log_probabilities,
+            guidance,
+            t_value=1.0,
+            frontier_chunk_ids=torch.tensor([0]),
+        )
+
+        self.assertEqual(int(selected[0]), 1)
+
+    def test_ego_stress_guidance_prefers_generic_ego_risk_reward(self):
+        model = _causal_shell()
+        model.guidance_mode = 'ego_stress'
+        model.guidance_ego_interaction_alpha = 2.0
+        model.guidance_target_event_eta = 0.0
+        model.guidance_invalid_beta = 0.0
+        model.guidance_edit_gamma = 0.0
+        log_probabilities = torch.log(torch.tensor([[0.55, 0.45]]))
+        guidance = {
+            'safe_energy': torch.zeros(1, 2),
+            'invalid_energy': torch.zeros(1, 2),
+            'critical_reward': torch.zeros(1, 2),
+            'ego_interaction_reward': torch.zeros(1, 2),
+            'ego_risk_reward': torch.tensor([[0.0, 1.0]]),
+            'target_event_reward': torch.zeros(1, 2),
+            'edit_distance': torch.zeros(1, 2),
+        }
+
+        selected = model._select_topk_by_guidance(
+            log_probabilities,
+            guidance,
+            t_value=1.0,
+            frontier_chunk_ids=torch.tensor([0]),
+        )
+
+        self.assertEqual(int(selected[0]), 1)
+
+    def test_ego_edit_guidance_balances_ego_event_and_minimal_edit(self):
+        model = _causal_shell()
+        model.guidance_mode = 'ego_edit'
+        model.guidance_ego_interaction_alpha = 1.0
+        model.guidance_target_event_eta = 2.0
+        model.guidance_invalid_beta = 0.0
+        model.guidance_edit_gamma = 3.0
+        log_probabilities = torch.log(torch.tensor([[0.5, 0.5]]))
+        guidance = {
+            'safe_energy': torch.zeros(1, 2),
+            'invalid_energy': torch.zeros(1, 2),
+            'ego_interaction_reward': torch.tensor([[0.2, 1.0]]),
+            'target_event_reward': torch.tensor([[0.2, 1.0]]),
+            'edit_distance': torch.tensor([[0.0, 2.0]]),
+        }
+
+        selected = model._select_topk_by_guidance(
+            log_probabilities,
+            guidance,
+            t_value=1.0,
+            frontier_chunk_ids=torch.tensor([0]),
+        )
+
+        self.assertEqual(int(selected[0]), 0)
+
+    def test_seed_trajs_define_candidate_edit_distance_when_available(self):
+        model = _causal_shell()
+        candidate_positions = torch.tensor([[
+            [[0.0, 0.0], [1.0, 0.0]],
+            [[0.0, 2.0], [1.0, 2.0]],
+        ]])
+        seed_trajs = torch.tensor([[[[0.0, 0.0], [1.0, 0.0]]]])
+
+        edit_distance = model._candidate_edit_distance(
+            candidate_positions,
+            topk_ids=torch.tensor([[5, 5]]),
+            flat_frontier=torch.tensor([0]),
+            seed_token_ids=torch.tensor([[5]]),
+            seed_trajs=seed_trajs,
+        )
+
+        self.assertAlmostEqual(float(edit_distance[0, 0]), 0.0, places=5)
+        self.assertGreater(float(edit_distance[0, 1]), 1.0)
+
+    def test_pack_agent_window_values_preserves_seed_traj_dimensions(self):
+        model = _causal_shell()
+        model.ar_prediction_tokens = 4
+        packed = {
+            'valid_mask': torch.ones(1, 8, dtype=torch.bool),
+            'agent_maps': [(0, 0, torch.tensor([2, 0]))],
+        }
+        agent_values = torch.arange(
+            3 * model.ar_prediction_tokens * 5 * 2,
+            dtype=torch.float,
+        ).view(3, model.ar_prediction_tokens, 5, 2)
+
+        packed_values = model._pack_agent_window_values(
+            agent_values,
+            packed,
+            fill_value=0.0,
+        )
+
+        self.assertEqual(
+            tuple(packed_values.shape),
+            (1, 8, 5, 2),
+        )
+        self.assertTrue(torch.equal(
+            packed_values[0, :model.ar_prediction_tokens],
+            agent_values[2],
+        ))
+        self.assertTrue(torch.equal(
+            packed_values[0, model.ar_prediction_tokens:],
+            agent_values[0],
+        ))
+
+    def test_zero_guidance_diagnostics_do_not_alias_between_keys(self):
+        model = _causal_shell()
+        diagnostics = model._zero_guidance_diagnostics(torch.ones(()))
+
+        diagnostics['lane_distance'] += torch.tensor(3.0)
+
+        self.assertEqual(float(diagnostics['lane_distance']), 3.0)
+        self.assertEqual(float(diagnostics['collision']), 0.0)
+        self.assertIn('dynamics_energy', diagnostics)
+        self.assertEqual(float(diagnostics['dynamics_energy']), 0.0)
+        self.assertIn('commit_speed_energy', diagnostics)
+        self.assertEqual(float(diagnostics['commit_speed_energy']), 0.0)
+        self.assertEqual(float(diagnostics['target_success_rate']), 0.0)
+        self.assertIn('ego_min_ttc', diagnostics)
+        self.assertIn('ego_path_intrusion_rate', diagnostics)
+        self.assertIn('ego_conflict_tta_error', diagnostics)
+        self.assertIn('ego_risk_min_ttc', diagnostics)
+        self.assertIn('ego_risk_success_rate', diagnostics)
+        self.assertIn('target_event_success_rate', diagnostics)
+
+    def test_criticality_reference_excludes_same_agent_nominal(self):
+        model = _causal_shell()
+        object.__setattr__(
+            model,
+            'trajectory_energy',
+            TrajectoryEnergy(dt=0.1, collision_distance=1.0),
+        )
+        model.guidance_near_miss_distance = 1.5
+        model.guidance_ttc_threshold = 3.0
+        candidate_positions = torch.tensor([
+            [[[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]]],
+            [[[4.0, 1.2], [3.0, 1.2], [2.0, 1.2]]],
+        ])
+        nominal_other = candidate_positions[:, 0]
+        candidate_batch = torch.tensor([0, 0])
+        agent_ids = torch.tensor([7, 9])
+
+        metrics = model._criticality_against_nominal_other_agents(
+            candidate_positions,
+            nominal_other,
+            candidate_batch,
+            agent_ids,
+        )
+
+        self.assertTrue(bool(metrics['near_miss'][0, 0]))
+        self.assertFalse(bool(metrics['hard_collision'][0, 0]))
+
+    def test_edit_sampling_locks_seed_tokens_outside_edit_mask(self):
+        model = _causal_shell()
+        model.diffusion_num_steps = 4
+        model.min_t = 1e-3
+        model.remask_confidence_temperature = 1.0
+        model.safety_energy_enabled = False
+        model.guidance_mode = 'ego_edit'
+        model.diffusion_decoder = SimpleNamespace(mask_token_id=8)
+        decode_inputs = []
+
+        def fake_decode(self, noisy, packed, summary, t, geometry_known_mask, **_kwargs):
+            decode_inputs.append(noisy.clone())
+            logits = torch.full((*noisy.shape, 8), -20.0, device=noisy.device)
+            logits[..., 7] = 20.0
+            return logits
+
+        model._decode_diffusion_logits = MethodType(fake_decode, model)
+        valid_mask = torch.ones(1, 4, dtype=torch.bool)
+        packed = {
+            'chunk_ids': torch.tensor([[0, 1, 2, 3]]),
+            'token_agent_ids': torch.zeros(1, 4, dtype=torch.long),
+        }
+        seed = torch.tensor([[1, 2, 3, 4]])
+        edit_mask = torch.tensor([[False, True, False, False]])
+
+        sampled, _confidence = model._diffusion_sample(
+            summary=torch.zeros(1, 4),
+            token_positions=torch.zeros(1, 4, 2),
+            token_headings=torch.zeros(1, 4),
+            token_agent_ids=packed['token_agent_ids'],
+            chunk_ids=packed['chunk_ids'],
+            valid_mask=valid_mask,
+            agent_context=torch.zeros(1, 4, 4),
+            agent_type_ids=torch.zeros(1, 4, dtype=torch.long),
+            packed=packed,
+            seed_token_ids=seed,
+            editable_mask=edit_mask,
+        )
+
+        self.assertTrue(torch.equal(sampled, torch.tensor([[1, 7, 3, 4]])))
+        self.assertEqual(len(decode_inputs), 1)
+        self.assertTrue(torch.equal(decode_inputs[0], torch.tensor([[1, 8, 3, 4]])))
+
+    def test_edit_sampling_uses_frontier_chunk_timestep_when_seed_locked(self):
+        model = _causal_shell()
+        model.diffusion_num_steps = 4
+        model.min_t = 1e-3
+        model.remask_confidence_temperature = 1.0
+        model.safety_energy_enabled = False
+        model.guidance_mode = 'none'
+        model.diffusion_decoder = SimpleNamespace(mask_token_id=8)
+        decode_times = []
+
+        def fake_decode(self, noisy, packed, summary, t, geometry_known_mask, **_kwargs):
+            decode_times.append(float(t[0]))
+            logits = torch.full((*noisy.shape, 8), -20.0, device=noisy.device)
+            logits[..., 7] = 20.0
+            return logits
+
+        model._decode_diffusion_logits = MethodType(fake_decode, model)
+        valid_mask = torch.ones(1, 4, dtype=torch.bool)
+        packed = {
+            'chunk_ids': torch.tensor([[0, 1, 2, 3]]),
+            'token_agent_ids': torch.zeros(1, 4, dtype=torch.long),
+        }
+
+        sampled, _confidence = model._diffusion_sample(
+            summary=torch.zeros(1, 4),
+            token_positions=torch.zeros(1, 4, 2),
+            token_headings=torch.zeros(1, 4),
+            token_agent_ids=packed['token_agent_ids'],
+            chunk_ids=packed['chunk_ids'],
+            valid_mask=valid_mask,
+            agent_context=torch.zeros(1, 4, 4),
+            agent_type_ids=torch.zeros(1, 4, dtype=torch.long),
+            packed=packed,
+            seed_token_ids=torch.tensor([[1, 2, 3, 4]]),
+            editable_mask=torch.tensor([[False, False, True, False]]),
+        )
+
+        self.assertTrue(torch.equal(sampled, torch.tensor([[1, 2, 7, 4]])))
+        self.assertEqual(decode_times, [0.5])
+
+    def test_sampling_preserves_infinite_ego_risk_min_ttc_when_no_finite_ttc(self):
+        model = _causal_shell()
+        model.diffusion_num_steps = 4
+        model.min_t = 1e-3
+        model.remask_confidence_temperature = 1.0
+        model.guidance_mode = 'safe'
+        model.diffusion_decoder = SimpleNamespace(mask_token_id=8)
+
+        def fake_decode(self, noisy, packed, summary, t, geometry_known_mask, **_kwargs):
+            logits = torch.full((*noisy.shape, 8), -20.0, device=noisy.device)
+            logits[..., 1] = 20.0
+            return logits
+
+        def fake_guided(
+            self,
+            logits,
+            probabilities,
+            frontier,
+            packed,
+            sampled,
+            t_value,
+            **_kwargs,
+        ):
+            del logits, probabilities, packed, sampled, t_value
+            selected_count = int(frontier.sum().item())
+            diagnostics = self._zero_guidance_diagnostics(torch.zeros(()))
+            diagnostics['ego_risk_min_ttc'] = torch.full((), float('inf'))
+            return (
+                torch.ones(selected_count, dtype=torch.long),
+                torch.ones(selected_count),
+                diagnostics,
+            )
+
+        model._decode_diffusion_logits = MethodType(fake_decode, model)
+        model._guided_frontier_tokens = MethodType(fake_guided, model)
+        valid_mask = torch.ones(1, 4, dtype=torch.bool)
+        packed = {
+            'valid_mask': valid_mask,
+            'chunk_ids': torch.tensor([[0, 1, 2, 3]]),
+            'token_agent_ids': torch.zeros(1, 4, dtype=torch.long),
+        }
+
+        model._diffusion_sample(
+            summary=torch.zeros(1, 4),
+            token_positions=torch.zeros(1, 4, 2),
+            token_headings=torch.zeros(1, 4),
+            token_agent_ids=packed['token_agent_ids'],
+            chunk_ids=packed['chunk_ids'],
+            valid_mask=valid_mask,
+            agent_context=torch.zeros(1, 4, 4),
+            agent_type_ids=torch.zeros(1, 4, dtype=torch.long),
+            packed=packed,
+        )
+
+        self.assertTrue(torch.isinf(model._last_sampling_energy['ego_risk_min_ttc']))
+
+    def test_guided_frontier_reports_infinite_ttc_when_no_finite_ttc_exists(self):
+        class NoFiniteTtcEnergy:
+            def lane_energy(self, candidate_positions, candidate_headings, *args, **kwargs):
+                del candidate_headings, args, kwargs
+                return (
+                    candidate_positions.new_zeros(candidate_positions.shape[:2]),
+                    candidate_positions.new_zeros(candidate_positions.shape[:2]),
+                )
+
+            def dynamics_energy(self, candidate_positions, candidate_headings, **kwargs):
+                del candidate_headings, kwargs
+                return candidate_positions.new_zeros(candidate_positions.shape[:2])
+
+            def collision_energy(self, candidate_positions, other_positions, **kwargs):
+                del other_positions, kwargs
+                return candidate_positions.new_zeros(candidate_positions.shape[:2])
+
+            def criticality_metrics(self, candidate_positions, other_positions, **kwargs):
+                del other_positions, kwargs
+                shape = candidate_positions.shape[:2]
+                return {
+                    'critical_reward': candidate_positions.new_zeros(shape),
+                    'hard_collision': torch.zeros(shape, dtype=torch.bool),
+                }
+
+            def ego_interaction_metrics(self, candidate_positions, ego_positions, **kwargs):
+                del ego_positions, kwargs
+                shape = candidate_positions.shape[:2]
+                inf = torch.full(shape, float('inf'))
+                zeros = candidate_positions.new_zeros(shape)
+                false = torch.zeros(shape, dtype=torch.bool)
+                return {
+                    'ego_min_ttc': inf,
+                    'ego_min_distance': zeros,
+                    'ego_required_decel': zeros,
+                    'ego_path_intrusion_rate': zeros,
+                    'ego_conflict_tta_error': zeros,
+                    'ego_risk_reward': zeros,
+                    'ego_interaction_reward': zeros,
+                    'target_event_reward': zeros,
+                    'ego_risk_success': false,
+                    'ego_near_miss_success': false,
+                    'target_event_success': false,
+                    'hard_collision': false,
+                }
+
+        model = _causal_shell()
+        model.ar_token_steps = 2
+        model.guidance_mode = 'safe'
+        model.guidance_safe_topk = 1
+        model.safety_topk = 1
+        model.diffusion_decoder = SimpleNamespace(mask_token_id=8)
+        model.safety_energy_weight = 0.0
+        model.commit_safety_weight = 0.0
+        model.lane_distance_energy_weight = 0.0
+        model.lane_heading_energy_weight = 0.0
+        model.dynamics_energy_weight = 0.0
+        model.commit_speed_energy_weight = 0.0
+        model.collision_energy_weight = 0.0
+        object.__setattr__(model, 'trajectory_energy', NoFiniteTtcEnergy())
+
+        model._refresh_token_geometry = MethodType(
+            lambda self, token_ids, packed, **_kwargs: (
+                packed['token_positions'],
+                packed['token_headings'],
+                torch.ones_like(token_ids, dtype=torch.float),
+            ),
+            model,
+        )
+        model._token_chunk_world = MethodType(
+            lambda self, token_ids, agent_types, positions, headings: (
+                positions[:, None, :].expand(-1, self.ar_token_steps, -1),
+                headings[:, None].expand(-1, self.ar_token_steps),
+            ),
+            model,
+        )
+        logits = torch.tensor([[[0.0, 1.0]]])
+        probabilities = torch.softmax(logits, dim=-1)
+        packed = {
+            'valid_mask': torch.ones(1, 1, dtype=torch.bool),
+            'token_positions': torch.zeros(1, 1, 2),
+            'token_headings': torch.zeros(1, 1),
+            'token_agent_ids': torch.zeros(1, 1, dtype=torch.long),
+            'agent_type_ids': torch.zeros(1, 1, dtype=torch.long),
+            'chunk_ids': torch.ones(1, 1, dtype=torch.long),
+        }
+
+        _selected_ids, _confidence, diagnostics = model._guided_frontier_tokens(
+            logits,
+            probabilities,
+            frontier=torch.ones(1, 1, dtype=torch.bool),
+            packed=packed,
+            sampled=torch.full((1, 1), 8, dtype=torch.long),
+            t_value=0.75,
+        )
+
+        self.assertTrue(torch.isinf(diagnostics['ego_risk_min_ttc']))
+        self.assertTrue(torch.isinf(diagnostics['ego_min_ttc']))
+
+    def test_edit_controls_target_agents_and_global_token_window(self):
+        model = _causal_shell()
+        model.ar_prediction_tokens = 4
+        model.ar_history_tokens = 2
+        model.guidance_mode = 'ego_edit'
+        model.guidance_target_agents = (1,)
+        model.guidance_target_time_window = (2, 4)
+        data = HeteroData()
+        data['agent']['token_idx'] = torch.arange(20).view(2, 10)
+        generation_agents = torch.tensor([True, True])
+        future_valid = torch.ones(2, 4, dtype=torch.bool)
+
+        seed_tokens, editable = model._build_guidance_edit_controls(
+            data,
+            round_idx=1,
+            future_valid=future_valid,
+            generation_agents=generation_agents,
+        )
+
+        self.assertTrue(torch.equal(
+            seed_tokens,
+            torch.tensor([[3, 4, 5, 6], [13, 14, 15, 16]]),
+        ))
+        self.assertTrue(torch.equal(
+            editable,
+            torch.tensor([
+                [False, False, False, False],
+                [False, True, True, False],
+            ]),
+        ))
+
+    def test_edit_controls_lock_ego_even_when_ego_is_targeted(self):
+        model = _causal_shell()
+        model.ar_prediction_tokens = 4
+        model.ar_history_tokens = 2
+        model.num_historical_steps = 3
+        model.guidance_mode = 'ego_edit'
+        model.guidance_target_agents = (0, 1)
+        model.guidance_target_time_window = (0, 4)
+        data = HeteroData()
+        data['agent']['num_nodes'] = 2
+        data['agent']['token_idx'] = torch.arange(12).view(2, 6)
+        data['agent']['position'] = torch.zeros(2, 7, 3)
+        data['agent']['av_index'] = torch.tensor([0])
+        generation_agents = torch.tensor([True, True])
+        future_valid = torch.ones(2, 4, dtype=torch.bool)
+
+        _seed_tokens, editable = model._build_guidance_edit_controls(
+            data,
+            round_idx=0,
+            future_valid=future_valid,
+            generation_agents=generation_agents,
+        )
+
+        self.assertTrue(torch.equal(
+            editable,
+            torch.tensor([
+                [False, False, False, False],
+                [True, True, True, True],
+            ]),
+        ))
+
+    def test_ego_reference_packing_uses_explicit_ego_agent_inputs(self):
+        model = _causal_shell()
+        model.ar_prediction_tokens = 2
+        model.ar_token_steps = 2
+        model.num_historical_steps = 3
+        data = HeteroData()
+        data['agent']['num_nodes'] = 2
+        data['agent']['position'] = torch.zeros(2, 7, 3)
+        data['agent']['heading'] = torch.zeros(2, 7)
+        data['agent']['av_index'] = torch.tensor([0])
+        data['agent']['ego_agent_id'] = torch.tensor([1])
+        data['agent']['ego_ref_traj'] = torch.stack([
+            torch.zeros(4, 2),
+            torch.tensor([
+                [10.0, 0.0],
+                [11.0, 0.0],
+                [12.0, 0.0],
+                [13.0, 0.0],
+            ]),
+        ])
+        data['agent']['ego_ref_heading'] = torch.stack([
+            torch.zeros(4),
+            torch.full((4,), 0.5),
+        ])
+        agent_batch = torch.zeros(2, dtype=torch.long)
+        packed = {
+            'valid_mask': torch.ones(1, 4, dtype=torch.bool),
+            'token_positions': torch.zeros(1, 4, 2),
+            'agent_maps': [(0, 0, torch.tensor([0, 1]))],
+        }
+
+        model._attach_ego_reference_to_packed(data, packed, agent_batch)
+
+        expected = data['agent']['ego_ref_traj'][1].reshape(2, 2, 2)
+        self.assertTrue(torch.equal(
+            packed['ego_ref_positions'][0, :2],
+            expected,
+        ))
+        self.assertTrue(torch.equal(
+            packed['ego_ref_positions'][0, 2:],
+            expected,
+        ))
+        self.assertTrue(torch.equal(
+            packed['ego_ref_headings'][0, :2],
+            torch.full((2, 2), 0.5),
+        ))
+
+    def test_seed_commit_override_preserves_locked_agent_raw_trajectory(self):
+        model = _causal_shell()
+        model.ar_commit_tokens = 1
+        model.ar_prediction_tokens = 4
+        model.ar_token_steps = 2
+        model.num_historical_steps = 3
+        data = HeteroData()
+        data['agent']['position'] = torch.zeros(2, 11, 3)
+        data['agent']['heading'] = torch.zeros(2, 11)
+        data['agent']['valid_mask'] = torch.ones(2, 11, dtype=torch.bool)
+        data['agent']['seed_trajs'] = torch.tensor([
+            [[10.0, 0.0], [11.0, 0.0], [12.0, 0.0], [13.0, 0.0]],
+            [[20.0, 0.0], [21.0, 0.0], [22.0, 0.0], [23.0, 0.0]],
+        ])
+        commit_traj = torch.zeros(2, 2, 2)
+        commit_head = torch.zeros(2, 2)
+        commit_valid = torch.ones(2, 2, dtype=torch.bool)
+        token_pos = torch.zeros(2, 1, 2)
+        token_heading = torch.zeros(2, 1)
+        current_pos = torch.zeros(2, 2)
+        current_heading = torch.zeros(2)
+        edit_window_mask = torch.tensor([
+            [False, False, False, False],
+            [True, False, False, False],
+        ])
+
+        result = model._apply_guidance_seed_commit_overrides(
+            data=data,
+            round_idx=0,
+            edit_window_mask=edit_window_mask,
+            commit_traj=commit_traj,
+            commit_head=commit_head,
+            commit_valid_frames=commit_valid,
+            commit_token_pos=token_pos,
+            commit_token_heading=token_heading,
+            current_pos=current_pos,
+            current_heading=current_heading,
+        )
+
+        (
+            commit_traj,
+            _commit_head,
+            _commit_valid,
+            token_pos,
+            _token_heading,
+            current_pos,
+            _current_heading,
+        ) = result
+        self.assertTrue(torch.equal(
+            commit_traj[0],
+            torch.tensor([[10.0, 0.0], [11.0, 0.0]]),
+        ))
+        self.assertTrue(torch.equal(commit_traj[1], torch.zeros(2, 2)))
+        self.assertTrue(torch.equal(token_pos[0, 0], torch.tensor([11.0, 0.0])))
+        self.assertTrue(torch.equal(current_pos[0], torch.tensor([11.0, 0.0])))
+
 
 class ClosedLoopCurriculumTest(unittest.TestCase):
     def test_curriculum_probabilities_follow_the_four_training_phases(self):
@@ -562,6 +1380,17 @@ class CausalDiffusionConfigTest(unittest.TestCase):
                     0.8562850952148438,
                     1.2705252170562744,
                 ],
+            )
+            self.assertIn(
+                config.Model.diffusion.guidance.mode,
+                ('none', 'safe', 'ego_stress', 'ego_edit'),
+            )
+            self.assertEqual(config.Model.diffusion.guidance.safe_topk, 16)
+            self.assertGreaterEqual(config.Model.diffusion.guidance.ego_stress_topk, 64)
+            self.assertGreaterEqual(config.Model.diffusion.guidance.ego_edit_topk, 64)
+            self.assertEqual(
+                config.Model.diffusion.guidance.target_spec,
+                'ego_risk',
             )
 
     def test_horizon_metrics_slice_requested_rollout_prefix(self):

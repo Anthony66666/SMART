@@ -151,10 +151,22 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
 
     def _pack_agent_window_values(self, agent_values, packed, fill_value=0):
         B, L = packed['valid_mask'].shape
+        extra_shape = tuple(agent_values.shape[2:])
+        result_shape = (B, L) + extra_shape
         if agent_values.dtype == torch.bool:
-            result = torch.full((B, L), bool(fill_value), dtype=agent_values.dtype, device=agent_values.device)
+            result = torch.full(
+                result_shape,
+                bool(fill_value),
+                dtype=agent_values.dtype,
+                device=agent_values.device,
+            )
         else:
-            result = torch.full((B, L), fill_value, dtype=agent_values.dtype, device=agent_values.device)
+            result = torch.full(
+                result_shape,
+                fill_value,
+                dtype=agent_values.dtype,
+                device=agent_values.device,
+            )
         for _scene_idx, seq_idx, agent_indices in packed['agent_maps']:
             for local_idx, agent_idx in enumerate(agent_indices.tolist()):
                 start = local_idx * self.ar_prediction_tokens
@@ -501,6 +513,18 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
         history_frame_valid = data['agent']['valid_mask'][:, :self.num_historical_steps].bool().clone()
         current_pos = history_frame_pos[:, -1].clone()
         current_heading = history_frame_heading[:, -1].clone()
+        if history_frame_pos.shape[1] >= 2:
+            reference_velocity = (
+                history_frame_pos[:, -1] - history_frame_pos[:, -2]
+            ) / 0.1
+            reference_speed = torch.norm(reference_velocity, dim=-1)
+            reference_valid = history_frame_valid[:, -1] & history_frame_valid[:, -2]
+            reference_speed = reference_speed.masked_fill(~reference_valid, 0.0)
+        else:
+            reference_speed = torch.zeros(num_agents, device=device)
+        reference_decay = float(
+            getattr(self, 'commit_speed_reference_decay', 1.0)
+        )
 
         pred_traj = torch.zeros(num_agents, self.ar_total_rollout_steps, 2, device=device)
         pred_head = torch.zeros(num_agents, self.ar_total_rollout_steps, device=device)
@@ -518,6 +542,7 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
         for round_idx in range(rounds):
             round_start = time.perf_counter()
             self._debug_log(f"ar_inference_round_start round={round_idx + 1}/{rounds}")
+            data['agent']['commit_speed_reference'] = reference_speed
             rollout_view = self._build_ar_rollout_view(
                 data,
                 history_token_ids,
@@ -558,27 +583,70 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
                     packed,
                     fill_value=0.0,
                 )
+            seed_token_ids = None
+            editable_mask = None
+            seed_trajs = None
+            edit_window_mask = None
+            if (
+                str(getattr(self, 'guidance_mode', 'none')).lower()
+                in ('ego_stress', 'ego_edit')
+                and hasattr(self, '_build_guidance_edit_controls')
+            ):
+                seed_window_tokens, edit_window_mask = self._build_guidance_edit_controls(
+                    data,
+                    round_idx,
+                    fv,
+                    generation_agents,
+                )
+                seed_token_ids = self._pack_agent_window_values(
+                    seed_window_tokens,
+                    packed,
+                    fill_value=0,
+                )
+                editable_mask = self._pack_agent_window_values(
+                    edit_window_mask,
+                    packed,
+                    fill_value=False,
+                )
+                if (
+                    'seed_trajs' in data['agent']
+                    and hasattr(self, '_window_from_seed_trajs')
+                ):
+                    seed_window_trajs = self._window_from_seed_trajs(
+                        data['agent']['seed_trajs'],
+                        round_idx,
+                    )
+                    seed_trajs = self._pack_agent_window_values(
+                        seed_window_trajs,
+                        packed,
+                        fill_value=0.0,
+                    )
 
             sample_start = time.perf_counter()
-            sampled_ids, sampled_confidence = self._diffusion_sample(
-                summary=summary,
-                token_positions=packed['token_positions'],
-                token_headings=packed['token_headings'],
-                token_agent_ids=packed['token_agent_ids'],
-                chunk_ids=packed['chunk_ids'],
-                valid_mask=packed['valid_mask'],
-                agent_context=packed['agent_context'],
-                agent_type_ids=packed['agent_type_ids'],
-                agent_shape_embeddings=packed['agent_shape_embeddings'],
-                map_context=packed.get('map_context'),
-                map_positions=packed.get('map_positions'),
-                map_orientations=packed.get('map_orientations'),
-                map_batch=packed.get('map_batch'),
-                map_valid_mask=packed.get('map_valid_mask'),
-                packed=packed,
-                initial_proposal_token_ids=initial_proposal_ids,
-                initial_proposal_confidence=initial_proposal_confidence,
-            )
+            sample_kwargs = {
+                'summary': summary,
+                'token_positions': packed['token_positions'],
+                'token_headings': packed['token_headings'],
+                'token_agent_ids': packed['token_agent_ids'],
+                'chunk_ids': packed['chunk_ids'],
+                'valid_mask': packed['valid_mask'],
+                'agent_context': packed['agent_context'],
+                'agent_type_ids': packed['agent_type_ids'],
+                'agent_shape_embeddings': packed['agent_shape_embeddings'],
+                'map_context': packed.get('map_context'),
+                'map_positions': packed.get('map_positions'),
+                'map_orientations': packed.get('map_orientations'),
+                'map_batch': packed.get('map_batch'),
+                'map_valid_mask': packed.get('map_valid_mask'),
+                'packed': packed,
+                'initial_proposal_token_ids': initial_proposal_ids,
+                'initial_proposal_confidence': initial_proposal_confidence,
+            }
+            if seed_token_ids is not None or editable_mask is not None:
+                sample_kwargs['seed_token_ids'] = seed_token_ids
+                sample_kwargs['editable_mask'] = editable_mask
+                sample_kwargs['seed_trajs'] = seed_trajs
+            sampled_ids, sampled_confidence = self._diffusion_sample(**sample_kwargs)
             self._debug_log(
                 f"ar_inference_round_sample_done round={round_idx + 1}/{rounds} "
                 f"sample_elapsed={time.perf_counter() - sample_start:.2f}s"
@@ -599,6 +667,30 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
                 current_pos,
                 current_heading,
             )
+            if (
+                edit_window_mask is not None
+                and hasattr(self, '_apply_guidance_seed_commit_overrides')
+            ):
+                (
+                    commit_traj,
+                    commit_head,
+                    commit_valid_frames,
+                    commit_token_pos,
+                    commit_token_heading,
+                    current_pos,
+                    current_heading,
+                ) = self._apply_guidance_seed_commit_overrides(
+                    data=data,
+                    round_idx=round_idx,
+                    edit_window_mask=edit_window_mask,
+                    commit_traj=commit_traj,
+                    commit_head=commit_head,
+                    commit_valid_frames=commit_valid_frames,
+                    commit_token_pos=commit_token_pos,
+                    commit_token_heading=commit_token_heading,
+                    current_pos=current_pos,
+                    current_heading=current_heading,
+                )
             frame_start = round_idx * self.ar_commit_tokens * self.ar_token_steps
             frame_end = frame_start + self.ar_commit_tokens * self.ar_token_steps
             pred_traj[:, frame_start:frame_end] = commit_traj
@@ -624,6 +716,17 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
             history_frame_pos = torch.cat([history_frame_pos, commit_traj], dim=1)[:, -self.num_historical_steps:]
             history_frame_heading = torch.cat([history_frame_heading, commit_head], dim=1)[:, -self.num_historical_steps:]
             history_frame_valid = torch.cat([history_frame_valid, commit_valid_frames], dim=1)[:, -self.num_historical_steps:]
+            if history_frame_pos.shape[1] >= 2:
+                rolled_velocity = (
+                    history_frame_pos[:, -1] - history_frame_pos[:, -2]
+                ) / 0.1
+                rolled_speed = torch.norm(rolled_velocity, dim=-1)
+                rolled_valid = history_frame_valid[:, -1] & history_frame_valid[:, -2]
+                rolled_speed = rolled_speed.masked_fill(~rolled_valid, 0.0)
+                reference_speed = torch.maximum(
+                    rolled_speed,
+                    reference_speed * reference_decay,
+                )
             self._debug_log(
                 f"ar_inference_round_done round={round_idx + 1}/{rounds} "
                 f"committed_valid_frames={int(commit_valid_frames.sum().item())} "
