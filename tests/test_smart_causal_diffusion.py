@@ -1180,13 +1180,12 @@ class CausalFrontierPlannerTest(unittest.TestCase):
 
 
 class ClosedLoopCurriculumTest(unittest.TestCase):
-    def test_curriculum_probabilities_follow_the_four_training_phases(self):
+    def test_curriculum_uses_model_rollout_from_epoch_zero(self):
         model = _causal_shell()
 
-        self.assertEqual(model._closed_loop_curriculum(0), (0.0, 0.0))
-        self.assertEqual(model._closed_loop_curriculum(4), (0.25, 0.0))
-        self.assertAlmostEqual(model._closed_loop_curriculum(8)[1], 0.10)
-        self.assertAlmostEqual(model._closed_loop_curriculum(15)[1], 0.30)
+        self.assertEqual(model._closed_loop_curriculum(0), (0.0, 0.50))
+        self.assertEqual(model._closed_loop_curriculum(3), (0.0, 0.50))
+        self.assertEqual(model._closed_loop_curriculum(4), (0.25, 0.50))
         self.assertEqual(model._closed_loop_curriculum(16), (0.25, 0.50))
         self.assertEqual(model._closed_loop_curriculum(31), (0.25, 0.50))
 

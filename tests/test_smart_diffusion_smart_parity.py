@@ -1,5 +1,8 @@
+import math
+import pickle
 import importlib
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 
 import torch
@@ -27,6 +30,33 @@ def _diffusion_shell():
     return model
 
 
+def _real_token_diffusion_shell():
+    token_path = Path(__file__).resolve().parents[1] / 'smart' / 'tokens' / 'cluster_frame_5_2048.pkl'
+    if not token_path.exists():
+        raise unittest.SkipTest(f'real SMART token vocab not found: {token_path}')
+    with token_path.open('rb') as f:
+        token_data = pickle.load(f)
+
+    model = _diffusion_shell()
+    token_all = {
+        k: torch.from_numpy(v).clone().to(dtype=torch.float)
+        for k, v in token_data['token_all'].items()
+    }
+    endpoint = {
+        k: torch.from_numpy(v).clone().to(dtype=torch.float)
+        for k, v in token_data['token'].items()
+    }
+    token_size = int(next(iter(endpoint.values())).shape[0])
+    model.model_config = SimpleNamespace(decoder=SimpleNamespace(token_size=token_size))
+    model.diffusion_decoder = SimpleNamespace(mask_token_id=token_size)
+    model.future_chunk_steps = 5
+    model.num_future_chunks = 4
+    model.num_future_steps = model.future_chunk_steps * model.num_future_chunks
+    model._token_vocab_cache = token_all
+    model._token_endpoint_vocab_cache = endpoint
+    return model
+
+
 def _agent_data():
     data = HeteroData()
     valid_mask = torch.zeros(4, 12, dtype=torch.bool)
@@ -35,6 +65,129 @@ def _agent_data():
     data['agent']['category'] = torch.tensor([3, 0, 3, 3])
     data['agent']['type'] = torch.tensor([0, 1, 2, 3])
     return data
+
+
+def _wrap_angle(angle):
+    return torch.atan2(torch.sin(angle), torch.cos(angle))
+
+
+def _corners_heading(corners):
+    diff_xy = corners[..., 0, :] - corners[..., 3, :]
+    return torch.atan2(diff_xy[..., 1], diff_xy[..., 0])
+
+
+def _row_rotate(points, heading):
+    cos, sin = heading.cos(), heading.sin()
+    rot = torch.stack((
+        torch.stack((cos, sin), dim=-1),
+        torch.stack((-sin, cos), dim=-1),
+    ), dim=-2)
+    return torch.matmul(points, rot)
+
+
+def _local_emitted_corners(model, type_name, token_id):
+    traj = model.token_vocab[type_name][token_id]
+    endpoint = model.token_endpoint_vocab[type_name][token_id]
+    smart_traj = torch.cat([traj[:model.future_chunk_steps], endpoint[None]], dim=0)
+    return smart_traj[1:1 + model.future_chunk_steps]
+
+
+def _select_real_motion_tokens(model, type_name):
+    token_all = model.token_vocab[type_name]
+    endpoint = model.token_endpoint_vocab[type_name]
+    start_center = token_all[:, 0].mean(dim=1)
+    endpoint_center = endpoint.mean(dim=1)
+    displacement = torch.norm(endpoint_center - start_center, dim=-1)
+    fast_id = int(torch.argmax(displacement).item())
+
+    smart_traj = torch.cat(
+        [token_all[:, :model.future_chunk_steps], endpoint[:, None]],
+        dim=1,
+    )
+    emitted = smart_traj[:, 1:1 + model.future_chunk_steps]
+    heading = _corners_heading(emitted)
+    heading_delta = _wrap_angle(heading[:, -1] - heading[:, 0]).abs()
+    moving = displacement > torch.quantile(displacement, 0.50)
+    turn_id = int(torch.argmax(heading_delta.masked_fill(~moving, -1.0)).item())
+    return fast_id, turn_id
+
+
+def _manual_real_token_sequence(model, type_name, token_seq, start_pos, start_heading):
+    pos = start_pos.clone()
+    heading = start_heading.clone()
+    query_pos = []
+    query_heading = []
+    frames = []
+    frame_headings = []
+    for token_id in token_seq:
+        query_pos.append(pos.clone())
+        query_heading.append(heading.clone())
+        local = _local_emitted_corners(model, type_name, token_id)
+        local_centers = local.mean(dim=1)
+        local_heading = _corners_heading(local)
+        world = _row_rotate(local_centers, heading) + pos
+        world_heading = _wrap_angle(local_heading + heading)
+        frames.append(world)
+        frame_headings.append(world_heading)
+        pos = world[-1].clone()
+        heading = world_heading[-1].clone()
+    return {
+        'query_pos': torch.stack(query_pos),
+        'query_heading': torch.stack(query_heading),
+        'frames': torch.cat(frames, dim=0),
+        'frame_heading': torch.cat(frame_headings, dim=0),
+    }
+
+
+def _decode_real_token_sequence(model, type_id, token_seq, start_pos, start_heading):
+    pos = start_pos[None].clone()
+    heading = start_heading[None].clone()
+    frames = []
+    frame_headings = []
+    for token_id in token_seq:
+        world, world_heading = model._token_chunk_world(
+            torch.tensor([token_id], dtype=torch.long),
+            torch.tensor([type_id], dtype=torch.long),
+            pos,
+            heading,
+        )
+        frames.append(world[0])
+        frame_headings.append(world_heading[0])
+        pos = world[:, -1].clone()
+        heading = world_heading[:, -1].clone()
+    return torch.cat(frames, dim=0), torch.cat(frame_headings, dim=0)
+
+
+def _refresh_real_token_geometry(model, type_id, token_seq, start_pos, start_heading, mode):
+    chunks = len(token_seq)
+    packed = {
+        'token_positions': torch.zeros(1, chunks, 2),
+        'token_headings': torch.zeros(1, chunks),
+        'valid_mask': torch.ones(1, chunks, dtype=torch.bool),
+        'agent_maps': [(0, 0, torch.tensor([0]))],
+        'agent_start_positions': start_pos[None].clone(),
+        'agent_start_headings': start_heading[None].clone(),
+        'agent_types_global': torch.tensor([type_id]),
+    }
+    if mode == 'all_known':
+        return model._refresh_token_geometry(torch.tensor([token_seq]), packed)
+    token_ids = torch.tensor([[token_seq[0]] + [model.mask_token_id] * (chunks - 1)])
+    known = torch.tensor([[True] + [False] * (chunks - 1)])
+    if mode == 'chunk0_only':
+        return model._refresh_token_geometry(
+            token_ids,
+            packed,
+            geometry_known_mask=known,
+        )
+    if mode == 'tail_proposal':
+        return model._refresh_token_geometry(
+            token_ids,
+            packed,
+            geometry_known_mask=known,
+            proposal_token_ids=torch.tensor([token_seq]),
+            proposal_confidence=torch.tensor([[0.0] + [0.7] * (chunks - 1)]),
+        )
+    raise ValueError(mode)
 
 
 class SMARTDiffusionSMARTParityTest(unittest.TestCase):
@@ -171,6 +324,88 @@ class SMARTDiffusionSMARTParityTest(unittest.TestCase):
 
         self.assertTrue(torch.equal(conf, torch.tensor([[0.25, 0.75]])))
 
+    def test_real_token_four_chunk_geometry_and_heading_are_query_relative(self):
+        model = _real_token_diffusion_shell()
+        start_pos = torch.tensor([3.0, -2.0])
+        heading_values = [0.0, math.pi / 6.0, math.pi / 2.0, -math.pi / 2.0, math.pi]
+
+        for type_name, type_id in [('veh', 0), ('ped', 1), ('cyc', 2)]:
+            fast_id, turn_id = _select_real_motion_tokens(model, type_name)
+            token_seq = [fast_id, turn_id, fast_id, turn_id]
+            for heading_value in heading_values:
+                with self.subTest(type=type_name, heading=heading_value):
+                    start_heading = torch.tensor(heading_value)
+                    ref = _manual_real_token_sequence(
+                        model,
+                        type_name,
+                        token_seq,
+                        start_pos,
+                        start_heading,
+                    )
+                    frames, frame_heading = _decode_real_token_sequence(
+                        model,
+                        type_id,
+                        token_seq,
+                        start_pos,
+                        start_heading,
+                    )
+                    self.assertLessEqual(float((frames - ref['frames']).abs().max()), 5e-5)
+                    self.assertLessEqual(
+                        float(_wrap_angle(frame_heading - ref['frame_heading']).abs().max()),
+                        1e-5,
+                    )
+
+                    pos_all, head_all, conf_all = _refresh_real_token_geometry(
+                        model,
+                        type_id,
+                        token_seq,
+                        start_pos,
+                        start_heading,
+                        'all_known',
+                    )
+                    self.assertLessEqual(float((pos_all[0] - ref['query_pos']).abs().max()), 5e-5)
+                    self.assertLessEqual(
+                        float(_wrap_angle(head_all[0] - ref['query_heading']).abs().max()),
+                        1e-5,
+                    )
+                    self.assertTrue(torch.equal(conf_all, torch.ones_like(conf_all)))
+
+                    pos_prop, head_prop, conf_prop = _refresh_real_token_geometry(
+                        model,
+                        type_id,
+                        token_seq,
+                        start_pos,
+                        start_heading,
+                        'tail_proposal',
+                    )
+                    self.assertLessEqual(float((pos_prop[0] - ref['query_pos']).abs().max()), 5e-5)
+                    self.assertLessEqual(
+                        float(_wrap_angle(head_prop[0] - ref['query_heading']).abs().max()),
+                        1e-5,
+                    )
+                    self.assertTrue(torch.equal(conf_prop[0] > 0.0, torch.ones(4, dtype=torch.bool)))
+
+                    pos_mask, head_mask, conf_mask = _refresh_real_token_geometry(
+                        model,
+                        type_id,
+                        token_seq,
+                        start_pos,
+                        start_heading,
+                        'chunk0_only',
+                    )
+                    expected_pos = ref['query_pos'].clone()
+                    expected_heading = ref['query_heading'].clone()
+                    expected_pos[2:] = ref['query_pos'][1]
+                    expected_heading[2:] = ref['query_heading'][1]
+                    self.assertLessEqual(float((pos_mask[0] - expected_pos).abs().max()), 5e-5)
+                    self.assertLessEqual(
+                        float(_wrap_angle(head_mask[0] - expected_heading).abs().max()),
+                        1e-5,
+                    )
+                    self.assertTrue(torch.equal(
+                        conf_mask,
+                        torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
+                    ))
 
     def test_decode_generates_non_target_agents_but_masks_metric_validity(self):
         model = _diffusion_shell()

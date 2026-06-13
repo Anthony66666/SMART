@@ -273,10 +273,8 @@ schedule 是：
 
 | epoch | perturb | model rollout |
 | --- | --- | --- |
-| 0-3 | 0.00 | 0.00 |
-| 4-7 | 0.25 | 0.00 |
-| 8-15 | 0.25 | 0.10 -> 0.30 线性增长，且不超过上限 |
-| 16+ | 0.25 | `closed_loop_batch_ratio_max`，当前 0.5 |
+| 0-3 | 0.00 | `closed_loop_batch_ratio_max`，当前 0.5 |
+| 4+ | 0.25 | `closed_loop_batch_ratio_max`，当前 0.5 |
 
 model-rollout view 会先用当前模型 no-grad 采样 1 到 4 个 committed token，把 agent
 状态滚动到预测状态，再从这个新状态继续构造训练目标。

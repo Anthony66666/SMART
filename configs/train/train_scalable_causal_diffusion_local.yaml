@@ -11,11 +11,11 @@ Dataset:
   val_batch_size: 1
   test_batch_size: 1
   shuffle: True
-  num_workers: 0
+  num_workers: 4
   pin_memory: False
   persistent_workers: False
-  train_raw_dir: ["data/valid_demo"]
-  val_raw_dir: ["data/valid_demo"]
+  train_raw_dir: ["/home/anthony/SimAgentJEPA/data/waymo/training_subset_10pct"]
+  val_raw_dir: ["/home/anthony/SimAgentJEPA/data/waymo/validation"]
   test_raw_dir:
   transform: WaymoTargetBuilder
   train_processed_dir:
@@ -43,16 +43,16 @@ Trainer:
 
 Visualization:
   # Enable after the training path is stable; each sample performs a full rollout.
-  enabled: false
+  enabled: true
   interval_epochs: 1
   sample_indices: [0, 1, 2, 3]
-  output_dir: "./outputs/val_causal_diffusion_local"
+  output_dir: "./outputs/val_causal_diffusion_local_v2"
   max_agents: 0
   step_viz:
     enabled: true
-    interval_steps: 2000
+    interval_steps: 1000
     sample_indices: [0, 1, 2, 3]
-    output_dir: "./outputs/step_causal_diffusion_local"
+    output_dir: "./outputs/step_causal_diffusion_local_v2"
 
 Model:
   mode: "train"

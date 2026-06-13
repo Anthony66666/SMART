@@ -39,11 +39,11 @@ without the previous per-chunk mask multipliers.
 
 Training uses a 32-epoch curriculum:
 
-- Epochs 0-3: clean rolling anchors.
-- Epochs 4-7: correlated pose perturbation on 25% of training views.
-- Epochs 8-15: model-rollout state probability increases linearly from 10% to
-  30%.
-- Epochs 16-31: model-rollout state probability is 50%.
+- Current implementation note, updated 2026-06-13: model-rollout state
+  probability starts at `closed_loop_batch_ratio_max` from epoch 0.
+- Epochs 0-3: model rollout plus clean rolling anchors.
+- Epochs 4-31: model rollout plus 25% correlated pose perturbation; remaining
+  views are clean rolling anchors.
 
 Rollout depth is sampled uniformly from one to four committed tokens. After a
 perturbed or predicted state is created, the remaining ground-truth trajectory

@@ -300,12 +300,11 @@ DDPStrategy(find_unused_parameters=True, gradient_as_bucket_view=True)
 
 | epoch，代码从 0 开始 | clean/perturb/rollout 分布 |
 | --- | --- |
-| 0-3 | 100% clean |
-| 4-7 | 75% clean，25% perturb |
-| 8-15 | 25% perturb，rollout 从 10% 增至 30%，其余 clean |
-| 16+ | 25% perturb，50% rollout，25% clean |
+| 0-3 | 50% rollout，50% clean |
+| 4+ | 50% rollout，25% perturb，25% clean |
 
-- 将训练缩短到 16 epoch 会导致最后的稳定闭环阶段几乎没有训练。
+- model-rollout 从第 0 个 epoch 开始参与训练；第 4 个 epoch 起额外加入
+  25% perturb state。
 
 ### `Trainer.save_ckpt_path: null`
 
@@ -785,8 +784,8 @@ offset ~ Normal(0, 0.3^2)
 ### `Model.diffusion.closed_loop_batch_ratio_max: 0.5`
 
 - **状态：生效。**
-- epoch 16 以后最多 50% batch 使用模型 rollout state；其余 batch 保持
-  clean 或 perturb。
+- 从 epoch 0 开始最多 50% batch 使用模型 rollout state；其余 batch 保持
+  clean，epoch 4 起再混入 perturb。
 - 在当前 1-4 token rollout depth 下，目标是把总体训练开销增量控制在约 30%。
 
 ### `Model.diffusion.current_state_enabled: true`

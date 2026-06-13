@@ -429,16 +429,7 @@ class SMARTCausalDiffusion(SMARTAutoregressiveDiffusion):
             getattr(self, 'closed_loop_batch_ratio_max', 0.5)
         )
         if epoch <= 3:
-            return 0.0, 0.0
-        if epoch <= 7:
-            return 0.25, 0.0
-        if epoch <= 15:
-            phase_end = min(0.30, maximum)
-            phase_start = min(0.10, phase_end)
-            rollout_prob = phase_start + (
-                epoch - 8
-            ) * ((phase_end - phase_start) / 7.0)
-            return 0.25, rollout_prob
+            return 0.0, maximum
         return 0.25, maximum
 
     def _pool_agent_context(self, hist_tokens, hist_mask):
