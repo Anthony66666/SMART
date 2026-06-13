@@ -1,6 +1,12 @@
 # Progress
 
 ## 2026-06-14 CST
+- Task: Ran the matched 1000-step AR diffusion baseline locally.
+- Result: `configs/train/train_scalable_ar_diffusion_baseline_1000.yaml` completed `max_steps=1000` on the 10% Waymo training subset, triggered the step-1000 validation pass, and wrote `checkpoints/ar_baseline_1000/last.ckpt`. Validation/step visualization outputs were generated under `outputs/val_ar_baseline_1000/` and `outputs/step_ar_baseline_1000/`.
+- Metrics: Final logged validation metrics were `val_minADE=2.920`, `val_minFDE=8.670`, `val_ar_window_loss=3.440`, and `val_ar_window_mask_acc=0.290`.
+- Next: Run the remaining matched 1000-step jobs for AR frontier, causal diffusion, and causal flow matching, then compare all four checkpoints.
+
+## 2026-06-14 CST
 - Task: Fixed the matched 1000-step training configs so local single-GPU runs validate and save checkpoints at the intended step boundary.
 - Result: `train.py` now supports config-driven `val_check_interval`, step-based checkpoint cadence, epoch-checkpoint fallback, and `save_last_checkpoint`. The four 1000-step comparison configs now use `strategy: auto`, validate at step 1000, save at step 1000, and write `last.ckpt`, including the causal diffusion and causal flow-matching configs.
 - Validation: Added resolver/config regression coverage in `tests/test_train_entrypoint_config.py` and `tests/test_compare_motion_models.py`. A two-step real training smoke with validation and step checkpointing saved `last.ckpt`.

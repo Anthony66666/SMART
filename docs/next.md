@@ -4,7 +4,7 @@
 
 - `smart_ar_diffusion` now has an opt-in causal-frontier v2 objective. Use `configs/train/train_scalable_ar_diffusion_baseline_1000.yaml` for the old AR baseline and `configs/train/train_scalable_ar_diffusion_frontier_local.yaml` for the new AR frontier model.
 - Matched 1000-step comparison configs are available for `ar_baseline`, `ar_frontier`, `causal_diffusion`, and `causal_flow_matching`; all use `/home/anthony/SimAgentJEPA/data/waymo/training_subset_10pct` for training and `/home/anthony/SimAgentJEPA/data/waymo/validation` for validation. These configs use `strategy: auto`, validate at step 1000, save a step-1000 checkpoint, and keep `last.ckpt` so interrupted mid-epoch runs still leave a usable comparison artifact.
-- Local 1000-step AR baseline training is in progress under `checkpoints/ar_baseline_1000`; keep generated checkpoints, Lightning logs, and `outputs/` out of commits.
+- Local 1000-step AR baseline training completed under `checkpoints/ar_baseline_1000/last.ckpt`; final logged validation metrics were `val_minADE=2.920`, `val_minFDE=8.670`, `val_ar_window_loss=3.440`, and `val_ar_window_mask_acc=0.290`. Keep generated checkpoints, Lightning logs, and `outputs/` out of commits.
 - Use `scripts/compare_motion_models.py` after checkpoints exist to produce records, summaries, manifests, and validation visualizations for the matched 1000-step comparison.
 - Causal flow matching is now available as additive predictor `smart_causal_flow_matching`. Use `configs/train/train_scalable_causal_flow_matching_local.yaml` for local smoke/training, `configs/train/train_scalable_causal_flow_matching.yaml` for server training, and `configs/validation/validation_scalable_causal_flow_matching.yaml` for validation.
 - Current flow-matching evidence is wiring-level, not quality evidence: the untrained model produced finite real-batch flow loss and rendered `outputs/causal_flow_matching_untrained_visual_smoke/idx_00000_1c83f56236e33b4_guidance_modes.png`, but trajectory quality should not be compared until a trained flow checkpoint exists.
@@ -45,8 +45,7 @@
 
 ## Next Actions
 
-- Train the matched 1000-step models with:
-  `python train.py --config configs/train/train_scalable_ar_diffusion_baseline_1000.yaml --save_ckpt_path checkpoints/ar_baseline_1000`
+- Train the remaining matched 1000-step models with:
   `python train.py --config configs/train/train_scalable_ar_diffusion_frontier_local.yaml --save_ckpt_path checkpoints/ar_frontier_1000`
   `python train.py --config configs/train/train_scalable_causal_diffusion_1000.yaml --save_ckpt_path checkpoints/causal_diffusion_1000`
   `python train.py --config configs/train/train_scalable_causal_flow_matching_1000.yaml --save_ckpt_path checkpoints/causal_flow_matching_1000`
