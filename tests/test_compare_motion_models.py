@@ -44,7 +44,11 @@ class CompareMotionModelsTest(unittest.TestCase):
                 self.assertEqual(cfg.Dataset.train_raw_dir, [TRAIN_DIR])
                 self.assertEqual(cfg.Dataset.val_raw_dir, [VAL_DIR])
                 self.assertEqual(cfg.Trainer.max_steps, 1000)
+                self.assertEqual(cfg.Trainer.val_check_interval, 1000)
+                self.assertEqual(cfg.Trainer.checkpoint_every_n_train_steps, 1000)
+                self.assertTrue(cfg.Trainer.save_last_checkpoint)
                 self.assertEqual(cfg.Trainer.devices, 1)
+                self.assertEqual(cfg.Trainer.strategy, "auto")
                 self.assertEqual(cfg.Model.predictor, predictor)
                 if predictor == "smart_ar_diffusion":
                     self.assertEqual(cfg.Model.diffusion.ar_objective, objective)

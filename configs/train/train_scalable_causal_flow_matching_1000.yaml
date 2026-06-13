@@ -25,11 +25,14 @@ Dataset:
   <<: *time_info
 
 Trainer:
-  strategy: ddp_find_unused_parameters_true
+  strategy: auto
   accelerator: "gpu"
   devices: 1
   max_epochs: 999
   max_steps: 1000
+  val_check_interval: 1000
+  checkpoint_every_n_train_steps: 1000
+  save_last_checkpoint: true
   save_ckpt_path:
   num_nodes: 1
   mode:

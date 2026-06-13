@@ -1,6 +1,12 @@
 # Progress
 
 ## 2026-06-14 CST
+- Task: Fixed the matched 1000-step training configs so local single-GPU runs validate and save checkpoints at the intended step boundary.
+- Result: `train.py` now supports config-driven `val_check_interval`, step-based checkpoint cadence, epoch-checkpoint fallback, and `save_last_checkpoint`. The four 1000-step comparison configs now use `strategy: auto`, validate at step 1000, save at step 1000, and write `last.ckpt`, including the causal diffusion and causal flow-matching configs.
+- Validation: Added resolver/config regression coverage in `tests/test_train_entrypoint_config.py` and `tests/test_compare_motion_models.py`. A two-step real training smoke with validation and step checkpointing saved `last.ckpt`.
+- Next: Let the four 1000-step jobs finish, then run `scripts/compare_motion_models.py` on the resulting `last.ckpt` files.
+
+## 2026-06-14 CST
 - Task: Added a SMART-AR causal-frontier v2 training path and matched 1000-step comparison configs.
 - Result: `smart_ar_diffusion` now supports config-gated `diffusion.ar_objective: causal_frontier_v1` while keeping `maskgit` as the default-compatible baseline. The new path can swap in `CausalDiffusionDecoder`, train with frontier-only causal supervision, inject current-motion context, build clean/perturbed/model-rollout training views, retokenize targets from closed-loop states, and use differentiable endpoint recovery for invalid retokenized targets. `train.py` now honors `Trainer.max_steps`.
 - Files: `smart/model/smart_ar_diffusion.py`, `train.py`, `configs/train/train_scalable_ar_diffusion_baseline_1000.yaml`, `configs/train/train_scalable_ar_diffusion_frontier_local.yaml`, `configs/train/train_scalable_causal_diffusion_1000.yaml`, `configs/train/train_scalable_causal_flow_matching_1000.yaml`, `scripts/compare_motion_models.py`, and focused tests.

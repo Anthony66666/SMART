@@ -34,6 +34,27 @@ def resolve_max_steps(trainer_config):
     return int(getattr(trainer_config, 'max_steps', -1))
 
 
+def resolve_val_check_interval(trainer_config):
+    return getattr(trainer_config, 'val_check_interval', 1.0)
+
+
+def resolve_checkpoint_every_n_train_steps(trainer_config):
+    value = getattr(trainer_config, 'checkpoint_every_n_train_steps', None)
+    if value in (None, "", 0):
+        return None
+    return int(value)
+
+
+def resolve_checkpoint_every_n_epochs(trainer_config):
+    if resolve_checkpoint_every_n_train_steps(trainer_config) is not None:
+        return None
+    return int(getattr(trainer_config, 'checkpoint_every_n_epochs', 1))
+
+
+def resolve_save_last_checkpoint(trainer_config):
+    return bool(getattr(trainer_config, 'save_last_checkpoint', True))
+
+
 if __name__ == '__main__':
     parser = ArgumentParser()
     Predictor_hash = {
@@ -68,7 +89,9 @@ if __name__ == '__main__':
     model_checkpoint = ModelCheckpoint(dirpath=args.save_ckpt_path,
                                        filename="{epoch:02d}",
                                        monitor=monitor_metric,
-                                       every_n_epochs=1,
+                                       every_n_train_steps=resolve_checkpoint_every_n_train_steps(trainer_config),
+                                       every_n_epochs=resolve_checkpoint_every_n_epochs(trainer_config),
+                                       save_last=resolve_save_last_checkpoint(trainer_config),
                                        save_top_k=5,
                                        mode=monitor_mode)
     lr_monitor = LearningRateMonitor(logging_interval='epoch')
@@ -103,6 +126,7 @@ if __name__ == '__main__':
                          callbacks=callbacks,
                          max_epochs=trainer_config.max_epochs,
                          max_steps=resolve_max_steps(trainer_config),
+                         val_check_interval=resolve_val_check_interval(trainer_config),
                          limit_val_batches=getattr(trainer_config, 'limit_val_batches', 1.0),
                          check_val_every_n_epoch=getattr(trainer_config, 'check_val_every_n_epoch', 1),
                          num_sanity_val_steps=0,
