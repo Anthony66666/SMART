@@ -1,5 +1,12 @@
 # Decisions
 
+## Decision: Add a config-gated AR causal-frontier objective
+- Date: 2026-06-14
+- Context: The user wanted a major improvement to original `smart_ar_diffusion` by transplanting the most useful causal diffusion ideas while preserving the original AR rollout surface for comparison.
+- Decision: Keep the existing `maskgit` AR objective as the baseline path and add `diffusion.ar_objective: causal_frontier_v1` as an opt-in objective. The new AR path uses causal temporal decoder edges, frontier-only supervision, current-motion state context, closed-loop model-rollout training views, and retokenized recovery targets.
+- Why: This tests whether the causal diffusion advantages come from causal frontier training and closed-loop state exposure rather than from replacing the AR interface itself.
+- Impact: Use `configs/train/train_scalable_ar_diffusion_baseline_1000.yaml` for the old AR baseline and `configs/train/train_scalable_ar_diffusion_frontier_local.yaml` for the new AR frontier model. Compare both against the matched causal diffusion and causal flow matching 1000-step configs before drawing quality conclusions.
+
 ## Decision: Add causal SMART-token flow matching as a separate predictor
 - Date: 2026-06-13
 - Context: The user wanted a flow-matching model to replace the current causal diffusion model for the same sim-agent rollout task, without deleting existing code.

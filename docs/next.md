@@ -2,6 +2,9 @@
 
 ## In Flight
 
+- `smart_ar_diffusion` now has an opt-in causal-frontier v2 objective. Use `configs/train/train_scalable_ar_diffusion_baseline_1000.yaml` for the old AR baseline and `configs/train/train_scalable_ar_diffusion_frontier_local.yaml` for the new AR frontier model.
+- Matched 1000-step comparison configs are available for `ar_baseline`, `ar_frontier`, `causal_diffusion`, and `causal_flow_matching`; all use `/home/anthony/SimAgentJEPA/data/waymo/training_subset_10pct` for training and `/home/anthony/SimAgentJEPA/data/waymo/validation` for validation.
+- Use `scripts/compare_motion_models.py` after checkpoints exist to produce records, summaries, manifests, and validation visualizations for the matched 1000-step comparison.
 - Causal flow matching is now available as additive predictor `smart_causal_flow_matching`. Use `configs/train/train_scalable_causal_flow_matching_local.yaml` for local smoke/training, `configs/train/train_scalable_causal_flow_matching.yaml` for server training, and `configs/validation/validation_scalable_causal_flow_matching.yaml` for validation.
 - Current flow-matching evidence is wiring-level, not quality evidence: the untrained model produced finite real-batch flow loss and rendered `outputs/causal_flow_matching_untrained_visual_smoke/idx_00000_1c83f56236e33b4_guidance_modes.png`, but trajectory quality should not be compared until a trained flow checkpoint exists.
 - Causal training curriculum changed on 2026-06-13: model-rollout states are now eligible from epoch 0 at `closed_loop_batch_ratio_max` probability, while perturb states still start at epoch 4. New runs should compare against older three-phase checkpoints with this schedule change called out explicitly.
@@ -36,11 +39,17 @@
 
 ## Blockers
 
+- The current local shell cannot run GPU training: `nvidia-smi --query-gpu=name,memory.total --format=csv,noheader` fails with `GPU access blocked by the operating system`. Run the 1000-step comparison jobs on a GPU-enabled server/workstation.
 - Waymo official evaluation dependencies are not installed in the current environment, so official export assertion tests still skip here.
-- `tests.test_smart_ar_diffusion` has two unrelated config-drift failures because the user-modified server AR train YAML enables causal noise and disables visible corruption while old tests still assert the prior defaults.
 
 ## Next Actions
 
+- Train the matched 1000-step models with:
+  `python train.py --config configs/train/train_scalable_ar_diffusion_baseline_1000.yaml --save_ckpt_path checkpoints/ar_baseline_1000`
+  `python train.py --config configs/train/train_scalable_ar_diffusion_frontier_local.yaml --save_ckpt_path checkpoints/ar_frontier_1000`
+  `python train.py --config configs/train/train_scalable_causal_diffusion_1000.yaml --save_ckpt_path checkpoints/causal_diffusion_1000`
+  `python train.py --config configs/train/train_scalable_causal_flow_matching_1000.yaml --save_ckpt_path checkpoints/causal_flow_matching_1000`
+- After those checkpoints exist, run `scripts/compare_motion_models.py` with the four `--model name=config=checkpoint` specs and write results under `outputs/model_comparison_1000`.
 - Launch server flow-matching training with `configs/train/train_scalable_causal_flow_matching.yaml` after the GitHub PR is created. The first server config uses `flow_integration_steps: 1` to keep epoch-end rollout validation bounded; raise it to 2 or 4 for final quality sweeps.
 - Run a short local flow-matching training job from `configs/train/train_scalable_causal_flow_matching_local.yaml` when debugging before server launch, then rerun the smoke and visual commands with the resulting checkpoint.
 - Compare trained `smart_causal_flow_matching` against `smart_causal_diffusion` on the same demo and validation scenes using ADE/FDE, moving-speed ratios, `val_rollout_score`, guidance metrics, and whole-scene visualizations.

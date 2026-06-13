@@ -30,6 +30,10 @@ def build_strategy(trainer_config):
     return strategy_name
 
 
+def resolve_max_steps(trainer_config):
+    return int(getattr(trainer_config, 'max_steps', -1))
+
+
 if __name__ == '__main__':
     parser = ArgumentParser()
     Predictor_hash = {
@@ -98,6 +102,7 @@ if __name__ == '__main__':
                          precision=getattr(trainer_config, 'precision', 32),
                          callbacks=callbacks,
                          max_epochs=trainer_config.max_epochs,
+                         max_steps=resolve_max_steps(trainer_config),
                          limit_val_batches=getattr(trainer_config, 'limit_val_batches', 1.0),
                          check_val_every_n_epoch=getattr(trainer_config, 'check_val_every_n_epoch', 1),
                          num_sanity_val_steps=0,

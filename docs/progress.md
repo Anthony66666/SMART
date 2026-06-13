@@ -1,5 +1,13 @@
 # Progress
 
+## 2026-06-14 CST
+- Task: Added a SMART-AR causal-frontier v2 training path and matched 1000-step comparison configs.
+- Result: `smart_ar_diffusion` now supports config-gated `diffusion.ar_objective: causal_frontier_v1` while keeping `maskgit` as the default-compatible baseline. The new path can swap in `CausalDiffusionDecoder`, train with frontier-only causal supervision, inject current-motion context, build clean/perturbed/model-rollout training views, retokenize targets from closed-loop states, and use differentiable endpoint recovery for invalid retokenized targets. `train.py` now honors `Trainer.max_steps`.
+- Files: `smart/model/smart_ar_diffusion.py`, `train.py`, `configs/train/train_scalable_ar_diffusion_baseline_1000.yaml`, `configs/train/train_scalable_ar_diffusion_frontier_local.yaml`, `configs/train/train_scalable_causal_diffusion_1000.yaml`, `configs/train/train_scalable_causal_flow_matching_1000.yaml`, `scripts/compare_motion_models.py`, and focused tests.
+- Validation: `python -m unittest tests.test_train_entrypoint_config tests.test_smart_ar_diffusion tests.test_compare_motion_models -v` passed; `python -m unittest tests.test_smart_causal_diffusion tests.test_smart_causal_flow_matching -v` passed; `py_compile` and `git diff --check` passed. A real `data/valid_demo` batch through the AR frontier `training_step` produced finite `loss=16.1374`.
+- Blocker: The current local shell cannot run the requested 1000-step GPU training because `nvidia-smi` fails with `GPU access blocked by the operating system`.
+- Next: Run the four matched 1000-step configs on a GPU-enabled machine, then compare checkpoints with `scripts/compare_motion_models.py`.
+
 ## 2026-06-13 CST
 - Task: Added the server training config for causal SMART-token flow matching.
 - Result: Added `configs/train/train_scalable_causal_flow_matching.yaml` for the 14-GPU server path with `/raid/haoq_lab/wangshijie/data/waymo/{training,validation}`, `smart_causal_flow_matching`, `flow_matching_v1`, and bounded first-run rollout validation via `flow_integration_steps: 1`.

@@ -364,27 +364,44 @@ class SMARTAutoregressiveDiffusionTest(unittest.TestCase):
         self.assertNotIn('monitor_metric: "val_loss"', text)
 
     def test_ar_configs_keep_causal_schedule_as_disabled_ablation(self):
-        for path in [
-            Path("configs/train/train_scalable_ar_diffusion.yaml"),
+        disabled_paths = [
+            Path("configs/train/train_scalable_ar_diffusion_baseline_1000.yaml"),
             Path("configs/train/train_scalable_ar_diffusion_local.yaml"),
-            Path("configs/validation/validation_scalable_ar_diffusion.yaml"),
-        ]:
+        ]
+        for path in disabled_paths:
             text = path.read_text()
             self.assertIn("causal_noise_schedule: false", text, str(path))
             self.assertIn("causal_chunk_mask_multipliers: [0.70, 0.90, 1.10, 1.30]", text, str(path))
             self.assertIn("causal_loss_weights: [1.0, 1.0, 0.75, 0.5]", text, str(path))
             self.assertNotIn("causal_chunk_mask_probs", text, str(path))
 
+        validation_text = Path("configs/validation/validation_scalable_ar_diffusion.yaml").read_text()
+        self.assertIn("prediction_tokens: 6", validation_text)
+        self.assertIn("causal_noise_schedule: false", validation_text)
+        self.assertIn("causal_chunk_mask_multipliers: [1, 1, 1, 1,1,1]", validation_text)
+        self.assertIn("causal_loss_weights: [1.0, 1.0, 1.0, 1.0,1.0,1.0]", validation_text)
+
+        server_text = Path("configs/train/train_scalable_ar_diffusion.yaml").read_text()
+        self.assertIn("prediction_tokens: 6", server_text)
+        self.assertIn("causal_noise_schedule: true", server_text)
+        self.assertIn("causal_chunk_mask_multipliers: [0.80, 0.90, 1.00, 1.10, 1.20, 1.30]", server_text)
+        self.assertIn("causal_loss_weights: [1.5, 1.25, 1.0, 0.9, 0.8, 0.7]", server_text)
+
 
     def test_ar_train_configs_enable_visible_token_neighbor_corruption(self):
-        train_paths = [
-            Path("configs/train/train_scalable_ar_diffusion.yaml"),
+        corruption_paths = [
+            Path("configs/train/train_scalable_ar_diffusion_baseline_1000.yaml"),
             Path("configs/train/train_scalable_ar_diffusion_local.yaml"),
         ]
-        for path in train_paths:
+        for path in corruption_paths:
             text = path.read_text()
             self.assertIn("visible_token_corruption_prob: 0.15", text, str(path))
             self.assertIn("visible_token_corruption_topk: 5", text, str(path))
+
+        server_text = Path("configs/train/train_scalable_ar_diffusion.yaml").read_text()
+        self.assertIn("visible_token_corruption_prob: 0", server_text)
+        frontier_text = Path("configs/train/train_scalable_ar_diffusion_frontier_local.yaml").read_text()
+        self.assertIn("visible_token_corruption_prob: 0.0", frontier_text)
 
         validation_text = Path("configs/validation/validation_scalable_ar_diffusion.yaml").read_text()
         self.assertIn("visible_token_corruption_prob: 0.0", validation_text)
@@ -403,6 +420,217 @@ class SMARTAutoregressiveDiffusionTest(unittest.TestCase):
             text = path.read_text()
             self.assertNotIn("self_condition_visible_prob", text, str(path))
             self.assertNotIn("self_condition_loss_weight", text, str(path))
+
+    def test_causal_temporal_decoder_flag_is_config_driven(self):
+        model = _ar_shell()
+        model.ar_causal_temporal_edges = False
+
+        self.assertFalse(model._use_causal_temporal_decoder())
+
+        model.ar_causal_temporal_edges = True
+
+        self.assertTrue(model._use_causal_temporal_decoder())
+
+    def test_frontier_loss_masks_suffix_and_supervises_selected_frontier(self):
+        model = _ar_shell()
+        model.ar_objective = "causal_frontier_v1"
+        model.ar_frontier_loss_weight = 1.0
+        model.ar_continuous_recovery_loss_weight = 0.0
+        model.diffusion_decoder = SimpleNamespace(mask_token_id=9)
+        model.min_t = 1.0e-3
+        captured = {}
+        test_case = self
+
+        def fake_frontier_ids(self, loss_mask_base, chunk_ids):
+            test_case.assertTrue(loss_mask_base.all())
+            test_case.assertTrue(torch.equal(chunk_ids, torch.tensor([[0, 1, 2, 3]])))
+            return torch.tensor([1])
+
+        def fake_decode(self, noisy, packed, summary, t, geometry_known_mask, **_kwargs):
+            captured["noisy"] = noisy.clone()
+            captured["geometry_known_mask"] = geometry_known_mask.clone()
+            captured["t"] = t.clone()
+            logits = torch.zeros(1, 4, 10)
+            logits[0, 1, 1] = 4.0
+            logits[0, 2, 2] = 4.0
+            logits[0, 3, 3] = 4.0
+            return logits
+
+        model._sample_frontier_ids = MethodType(fake_frontier_ids, model)
+        model._decode_diffusion_logits = MethodType(fake_decode, model)
+        packed = {
+            "token_ids": torch.tensor([[0, 1, 2, 3]]),
+            "valid_mask": torch.ones(1, 4, dtype=torch.bool),
+            "loss_mask_base": torch.ones(1, 4, dtype=torch.bool),
+            "chunk_ids": torch.tensor([[0, 1, 2, 3]]),
+        }
+
+        loss, acc = model._compute_diffusion_loss(packed, torch.zeros(1, 8))
+
+        self.assertGreater(float(loss), 0.0)
+        self.assertEqual(float(acc), 1.0)
+        self.assertTrue(torch.equal(captured["noisy"], torch.tensor([[0, 9, 9, 9]])))
+        self.assertTrue(torch.equal(
+            captured["geometry_known_mask"],
+            torch.tensor([[True, False, False, False]]),
+        ))
+        self.assertTrue(torch.allclose(captured["t"], torch.tensor([0.75])))
+
+    def test_ar_closed_loop_curriculum_starts_rollout_at_epoch_zero(self):
+        model = _ar_shell()
+        model.ar_closed_loop_batch_ratio_max = 0.5
+
+        self.assertEqual(model._ar_closed_loop_curriculum(0), (0.0, 0.5))
+        self.assertEqual(model._ar_closed_loop_curriculum(3), (0.0, 0.5))
+        self.assertEqual(model._ar_closed_loop_curriculum(4), (0.25, 0.5))
+
+    def test_ar_frontier_training_view_uses_rollout_when_selected(self):
+        model = _ar_shell()
+        model.ar_closed_loop_max_depth = 1
+        data = _toy_sequence(num_agents=1, num_tokens=18, num_frames=91)
+        metadata = {"retokenization_valid": torch.ones(1, 4, dtype=torch.bool)}
+        calls = {"rollout": 0, "retokenize": 0}
+        test_case = self
+
+        model._ar_closed_loop_curriculum = MethodType(lambda self, epoch: (0.0, 1.0), model)
+
+        def fake_rollout_view(self, batch, rollout_depth):
+            calls["rollout"] += 1
+            test_case.assertEqual(rollout_depth, 1)
+            return batch
+
+        def fake_retokenize(self, view):
+            calls["retokenize"] += 1
+            return metadata
+
+        model._build_model_rollout_training_view = MethodType(fake_rollout_view, model)
+        model._retokenize_training_view = MethodType(fake_retokenize, model)
+
+        view, retokenization, state_mode, rollout_depth = model._build_ar_frontier_training_view(data)
+
+        self.assertIs(view, data)
+        self.assertIs(retokenization, metadata)
+        self.assertEqual(state_mode, "rollout")
+        self.assertEqual(rollout_depth, 1)
+        self.assertEqual(calls, {"rollout": 1, "retokenize": 1})
+
+    def test_frontier_training_step_attaches_retokenization_metadata(self):
+        model = _ar_shell()
+        model.ar_objective = "causal_frontier_v1"
+        model.ar_rolling_anchor_training = True
+        model.ntp_aux_loss_weight = 0.0
+        data = _toy_sequence(num_agents=2, num_tokens=18, num_frames=91)
+        metadata = {
+            "retokenization_valid": torch.tensor([
+                [True, False, True, True],
+                [False, True, True, False],
+            ]),
+            "recovery_target_local_endpoint": torch.arange(16, dtype=torch.float).view(2, 4, 2),
+        }
+        calls = {"frontier_view": 0}
+        logged = []
+        test_case = self
+
+        model._prepare_batch = MethodType(lambda self, batch: batch, model)
+
+        def fake_frontier_view(self, batch):
+            calls["frontier_view"] += 1
+            return batch, metadata, "clean", 0
+
+        def fake_build_inputs(self, batch):
+            packed = {
+                "agent_maps": [(0, 0, torch.tensor([0, 1]))],
+                "token_ids": torch.zeros(1, 8, dtype=torch.long),
+                "valid_mask": torch.ones(1, 8, dtype=torch.bool),
+                "loss_mask_base": torch.ones(1, 8, dtype=torch.bool),
+                "chunk_ids": torch.arange(4).repeat(2).unsqueeze(0),
+            }
+            summary = torch.zeros(1, 1)
+            return packed, summary, None, None, None, None, None
+
+        def fake_diffusion_loss(self, packed, summary):
+            expected_valid = torch.tensor([[True, False, True, True, False, True, True, False]])
+            expected_endpoint = torch.arange(16, dtype=torch.float).view(1, 8, 2)
+            test_case.assertTrue(torch.equal(
+                packed["retokenization_valid"],
+                expected_valid,
+            ))
+            test_case.assertTrue(torch.equal(
+                packed["recovery_target_local_endpoint"],
+                expected_endpoint,
+            ))
+            return torch.tensor(2.0), torch.tensor(0.5)
+
+        model._build_ar_frontier_training_view = MethodType(fake_frontier_view, model)
+        model._build_diffusion_inputs = MethodType(fake_build_inputs, model)
+        model._compute_diffusion_loss = MethodType(fake_diffusion_loss, model)
+        model._compute_optional_ntp_loss = MethodType(lambda self, batch, ref: torch.tensor(0.0), model)
+        model.log = MethodType(lambda self, name, *args, **kwargs: logged.append(name), model)
+
+        loss = model.training_step(data, 0)
+
+        self.assertEqual(float(loss), 2.0)
+        self.assertEqual(calls["frontier_view"], 1)
+        self.assertIn("train_ar_state_mode_clean", logged)
+
+    def test_select_closed_loop_anchor_reserves_rollout_and_prediction_room(self):
+        model = _ar_shell()
+        model.ar_prediction_tokens = 4
+        model.ar_token_steps = 5
+        model.ar_history_tokens = 2
+        data = _toy_sequence(num_agents=1, num_tokens=8, num_frames=41)
+
+        anchor = model._select_closed_loop_anchor(data, rollout_depth=2)
+
+        self.assertEqual(anchor, 2)
+
+    def test_retokenize_training_view_updates_future_tokens_and_metadata(self):
+        model = _ar_shell()
+        model.ar_prediction_tokens = 4
+        model.ar_token_steps = 5
+        data = _toy_sequence(num_agents=1, num_tokens=18, num_frames=91)
+        token_ids = torch.tensor([[5, 6, 7, 8]])
+        errors = torch.tensor([[0.1, 0.2, 0.3, 0.4]])
+        retokenization_valid = torch.tensor([[True, False, True, True]])
+        local_endpoints = torch.ones(1, 4, 2)
+
+        def fake_retokenize_future(self, **_kwargs):
+            return token_ids, errors, retokenization_valid, local_endpoints
+
+        def fake_decode(self, token_ids_arg, token_valid_arg, *_args):
+            token_pos = torch.arange(8, dtype=torch.float).view(1, 4, 2)
+            token_heading = torch.arange(4, dtype=torch.float).view(1, 4)
+            return None, None, None, token_pos, token_heading, None, None
+
+        model._retokenize_future = MethodType(fake_retokenize_future, model)
+        model._decode_token_sequence = MethodType(fake_decode, model)
+
+        metadata = model._retokenize_training_view(data)
+
+        self.assertTrue(torch.equal(data["agent"]["token_idx"][0, 2:6], token_ids[0]))
+        self.assertTrue(torch.equal(data["agent"]["token_pos"][0, 2:6], torch.arange(8, dtype=torch.float).view(4, 2)))
+        self.assertTrue(torch.equal(data["agent"]["token_heading"][0, 2:6], torch.arange(4, dtype=torch.float)))
+        self.assertTrue(torch.equal(metadata["retokenization_error"], errors))
+        self.assertTrue(torch.equal(metadata["retokenization_valid"], retokenization_valid))
+        self.assertTrue(torch.equal(metadata["recovery_target_local_endpoint"], local_endpoints))
+
+    def test_current_state_context_is_added_to_each_agent_chunk(self):
+        model = _ar_shell()
+        model.ar_prediction_tokens = 2
+        model.current_state_enabled = True
+        object.__setattr__(model, "current_state_projection", lambda features: features)
+        data = _toy_sequence(num_agents=1, num_tokens=18, num_frames=91)
+        packed = {
+            "agent_maps": [(0, 0, torch.tensor([0]))],
+            "agent_context": torch.zeros(1, 2, 5),
+            "valid_mask": torch.ones(1, 2, dtype=torch.bool),
+        }
+
+        model._apply_current_state_context(data, packed)
+
+        _velocity, _heading, expected_features = model._current_state_motion(data)
+        self.assertTrue(torch.allclose(packed["agent_context"][0, 0], expected_features[0]))
+        self.assertTrue(torch.allclose(packed["agent_context"][0, 1], expected_features[0]))
 
 
 if __name__ == "__main__":

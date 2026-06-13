@@ -3,9 +3,13 @@ import math
 import time
 
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from torch_geometric.data import Batch
 
 from smart.model.smart_diffusion import SMARTDiffusion
+from smart.modules.causal_diffusion_decoder import CausalDiffusionDecoder
+from smart.utils import wrap_angle
 
 
 class SMARTAutoregressiveDiffusion(SMARTDiffusion):
@@ -19,6 +23,9 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
     def __init__(self, model_config) -> None:
         super().__init__(model_config)
         diffusion_cfg = getattr(model_config, 'diffusion', None)
+        self.ar_objective = str(getattr(diffusion_cfg, 'ar_objective', 'maskgit')).lower()
+        if self.ar_objective not in ('maskgit', 'causal_frontier_v1'):
+            raise ValueError(f"Unsupported diffusion.ar_objective: {self.ar_objective}")
         self.ar_history_tokens = int(getattr(diffusion_cfg, 'history_tokens', 2))
         self.ar_prediction_tokens = int(getattr(diffusion_cfg, 'prediction_tokens', 4))
         self.ar_commit_tokens = int(getattr(diffusion_cfg, 'commit_tokens', 2))
@@ -26,7 +33,41 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
         self.ar_total_rollout_steps = int(getattr(diffusion_cfg, 'total_rollout_steps', self.num_future_steps))
         self.ar_local_map_refresh = str(getattr(diffusion_cfg, 'local_map_refresh', 'rescreen')).lower()
         self.ar_carry_tail_proposal = bool(getattr(diffusion_cfg, 'carry_tail_proposal', False))
+        self.ar_causal_temporal_edges = bool(getattr(diffusion_cfg, 'causal_temporal_edges', False))
         self.ar_rolling_anchor_training = bool(getattr(diffusion_cfg, 'rolling_anchor_training', True))
+        self.current_state_enabled = bool(getattr(diffusion_cfg, 'current_state_enabled', False))
+        self.ar_frontier_loss_weight = max(
+            0.0,
+            float(getattr(diffusion_cfg, 'frontier_loss_weight', 1.0)),
+        )
+        self.ar_continuous_recovery_loss_weight = max(
+            0.0,
+            float(getattr(diffusion_cfg, 'continuous_recovery_loss_weight', 0.0)),
+        )
+        thresholds = tuple(
+            float(value)
+            for value in getattr(
+                diffusion_cfg,
+                'retokenization_error_thresholds',
+                (0.65, 0.78, 0.62),
+            )
+        )
+        if len(thresholds) != 3:
+            raise ValueError(
+                "diffusion.retokenization_error_thresholds must contain veh/ped/cyc values."
+            )
+        self.retokenization_error_thresholds = thresholds
+        self.ar_closed_loop_batch_ratio_max = min(
+            1.0,
+            max(
+                0.0,
+                float(getattr(diffusion_cfg, 'closed_loop_batch_ratio_max', 0.0)),
+            ),
+        )
+        self.ar_closed_loop_max_depth = max(
+            1,
+            min(4, int(getattr(diffusion_cfg, 'closed_loop_max_depth', 4))),
+        )
         self.ar_state_perturb_prob = float(getattr(diffusion_cfg, 'state_perturb_prob', 0.5))
         self.ar_state_perturb_prob = min(max(self.ar_state_perturb_prob, 0.0), 1.0)
         self.ar_state_perturb_pos_sigma_m = float(getattr(diffusion_cfg, 'state_perturb_pos_sigma_m', 0.3))
@@ -56,9 +97,689 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
         # the first prediction-token chunk ids.
         self.full_num_future_chunks = self.num_future_chunks
         self.num_future_chunks = self.ar_prediction_tokens
+        if self._use_causal_temporal_decoder():
+            token_size = int(getattr(model_config.decoder, 'token_size', 2048))
+            self.diffusion_decoder = CausalDiffusionDecoder(
+                hidden_dim=self.hidden_dim,
+                token_size=token_size,
+                num_future_chunks=self.num_future_chunks,
+                num_heads=self.model_config.num_heads,
+                head_dim=self.model_config.head_dim,
+                dropout=self.model_config.dropout,
+                num_freq_bands=self.model_config.num_freq_bands,
+                a2a_radius=float(self.model_config.decoder.a2a_radius),
+                pl2a_radius=float(self.model_config.decoder.pl2a_radius),
+                time_span=getattr(self.model_config.decoder, 'time_span', None),
+                future_chunk_steps=self.future_chunk_steps,
+                num_layers=self.diffusion_num_layers,
+                num_token_types=4 if self.use_type_embedding else 1,
+                use_agent_context=self.use_agent_context,
+            )
+        if self.current_state_enabled:
+            self.current_state_projection = nn.Sequential(
+                nn.Linear(5, self.hidden_dim),
+                nn.SiLU(),
+                nn.Linear(self.hidden_dim, self.hidden_dim),
+            )
+        self._token_center_vocab_cache = None
 
     def _num_ar_rollout_rounds(self):
         return self.ar_total_rollout_steps // (self.ar_commit_tokens * self.ar_token_steps)
+
+    def _use_causal_temporal_decoder(self):
+        return bool(getattr(self, 'ar_causal_temporal_edges', False))
+
+    def _ar_closed_loop_curriculum(self, epoch):
+        epoch = max(0, int(epoch))
+        maximum = float(getattr(self, 'ar_closed_loop_batch_ratio_max', 0.0))
+        if epoch <= 3:
+            return 0.0, maximum
+        return 0.25, maximum
+
+    def _current_state_motion(self, data):
+        agent = data['agent']
+        current_index = self.num_historical_steps - 1
+        previous_index = max(current_index - 1, 0)
+        current_position = agent['position'][:, current_index, :2].float()
+        previous_position = agent['position'][:, previous_index, :2].float()
+        current_heading = agent['heading'][:, current_index].float()
+        previous_heading = agent['heading'][:, previous_index].float()
+        current_valid = agent['valid_mask'][:, current_index].bool()
+        previous_valid = agent['valid_mask'][:, previous_index].bool()
+        finite_difference_valid = current_valid & previous_valid
+
+        velocity = (current_position - previous_position) / 0.1
+        if 'velocity' in agent:
+            observed_velocity = agent['velocity'][
+                :,
+                min(current_index, agent['velocity'].shape[1] - 1),
+                :2,
+            ].float()
+            velocity = torch.where(
+                finite_difference_valid.unsqueeze(-1),
+                velocity,
+                observed_velocity,
+            )
+        velocity = velocity.masked_fill(~current_valid.unsqueeze(-1), 0.0)
+
+        cos_heading = current_heading.cos()
+        sin_heading = current_heading.sin()
+        longitudinal = velocity[:, 0] * cos_heading + velocity[:, 1] * sin_heading
+        lateral = -velocity[:, 0] * sin_heading + velocity[:, 1] * cos_heading
+        speed = torch.norm(velocity, dim=-1)
+        yaw_rate = wrap_angle(current_heading - previous_heading) / 0.1
+        yaw_rate = yaw_rate.masked_fill(~finite_difference_valid, 0.0)
+        features = torch.stack(
+            [
+                longitudinal / 20.0,
+                lateral / 20.0,
+                speed / 20.0,
+                yaw_rate / 2.0,
+                current_valid.to(dtype=velocity.dtype),
+            ],
+            dim=-1,
+        )
+        return velocity, current_heading, features
+
+    def _apply_current_state_context(self, data, packed):
+        if not bool(getattr(self, 'current_state_enabled', False)):
+            return
+        _velocity, _current_heading, state_features = self._current_state_motion(data)
+        state_embeddings = self.current_state_projection(state_features)
+        for _scene_idx, sequence_idx, agent_indices in packed['agent_maps']:
+            for local_idx, agent_idx in enumerate(agent_indices.tolist()):
+                start = local_idx * self.ar_prediction_tokens
+                end = start + self.ar_prediction_tokens
+                packed['agent_context'][sequence_idx, start:end] += (
+                    state_embeddings[agent_idx]
+                )
+
+    def _build_diffusion_inputs(self, data, rollout_valid=False):
+        result = super()._build_diffusion_inputs(
+            data,
+            rollout_valid=rollout_valid,
+        )
+        packed = result[0]
+        if (
+            packed is not None
+            and getattr(self, 'ar_objective', 'maskgit') == 'causal_frontier_v1'
+        ):
+            self._apply_current_state_context(data, packed)
+        return result
+
+    def _sample_frontier_ids(self, loss_mask_base, chunk_ids):
+        frontier_ids = torch.full(
+            (loss_mask_base.shape[0],),
+            -1,
+            dtype=torch.long,
+            device=chunk_ids.device,
+        )
+        for batch_idx in range(loss_mask_base.shape[0]):
+            available = torch.unique(
+                chunk_ids[batch_idx][loss_mask_base[batch_idx]]
+            )
+            available = available[
+                (available >= 0) & (available < self.num_future_chunks)
+            ]
+            if available.numel() == 0:
+                continue
+            selected = torch.randint(
+                available.numel(),
+                (1,),
+                device=chunk_ids.device,
+            )
+            frontier_ids[batch_idx] = available[selected]
+        return frontier_ids
+
+    def _compute_diffusion_loss(self, packed, summary):
+        if getattr(self, 'ar_objective', 'maskgit') == 'causal_frontier_v1':
+            return self._compute_frontier_diffusion_loss(packed, summary)
+        return super()._compute_diffusion_loss(packed, summary)
+
+    def _compute_frontier_diffusion_loss(self, packed, summary):
+        gt = packed['token_ids']
+        valid_mask = packed['valid_mask']
+        raw_loss_mask_base = packed.get('loss_mask_base', valid_mask) & valid_mask
+        retokenization_valid = packed.get(
+            'retokenization_valid',
+            torch.ones_like(valid_mask),
+        ).bool()
+        loss_mask_base = raw_loss_mask_base & retokenization_valid
+        frontier_ids = self._sample_frontier_ids(
+            raw_loss_mask_base,
+            packed['chunk_ids'],
+        )
+        selected_frontier = frontier_ids.unsqueeze(-1)
+        has_frontier = selected_frontier >= 0
+        mask = (
+            valid_mask
+            & has_frontier
+            & (packed['chunk_ids'] >= selected_frontier)
+        )
+        frontier_raw_mask = (
+            mask
+            & (packed['chunk_ids'] == selected_frontier)
+            & raw_loss_mask_base
+        )
+        frontier_mask = frontier_raw_mask & loss_mask_base
+
+        noisy = gt.clone()
+        noisy[mask] = self.mask_token_id
+        geometry_known_mask = (~mask) & valid_mask
+        t = (
+            1.0
+            - frontier_ids.clamp_min(0).to(dtype=summary.dtype)
+            / float(self.num_future_chunks)
+        ).clamp_min(float(getattr(self, 'min_t', 1e-3)))
+        logits = self._decode_diffusion_logits(
+            noisy,
+            packed,
+            summary,
+            t,
+            geometry_known_mask,
+        )
+
+        if hasattr(self, '_continuous_recovery_loss'):
+            recovery_loss = self._continuous_recovery_loss(
+                logits,
+                packed,
+                masked_supervision=frontier_raw_mask,
+            )
+        else:
+            recovery_loss = logits.sum() * 0.0
+
+        if frontier_mask.any():
+            log_p = F.log_softmax(logits, dim=-1)
+            nll = -log_p.gather(-1, gt.unsqueeze(-1)).squeeze(-1)
+            loss = nll[frontier_mask].mean() * float(
+                getattr(self, 'ar_frontier_loss_weight', 1.0)
+            )
+            acc = (
+                logits[frontier_mask].argmax(-1) == gt[frontier_mask]
+            ).float().mean()
+        else:
+            loss = logits.sum() * 0.0
+            acc = logits.new_zeros(())
+        loss = loss + float(
+            getattr(self, 'ar_continuous_recovery_loss_weight', 0.0)
+        ) * recovery_loss
+
+        if getattr(self, 'training', False):
+            valid_count = valid_mask.float().sum().clamp_min(1.0)
+            self.log(
+                'train_ar_frontier_mask_frac',
+                mask.float().sum() / valid_count,
+                prog_bar=False,
+                on_step=True,
+                on_epoch=True,
+                batch_size=1,
+            )
+            self.log(
+                'train_ar_frontier_frac',
+                frontier_mask.float().sum() / valid_count,
+                prog_bar=False,
+                on_step=True,
+                on_epoch=True,
+                batch_size=1,
+            )
+            self.log(
+                'train_ar_continuous_recovery_loss',
+                recovery_loss,
+                prog_bar=False,
+                on_step=True,
+                on_epoch=True,
+                batch_size=1,
+            )
+        return loss, acc
+
+    def _token_center_vocabs(self):
+        if getattr(self, '_token_center_vocab_cache', None) is None:
+            center_vocabs = {}
+            for type_name in ('veh', 'ped', 'cyc'):
+                trajectories = self.token_vocab[type_name]
+                endpoints = self.token_endpoint_vocab[type_name]
+                smart_trajectories = torch.cat(
+                    [
+                        trajectories[:, :self.ar_token_steps],
+                        endpoints[:, None],
+                    ],
+                    dim=1,
+                )
+                center_vocabs[type_name] = smart_trajectories[
+                    :, 1:1 + self.ar_token_steps
+                ].mean(dim=2)
+            self._token_center_vocab_cache = center_vocabs
+        return self._token_center_vocab_cache
+
+    def _retokenize_future(
+        self,
+        future_positions,
+        future_valid,
+        start_positions,
+        start_headings,
+        agent_types,
+        token_center_vocabs=None,
+    ):
+        if future_positions.dim() != 4:
+            raise ValueError("future_positions must have shape [agent, chunk, step, 2].")
+        num_agents, num_chunks, num_steps, _ = future_positions.shape
+        if num_steps != self.ar_token_steps:
+            raise ValueError(
+                f"Expected {self.ar_token_steps} frames per token, got {num_steps}."
+            )
+        use_physical_decode = token_center_vocabs is None
+        center_vocabs = (
+            self._token_center_vocabs()
+            if use_physical_decode
+            else token_center_vocabs
+        )
+        device = future_positions.device
+        token_ids = torch.zeros(num_agents, num_chunks, dtype=torch.long, device=device)
+        errors = future_positions.new_full((num_agents, num_chunks), float('inf'))
+        target_valid = torch.zeros(
+            num_agents,
+            num_chunks,
+            dtype=torch.bool,
+            device=device,
+        )
+        local_endpoints = future_positions.new_zeros(num_agents, num_chunks, 2)
+        current_positions = start_positions.clone()
+        current_headings = start_headings.clone()
+        type_names = ('veh', 'ped', 'cyc')
+
+        for chunk_idx in range(num_chunks):
+            for agent_idx in range(num_agents):
+                agent_type = int(agent_types[agent_idx].item())
+                if agent_type < 0 or agent_type >= len(type_names):
+                    continue
+                frame_valid = future_valid[agent_idx, chunk_idx].bool()
+                if not frame_valid.any():
+                    continue
+                world_delta = (
+                    future_positions[agent_idx, chunk_idx]
+                    - current_positions[agent_idx]
+                )
+                heading = current_headings[agent_idx]
+                cos_heading = heading.cos()
+                sin_heading = heading.sin()
+                world_to_local = torch.stack([
+                    torch.stack([cos_heading, -sin_heading]),
+                    torch.stack([sin_heading, cos_heading]),
+                ])
+                target_local = world_delta @ world_to_local
+                valid_indices = torch.nonzero(frame_valid, as_tuple=False).squeeze(-1)
+                local_endpoints[agent_idx, chunk_idx] = target_local[valid_indices[-1]]
+
+                vocab = center_vocabs[type_names[agent_type]].to(
+                    device=device,
+                    dtype=future_positions.dtype,
+                )
+                distances = torch.norm(
+                    vocab[:, frame_valid] - target_local[frame_valid].unsqueeze(0),
+                    dim=-1,
+                ).mean(dim=-1)
+                best_error, best_token = distances.min(dim=0)
+                token_ids[agent_idx, chunk_idx] = best_token
+                errors[agent_idx, chunk_idx] = best_error
+                threshold = self.retokenization_error_thresholds[agent_type]
+                target_valid[agent_idx, chunk_idx] = best_error <= threshold
+
+                if use_physical_decode:
+                    world, world_heading = self._token_chunk_world(
+                        best_token.view(1),
+                        agent_types[agent_idx].view(1),
+                        current_positions[agent_idx].view(1, 2),
+                        current_headings[agent_idx].view(1),
+                    )
+                    current_positions[agent_idx] = world[0, valid_indices[-1]]
+                    current_headings[agent_idx] = world_heading[
+                        0,
+                        valid_indices[-1],
+                    ]
+                else:
+                    selected = vocab[best_token]
+                    endpoint_local = selected[valid_indices[-1]]
+                    local_to_world = torch.stack([
+                        torch.stack([cos_heading, sin_heading]),
+                        torch.stack([-sin_heading, cos_heading]),
+                    ])
+                    current_positions[agent_idx] = (
+                        endpoint_local @ local_to_world
+                        + current_positions[agent_idx]
+                    )
+                    if valid_indices.numel() >= 2:
+                        last_delta = (
+                            selected[valid_indices[-1]]
+                            - selected[valid_indices[-2]]
+                        )
+                    else:
+                        last_delta = selected[valid_indices[-1]]
+                    if torch.norm(last_delta) > 1e-6:
+                        current_headings[agent_idx] = (
+                            current_headings[agent_idx]
+                            + torch.atan2(last_delta[1], last_delta[0])
+                        )
+        return token_ids, errors, target_valid, local_endpoints
+
+    def _continuous_recovery_loss(self, logits, packed, masked_supervision):
+        retokenization_valid = packed.get('retokenization_valid')
+        target_endpoints = packed.get('recovery_target_local_endpoint')
+        if retokenization_valid is None or target_endpoints is None:
+            return logits.sum() * 0.0
+        recovery_mask = (
+            masked_supervision
+            & packed.get('loss_mask_base', masked_supervision)
+            & ~retokenization_valid.bool()
+        )
+        if not recovery_mask.any():
+            return logits.sum() * 0.0
+
+        probabilities = F.softmax(logits, dim=-1)
+        predicted_endpoints = target_endpoints.new_zeros(target_endpoints.shape)
+        center_vocabs = self._token_center_vocabs()
+        for type_name, type_id in (('veh', 0), ('ped', 1), ('cyc', 2)):
+            type_mask = recovery_mask & (packed['agent_type_ids'] == type_id)
+            if not type_mask.any():
+                continue
+            endpoints = center_vocabs[type_name][:, -1].to(
+                device=logits.device,
+                dtype=logits.dtype,
+            )
+            predicted_endpoints[type_mask] = probabilities[type_mask] @ endpoints
+        return F.smooth_l1_loss(
+            predicted_endpoints[recovery_mask],
+            target_endpoints[recovery_mask].to(dtype=logits.dtype),
+            reduction='mean',
+        )
+
+    def _retokenize_training_view(self, view):
+        agent = view['agent']
+        future_start = self.num_historical_steps
+        future_end = future_start + self.ar_prediction_tokens * self.ar_token_steps
+        future_positions = agent['position'][
+            :,
+            future_start:future_end,
+            :2,
+        ].reshape(
+            -1,
+            self.ar_prediction_tokens,
+            self.ar_token_steps,
+            2,
+        )
+        future_valid = agent['valid_mask'][:, future_start:future_end].reshape(
+            -1,
+            self.ar_prediction_tokens,
+            self.ar_token_steps,
+        )
+        start_positions = agent['position'][:, self.num_historical_steps - 1, :2]
+        start_headings = agent['heading'][:, self.num_historical_steps - 1]
+        token_ids, errors, retokenization_valid, local_endpoints = (
+            self._retokenize_future(
+                future_positions=future_positions,
+                future_valid=future_valid,
+                start_positions=start_positions,
+                start_headings=start_headings,
+                agent_types=agent['type'],
+            )
+        )
+
+        target_slice = slice(
+            self.ar_history_tokens,
+            self.ar_history_tokens + self.ar_prediction_tokens,
+        )
+        target_token_valid = agent['agent_valid_mask'][:, target_slice].bool()
+        agent['token_idx'][:, target_slice] = token_ids
+        (
+            _target_traj,
+            _target_head,
+            _target_frame_valid,
+            token_positions,
+            token_headings,
+            _end_positions,
+            _end_headings,
+        ) = self._decode_token_sequence(
+            token_ids,
+            target_token_valid,
+            agent['type'],
+            start_positions,
+            start_headings,
+        )
+        if 'token_pos' in agent:
+            agent['token_pos'][:, target_slice] = token_positions
+        if 'token_heading' in agent:
+            agent['token_heading'][:, target_slice] = token_headings
+        return {
+            'retokenization_error': errors,
+            'retokenization_valid': retokenization_valid & target_token_valid,
+            'recovery_target_local_endpoint': local_endpoints,
+        }
+
+    def _select_closed_loop_anchor(self, data, rollout_depth):
+        token_count = int(data['agent']['token_idx'].shape[1])
+        frame_count = int(data['agent']['position'].shape[1])
+        minimum_anchor = self.ar_history_tokens
+        required_future_tokens = self.ar_prediction_tokens + rollout_depth
+        maximum_anchor = token_count - required_future_tokens
+        maximum_frame_anchor = (
+            frame_count - 1 - required_future_tokens * self.ar_token_steps
+        ) // self.ar_token_steps
+        maximum_anchor = min(maximum_anchor, maximum_frame_anchor)
+        if maximum_anchor < minimum_anchor:
+            return None
+        if maximum_anchor == minimum_anchor:
+            return minimum_anchor
+        return int(torch.randint(
+            minimum_anchor,
+            maximum_anchor + 1,
+            (1,),
+            device=data['agent']['token_idx'].device,
+        ).item())
+
+    @torch.no_grad()
+    def _build_model_rollout_training_view(self, data, rollout_depth):
+        start_anchor = self._select_closed_loop_anchor(data, rollout_depth)
+        if start_anchor is None:
+            return None
+        start_view, _tokens, _valid, _anchor = self._build_ar_training_view(
+            data,
+            anchor_token=start_anchor,
+            perturb=False,
+        )
+        (
+            packed,
+            summary,
+            _ft,
+            future_valid,
+            generation_agents,
+            _supervision_agents,
+            _agent_batch,
+        ) = self._build_diffusion_inputs(start_view, rollout_valid=True)
+        if packed is None:
+            return None
+        sampled_ids, sampled_confidence = self._diffusion_sample(
+            summary=summary,
+            token_positions=packed['token_positions'],
+            token_headings=packed['token_headings'],
+            token_agent_ids=packed['token_agent_ids'],
+            chunk_ids=packed['chunk_ids'],
+            valid_mask=packed['valid_mask'],
+            agent_context=packed['agent_context'],
+            agent_type_ids=packed['agent_type_ids'],
+            agent_shape_embeddings=packed['agent_shape_embeddings'],
+            map_context=packed.get('map_context'),
+            map_positions=packed.get('map_positions'),
+            map_orientations=packed.get('map_orientations'),
+            map_batch=packed.get('map_batch'),
+            map_valid_mask=packed.get('map_valid_mask'),
+            packed=packed,
+        )
+        num_agents = int(data['agent']['position'].shape[0])
+        per_agent_tokens, _confidence = self._unpack_sampled_tokens(
+            sampled_ids,
+            sampled_confidence,
+            packed,
+            num_agents,
+        )
+        committed_tokens = per_agent_tokens[:, :rollout_depth]
+        committed_valid = (
+            future_valid[:, :rollout_depth].bool()
+            & generation_agents[:, None]
+        )
+        current_index = self.num_historical_steps - 1
+        start_positions = start_view['agent']['position'][:, current_index, :2]
+        start_headings = start_view['agent']['heading'][:, current_index]
+        (
+            committed_traj,
+            committed_head,
+            committed_frame_valid,
+            committed_token_pos,
+            committed_token_heading,
+            _end_positions,
+            _end_headings,
+        ) = self._decode_token_sequence(
+            committed_tokens,
+            committed_valid,
+            start_view['agent']['type'],
+            start_positions,
+            start_headings,
+        )
+
+        history_token_ids = self._roll_history_token_ids(
+            start_view['agent']['token_idx'][:, :self.ar_history_tokens],
+            committed_tokens,
+        )
+        history_token_valid = self._roll_history_token_valid(
+            start_view['agent']['agent_valid_mask'][:, :self.ar_history_tokens],
+            committed_valid,
+        )
+        history_token_pos = self._roll_history_token_state(
+            start_view['agent']['token_pos'][:, :self.ar_history_tokens],
+            committed_token_pos,
+        )
+        history_token_heading = self._roll_history_token_state(
+            start_view['agent']['token_heading'][:, :self.ar_history_tokens],
+            committed_token_heading,
+        )
+        history_frame_pos = torch.cat(
+            [
+                start_view['agent']['position'][
+                    :,
+                    :self.num_historical_steps,
+                    :2,
+                ],
+                committed_traj,
+            ],
+            dim=1,
+        )[:, -self.num_historical_steps:]
+        history_frame_heading = torch.cat(
+            [
+                start_view['agent']['heading'][:, :self.num_historical_steps],
+                committed_head,
+            ],
+            dim=1,
+        )[:, -self.num_historical_steps:]
+        history_frame_valid = torch.cat(
+            [
+                start_view['agent']['valid_mask'][:, :self.num_historical_steps],
+                committed_frame_valid,
+            ],
+            dim=1,
+        )[:, -self.num_historical_steps:]
+        final_view = self._build_ar_rollout_view(
+            data,
+            history_token_ids,
+            history_token_pos,
+            history_token_heading,
+            history_frame_pos,
+            history_frame_heading,
+            history_frame_valid,
+            generation_agents,
+            history_token_valid=history_token_valid,
+        )
+
+        final_anchor = start_anchor + rollout_depth
+        source_frame_start = final_anchor * self.ar_token_steps + 1
+        source_frame_end = (
+            source_frame_start
+            + self.ar_prediction_tokens * self.ar_token_steps
+        )
+        target_frame_slice = slice(
+            self.num_historical_steps,
+            self.num_historical_steps
+            + self.ar_prediction_tokens * self.ar_token_steps,
+        )
+        final_view['agent']['position'][:, target_frame_slice] = data['agent'][
+            'position'
+        ][:, source_frame_start:source_frame_end, :2]
+        for key in ('heading', 'valid_mask'):
+            final_view['agent'][key][:, target_frame_slice] = data['agent'][key][
+                :, source_frame_start:source_frame_end
+            ]
+        target_token_slice = slice(
+            self.ar_history_tokens,
+            self.ar_history_tokens + self.ar_prediction_tokens,
+        )
+        final_view['agent']['agent_valid_mask'][:, target_token_slice] = data[
+            'agent'
+        ]['agent_valid_mask'][
+            :, final_anchor:final_anchor + self.ar_prediction_tokens
+        ]
+        return final_view
+
+    def _clean_retokenization_metadata(self, view):
+        agent = view['agent']
+        target_slice = slice(
+            self.ar_history_tokens,
+            self.ar_history_tokens + self.ar_prediction_tokens,
+        )
+        target_valid = agent['agent_valid_mask'][:, target_slice].bool()
+        num_agents = int(target_valid.shape[0])
+        return {
+            'retokenization_error': torch.zeros(
+                num_agents,
+                self.ar_prediction_tokens,
+                device=target_valid.device,
+            ),
+            'retokenization_valid': target_valid.clone(),
+            'recovery_target_local_endpoint': torch.zeros(
+                num_agents,
+                self.ar_prediction_tokens,
+                2,
+                device=target_valid.device,
+            ),
+        }
+
+    def _build_ar_frontier_training_view(self, data):
+        epoch = int(getattr(self, 'current_epoch', 0))
+        perturb_prob, rollout_prob = self._ar_closed_loop_curriculum(epoch)
+        rollout_draw = torch.rand((), device=data['agent']['token_idx'].device)
+        if rollout_prob > 0.0 and rollout_draw < rollout_prob:
+            rollout_depth = int(torch.randint(
+                1,
+                int(getattr(self, 'ar_closed_loop_max_depth', 1)) + 1,
+                (1,),
+                device=data['agent']['token_idx'].device,
+            ).item())
+            rollout_view = self._build_model_rollout_training_view(
+                data,
+                rollout_depth,
+            )
+            if rollout_view is not None:
+                metadata = self._retokenize_training_view(rollout_view)
+                return rollout_view, metadata, 'rollout', rollout_depth
+
+        view, _tokens, _valid, _anchor = self._build_ar_training_view(
+            data,
+            perturb=False,
+        )
+        if perturb_prob > 0.0 and torch.rand(
+            (),
+            device=data['agent']['token_idx'].device,
+        ) < perturb_prob:
+            self._perturb_ar_history_state(view)
+            metadata = self._retokenize_training_view(view)
+            return view, metadata, 'perturb', 0
+        return view, self._clean_retokenization_metadata(view), 'clean', 0
 
     def _select_anchor_token(self, data, anchor_token=None):
         if anchor_token is not None:
@@ -260,15 +981,27 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
         )
 
     def training_step(self, data, batch_idx):
+        del batch_idx
         data = self._prepare_batch(data)
+        retokenization = None
+        state_mode = 'clean'
+        rollout_depth = 0
         if self.ar_rolling_anchor_training:
-            data, _target_tokens, _target_valid, _anchor = self._build_ar_training_view(data)
+            if getattr(self, 'ar_objective', 'maskgit') == 'causal_frontier_v1':
+                data, retokenization, state_mode, rollout_depth = (
+                    self._build_ar_frontier_training_view(data)
+                )
+            else:
+                data, _target_tokens, _target_valid, _anchor = self._build_ar_training_view(data)
         packed, summary, _ft, _fv, _generation_agents, _supervision_agents, _agent_batch = self._build_diffusion_inputs(data)
         if packed is None:
             zero_loss = self._zero_connected_loss()
             self.log('train_empty_diffusion_batch', zero_loss.detach().new_ones(()),
                      prog_bar=False, on_step=True, on_epoch=True, batch_size=1)
             return zero_loss
+        if retokenization is not None:
+            for key, values in retokenization.items():
+                packed[key] = self._pack_agent_window_values(values, packed)
 
         diffusion_loss, mask_acc = self._compute_diffusion_loss(packed, summary)
         ntp_loss = self._compute_optional_ntp_loss(data, diffusion_loss)
@@ -283,6 +1016,25 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
         self.log('ntp_loss', ntp_loss, prog_bar=True, on_step=True, on_epoch=True,
                  batch_size=1)
         self.log('train_mask_acc', mask_acc, on_step=True, on_epoch=True, batch_size=1)
+        if getattr(self, 'ar_objective', 'maskgit') == 'causal_frontier_v1':
+            for name in ('clean', 'perturb', 'rollout'):
+                value = loss.new_tensor(1.0 if state_mode == name else 0.0)
+                self.log(
+                    f'train_ar_state_mode_{name}',
+                    value,
+                    prog_bar=False,
+                    on_step=True,
+                    on_epoch=True,
+                    batch_size=1,
+                )
+            self.log(
+                'train_ar_rollout_depth',
+                loss.new_tensor(float(rollout_depth)),
+                prog_bar=False,
+                on_step=True,
+                on_epoch=True,
+                batch_size=1,
+            )
         return loss
 
     def validation_step(self, data, batch_idx):
