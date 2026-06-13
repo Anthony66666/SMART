@@ -1,3 +1,5 @@
+import subprocess
+import sys
 import unittest
 from pathlib import Path
 
@@ -17,6 +19,17 @@ class CompareMotionModelsTest(unittest.TestCase):
         self.assertEqual(spec.name, "ar")
         self.assertEqual(spec.config_path, "configs/train/a.yaml")
         self.assertEqual(spec.ckpt_path, "checkpoints/ar/epoch=00.ckpt")
+
+    def test_script_help_runs_from_file_path(self):
+        result = subprocess.run(
+            [sys.executable, "scripts/compare_motion_models.py", "--help"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertIn("--model", result.stdout)
 
     def test_1000_step_configs_use_identical_data_and_expected_predictors(self):
         expected = {

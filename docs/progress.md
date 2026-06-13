@@ -1,6 +1,26 @@
 # Progress
 
 ## 2026-06-14 CST
+- Task: Completed the matched 1000-step causal flow-matching local run and four-model comparison.
+- Result: `configs/train/train_scalable_causal_flow_matching_1000.yaml` completed `max_steps=1000`, triggered step-1000 validation, and wrote `checkpoints/causal_flow_matching_1000/last.ckpt`. Validation/step visualization outputs were generated under `outputs/val_causal_flow_matching_1000/` and `outputs/step_causal_flow_matching_1000/`.
+- Metrics: Final logged flow-matching validation metrics were `val_minADE=2.450`, `val_minFDE=8.410`, `val_ar_window_loss=0.000464`, `val_ar_window_mask_acc=1.000`, `val_rollout_score=19.40`, and `train_loss_epoch=0.158`.
+- Comparison: `scripts/compare_motion_models.py` produced `outputs/model_comparison_1000/records.csv`, `summary.csv`, `manifest.json`, and 32 per-model/per-scene PNGs for indices 0-7. The 8-scene summary was: `causal_flow` ADE/FDE `5.4096/11.4135`, `ar_baseline` `5.8834/12.1168`, `causal_diffusion` `6.4491/13.6338`, and `ar_frontier` `7.9828/15.6503`, all with coverage `1.0`.
+- Fix: The comparison script now inserts the repo root into `sys.path` when run as `python scripts/compare_motion_models.py`, and `tests/test_compare_motion_models.py` covers `--help` execution from the file path.
+- Next: Commit/push the tracked code, config, and docs updates while keeping generated `checkpoints/`, `outputs/`, `cache/`, and Lightning artifacts out of Git.
+
+## 2026-06-14 CST
+- Task: Ran the matched 1000-step causal diffusion model locally.
+- Result: `configs/train/train_scalable_causal_diffusion_1000.yaml` completed `max_steps=1000` on the same 10% Waymo training subset, triggered the step-1000 validation pass, and wrote `checkpoints/causal_diffusion_1000/last.ckpt`. Validation/step visualization outputs were generated under `outputs/val_causal_diffusion_1000/` and `outputs/step_causal_diffusion_1000/`.
+- Metrics: Final logged validation metrics were `val_minADE=3.020`, `val_minFDE=9.990`, `val_ar_window_loss=4.040`, `val_ar_window_mask_acc=0.249`, and `val_rollout_score=24.10`.
+- Next: Run the remaining matched 1000-step causal flow matching job, then compare all four checkpoints.
+
+## 2026-06-14 CST
+- Task: Ran the matched 1000-step AR causal-frontier diffusion variant locally.
+- Result: `configs/train/train_scalable_ar_diffusion_frontier_local.yaml` completed `max_steps=1000` on the same 10% Waymo training subset, triggered the step-1000 validation pass, and wrote `checkpoints/ar_frontier_1000/last.ckpt`. Validation/step visualization outputs were generated under `outputs/val_ar_frontier_1000/` and `outputs/step_ar_frontier_1000/`.
+- Metrics: Final logged validation metrics were `val_minADE=4.520`, `val_minFDE=12.70`, `val_ar_window_loss=4.020`, and `val_ar_window_mask_acc=0.187`.
+- Next: Run the remaining matched 1000-step jobs for causal diffusion and causal flow matching, then compare all four checkpoints.
+
+## 2026-06-14 CST
 - Task: Ran the matched 1000-step AR diffusion baseline locally.
 - Result: `configs/train/train_scalable_ar_diffusion_baseline_1000.yaml` completed `max_steps=1000` on the 10% Waymo training subset, triggered the step-1000 validation pass, and wrote `checkpoints/ar_baseline_1000/last.ckpt`. Validation/step visualization outputs were generated under `outputs/val_ar_baseline_1000/` and `outputs/step_ar_baseline_1000/`.
 - Metrics: Final logged validation metrics were `val_minADE=2.920`, `val_minFDE=8.670`, `val_ar_window_loss=3.440`, and `val_ar_window_mask_acc=0.290`.

@@ -3,12 +3,17 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
 import torch
 from torch_geometric.data import Batch
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from smart.callbacks.validation_visualization import save_validation_visualization
 from smart.datasets.scalable_dataset import MultiDataset
