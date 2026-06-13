@@ -1,5 +1,54 @@
 # Progress
 
+## 2026-06-13 CST
+- Task: Added the server training config for causal SMART-token flow matching.
+- Result: Added `configs/train/train_scalable_causal_flow_matching.yaml` for the 14-GPU server path with `/raid/haoq_lab/wangshijie/data/waymo/{training,validation}`, `smart_causal_flow_matching`, `flow_matching_v1`, and bounded first-run rollout validation via `flow_integration_steps: 1`.
+- Validation: Config loading and model construction should be verified before launch; use `--save_ckpt_path checkpoints/causal_flow_matching` for server runs.
+- Next: Submit the flow-matching code/config changes to GitHub, then start the server run from the new config.
+
+## 2026-06-13 CST
+- Task: Added a causal SMART-token flow-matching predictor as an additive replacement path for causal diffusion.
+- Result: New `smart_causal_flow_matching` predictor reuses the causal receding-horizon sim-agent rollout shell, preserves 4-token proposal / 1-token commit semantics, and replaces the discrete frontier diffusion objective/sampler with token-simplex flow matching and Euler frontier integration. Train/validation entrypoints and the causal smoke/visualization scripts now support the new predictor without deleting `smart_causal_diffusion`.
+- Files: `smart/model/smart_causal_flow_matching.py`, `smart/model/__init__.py`, `train.py`, `val.py`, `scripts/smoke_causal_guidance_modes.py`, `configs/train/train_scalable_causal_flow_matching_local.yaml`, `configs/validation/validation_scalable_causal_flow_matching.yaml`, `tests/test_smart_causal_flow_matching.py`
+- Validation: Focused flow tests passed; the combined flow/causal smoke/visual test bundle passed 75 tests; `py_compile` passed for touched Python files. A CUDA real-batch loss smoke on `data/valid_demo` produced finite `flow_loss=17.5625` over 192 packed tokens. An untrained CUDA inference smoke wrote `outputs/causal_flow_matching_untrained_smoke/metrics.json`, and a visual smoke wrote `outputs/causal_flow_matching_untrained_visual_smoke/idx_00000_1c83f56236e33b4_guidance_modes.png` (`RGBA`, `1488x930`).
+- Next: Train a real flow-matching checkpoint from the new local config before comparing ADE/FDE, speed ratios, or guidance quality against causal diffusion.
+
+## 2026-06-13 CST
+- Task: Changed causal diffusion training to use model-rollout states from epoch 0.
+- Result: `_closed_loop_curriculum()` now returns `closed_loop_batch_ratio_max` rollout probability immediately, keeping perturb disabled for epochs 0-3 and enabling 25% perturb from epoch 4 onward. Updated schedule docs and the durable project plan/decision notes.
+- Evidence: Added/updated `ClosedLoopCurriculumTest.test_curriculum_uses_model_rollout_from_epoch_zero`; the focused test passes.
+
+## 2026-06-13 CST
+- Task: Swept epoch-4 causal diffusion inference guidance settings to test whether poor results come from restrictive reranking.
+- Result: Added `scripts/sweep_causal_guidance_settings.py` to reuse the existing causal guidance smoke path while changing only inference-time model attributes. Ran two CUDA sweeps on all 11 `data/valid_demo` scenes with `/mnt/d/casual_v2_epoch=04.ckpt`. The core sweep covered `none`, deterministic top-1/no-energy safe, default safe, weak energy, and speed4 variants; the speed-floor sweep covered higher `commit_min_speed_ratio` and no reference-speed decay.
+- Finding: The main issue is not the default safety energy alone. `safe_top1_no_energy` already predicts slowly (`moving_speed_ratio=0.6199`) but with much better ADE/FDE than stochastic `none`, so the top-ranked token logits are biased toward conservative trajectories while multinomial `none` reaches higher speed by sampling worse tokens. The best tested setting is `commit_min_speed_ratio=0.75` and `commit_speed_reference_decay=1.0`, giving ADE/FDE `2.2930/5.2324`, pred speed `1.2919`, and moving-speed ratio `0.7485`, versus default safe `2.5538/5.7098`, `1.0400`, and `0.6118`.
+- Outputs: `outputs/causal_guidance_epoch04_setting_sweep_core/` and `outputs/causal_guidance_epoch04_setting_sweep_speed_floor/` contain `metrics.json`, `records.csv`, `summary.csv`, `ranked_summary.csv`, and `settings.csv`.
+- Validation: `python -m py_compile scripts/sweep_causal_guidance_settings.py` passed before both sweeps.
+
+## 2026-06-13 CST
+- Task: Generated whole-scene visual comparisons for `none` versus `safe` guidance on the current epoch-4 causal checkpoint.
+- Result: Used `/mnt/d/casual_v2_epoch=04.ckpt` with `missing=0`, `unexpected=0` to render all 11 `data/valid_demo` scenes. Each scene has separate full-scene `none` and `safe` PNGs plus a side-by-side whole-scene comparison PNG. These plots use the official validation visualization path, so they show all current-valid scene agents rather than only the selected guidance target and ego agent.
+- Outputs: `outputs/causal_guidance_epoch04_whole_scene_none_safe/per_mode/` contains 22 single-mode PNGs, `outputs/causal_guidance_epoch04_whole_scene_none_safe/compare/` contains 11 `none_vs_safe` PNGs, and the run wrote `manifest.json`, `records.csv`, `summary.csv`, and `summary.json`.
+- Validation: Verified PNG counts and dimensions (`per_mode` images are `1440x1440`, compare images are `1890x945`), inspected `idx_00000_1c83f56236e33b4_none_vs_safe_whole_scene.png`, and confirmed `summary.csv` has the expected `none`/`safe` rows.
+
+## 2026-06-13 CST
+- Task: Re-ran matched causal speed diagnostics on the actual epoch-4 checkpoint path.
+- Result: The exact user-provided `/mnt/d/causal_v2_epoch=04.ckpt` path is not visible in this workspace, but the actual file `/mnt/d/casual_v2_epoch=04.ckpt` exists and loads as `epoch=4`, `global_step=21745`, with `missing=0`, `unexpected=0`. On all 11 `data/valid_demo` scenes, `none` predicts mean speed `1.9128` vs GT `1.7695`, moving-speed ratio `0.7944`, p50 ratio `0.7185`, and pair-weighted ratio `0.8236`. `safe` predicts mean speed `1.0400`, moving-speed ratio `0.6118`, p50 ratio `0.5651`, and pair-weighted ratio `0.5982`.
+- Finding: The epoch-4 checkpoint changes the speed diagnosis: `none` is no longer the severe low-speed collapse seen at epoch 2, while `safe` still imposes a clear slowdown. ADE/FDE are better under `safe` (`3.7364/8.9915 -> 2.5538/5.7098`) despite the speed penalty, so further debugging should separate raw token-logit quality in `none` from guidance/rerank conservatism in `safe`.
+- Outputs: `outputs/causal_speed_diag_epoch04_none_safe/metrics.json`, `records.csv`, and `summary.csv`.
+
+## 2026-06-13 CST
+- Task: Tested whether 4-token causal/diffusion proposals mis-handle chunk 1-3 coordinate anchors or heading when using real SMART tokens.
+- Result: Added a regression that loads `smart/tokens/cluster_frame_5_2048.pkl`, selects high-displacement and turning tokens for `veh`, `ped`, and `cyc`, and checks five start headings (`0`, `30`, `90`, `-90`, and `180` degrees). `_token_chunk_world()` matches a manual query-relative decode, and `_refresh_token_geometry()` matches all-known and proposal-carried query anchors/headings. With only chunk 0 known, masked tails correctly fall back to the latest known pose/heading.
+- Finding: The coordinate transform itself is not keeping chunk 1-3 in the first token's frame, and heading rotation is consistent for real token corners. The remaining mismatch risk is architectural: early masked tail chunks only have fallback/proposal geometry until they are sampled/committed, whereas original SMART updates query geometry, token embeddings, and motion features in a strict one-token recurrent loop.
+- Validation: `python -m unittest tests.test_smart_diffusion_smart_parity.SMARTDiffusionSMARTParityTest.test_real_token_four_chunk_geometry_and_heading_are_query_relative` passed. The related four-test bundle covering endpoint, proposal confidence, real-token heading, and rollout visualization query refresh also passed.
+
+## 2026-06-13 CST
+- Task: Diagnosed causal v2 epoch-2 speed collapse with matched `none` versus `safe` guidance on all 11 `data/valid_demo` scenes.
+- Result: `/mnt/d/causal_v2_epoch=02.ckpt` loaded with `missing=0`, `unexpected=0`. `none` already predicts slow trajectories: mean pred speed `0.9240` vs GT `1.7695`, moving-speed ratio `0.5518` and pair-weighted ratio `0.5486`. `safe` is only slightly slower: mean pred speed `0.8665`, moving-speed ratio `0.5271` and pair-weighted ratio `0.5153`.
+- Finding: The primary speed issue is present without safety reranking, so the root cause is likely training distribution/token logits rather than `safe` energy alone. `safe` improves ADE/FDE on this smoke (`3.1711/6.8125 -> 2.8586/6.1969`) while adding a small additional speed penalty.
+- Outputs: `outputs/causal_speed_diag_epoch02_none_safe/metrics.json`, `records.csv`, and `summary.csv`.
+
 ## 2026-06-12 CST
 - Task: Fixed three causal diffusion review issues in sampler and guidance metrics.
 - Result: Seed-locked ego/edit sampling now preserves global chunk timestep semantics, so editable later chunks decode at their own causal frontier `t`; no-finite ego TTC diagnostics now remain infinite instead of becoming zero; smoke and visualization token-change rates now divide by valid token count only.

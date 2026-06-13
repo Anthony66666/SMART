@@ -1,0 +1,162 @@
+# From-scratch causal SMART-token flow matching.
+time_info: &time_info
+  num_historical_steps: 11
+  num_future_steps: 80
+  use_intention: True
+  token_size: 2048
+
+Dataset:
+  root:
+  train_batch_size: 4
+  val_batch_size: 1
+  test_batch_size: 1
+  shuffle: True
+  num_workers: 4
+  pin_memory: True
+  persistent_workers: True
+  train_raw_dir: ["/raid/haoq_lab/wangshijie/data/waymo/training"]
+  val_raw_dir: ["/raid/haoq_lab/wangshijie/data/waymo/validation"]
+  test_raw_dir:
+  transform: WaymoTargetBuilder
+  train_processed_dir:
+  val_processed_dir:
+  test_processed_dir:
+  dataset: "scalable"
+  <<: *time_info
+
+Trainer:
+  strategy: ddp_find_unused_parameters_true
+  accelerator: "gpu"
+  devices: 14
+  max_epochs: 32
+  save_ckpt_path:
+  num_nodes: 1
+  mode:
+  ckpt_path:
+  precision: 32
+  accumulate_grad_batches: 1
+  limit_val_batches: 50
+  check_val_every_n_epoch: 1
+  monitor_metric: "val_rollout_score"
+  monitor_mode: "min"
+
+Visualization:
+  enabled: true
+  interval_epochs: 1
+  sample_indices: [0, 1, 2, 3]
+  output_dir: "./outputs/val_causal_flow_matching"
+  max_agents: 0
+  step_viz:
+    enabled: true
+    interval_steps: 2000
+    sample_indices: [110, 111, 112, 113]
+    output_dir: "./outputs/step_causal_flow_matching"
+
+Model:
+  mode: "train"
+  predictor: "smart_causal_flow_matching"
+  dataset: "waymo"
+  input_dim: 2
+  hidden_dim: 128
+  output_dim: 2
+  output_head: False
+  num_heads: 8
+  <<: *time_info
+  head_dim: 16
+  dropout: 0.1
+  num_freq_bands: 64
+  lr: 0.0005
+  # LambdaLR is stepped once per epoch by Lightning.
+  warmup_steps: 2
+  total_steps: 32
+  inference_token: True
+  rollout_num: 1
+  decoder:
+    <<: *time_info
+    num_map_layers: 3
+    num_agent_layers: 6
+    a2a_radius: 60
+    pl2pl_radius: 10
+    pl2a_radius: 30
+    time_span: 30
+  diffusion:
+    future_chunk_steps: 5
+    history_tokens: 2
+    prediction_tokens: 4
+    commit_tokens: 1
+    carry_tail_proposal: true
+    proposal_conditioning_enabled: true
+    causal_objective: flow_matching_v1
+    flow_loss_weight: 1.0
+    # Keep server epoch-end rollout bounded for the first training run.
+    # Increase to 2 or 4 for final quality sweeps after a checkpoint exists.
+    flow_integration_steps: 1
+    flow_sampling_strategy: argmax
+    token_steps: 5
+    total_rollout_steps: 80
+    local_map_refresh: rescreen
+    rolling_anchor_training: true
+    state_perturb_pos_sigma_m: 0.3
+    state_perturb_heading_sigma_rad: 0.05
+    closed_loop_max_depth: 4
+    closed_loop_batch_ratio_max: 0.5
+    current_state_enabled: true
+    current_state_edges: true
+    history_recency_decay: 0.5
+    # Full training-set perturbed P99 calibration (10,000 sampled scenes).
+    retokenization_error_thresholds: [0.7379697561264038, 0.8562850952148438, 1.2705252170562744]
+    continuous_recovery_loss_weight: 0.0
+    frontier_loss_weight: 1.0
+    encoder_lr_scale: 0.5
+    num_steps: 4
+    num_layers: 6
+    eps: 1.0e-3
+    min_t: 1.0e-3
+    ntp_aux_loss_weight: 0.0
+    use_agent_context: true
+    use_type_embedding: true
+    use_map_context: true
+    max_map_tokens: 0
+    geometry_dropout_prob: 0.0
+    visible_token_corruption_prob: 0.0
+    target_category_only: true
+    agent_selection_mode: smart_inference
+    supervision_mode: smart_category3
+    metric_mode: smart_val_compatible
+    remask_confidence_temperature: 1.0
+    geometry_confidence_source_threshold: 0.2
+    safety_energy_enabled: true
+    safety_topk: 16
+    safety_energy_weight: 1.0
+    commit_safety_weight: 1.0
+    commit_speed_energy_weight: 2.0
+    commit_min_speed_ratio: 0.55
+    commit_speed_threshold: 1.0
+    commit_speed_reference_decay: 0.92
+    guidance:
+      mode: safe
+      safe_topk: 16
+      ego_stress_topk: 64
+      ego_edit_topk: 64
+      ego_interaction_alpha: 1.0
+      target_event_eta: 0.0
+      invalid_beta: 1.0
+      edit_gamma: 1.0
+      near_miss_distance: 2.0
+      ttc_threshold: 3.0
+      path_corridor_width: 2.0
+      conflict_tta_threshold: 1.0
+      offroad_distance: 4.0
+      hard_collision_weight: 10.0
+      target_spec: ego_risk
+    lane_distance_energy_weight: 1.0
+    lane_heading_energy_weight: 0.5
+    dynamics_energy_weight: 0.25
+    collision_energy_weight: 2.0
+    trajectory_dt: 0.1
+    max_acceleration: 6.0
+    max_yaw_rate: 1.2
+    collision_distance: 2.0
+    eval_inference_batches: 2
+    debug_validation_logging: true
+    freeze_encoder: false

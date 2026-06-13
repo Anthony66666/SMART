@@ -1,5 +1,19 @@
 # Decisions
 
+## Decision: Add causal SMART-token flow matching as a separate predictor
+- Date: 2026-06-13
+- Context: The user wanted a flow-matching model to replace the current causal diffusion model for the same sim-agent rollout task, without deleting existing code.
+- Decision: Add `smart_causal_flow_matching` as an independent predictor that inherits the causal receding-horizon rollout shell, keeps the 4-token proposal / 1-token commit interface, and replaces the discrete frontier CE/sampler with token-simplex flow matching and Euler frontier integration.
+- Why: This preserves the stable training, validation, guidance, and visualization surfaces while letting flow matching be compared directly against `smart_causal_diffusion`.
+- Impact: New flow runs should use the dedicated flow configs and checkpoints; existing causal diffusion configs and checkpoints remain valid.
+
+## Decision: Start causal model-rollout training at epoch 0
+- Date: 2026-06-13
+- Context: Later causal checkpoints showed conservative token logits and the user wanted to remove the clean-only warmup so training sees its own closed-loop states immediately.
+- Decision: `_closed_loop_curriculum()` now returns nonzero model-rollout probability from epoch 0, using `closed_loop_batch_ratio_max` as the rollout rate. Perturb state training remains disabled for epochs 0-3 and starts at 25% from epoch 4 onward.
+- Why: This directly trains the causal decoder on the closed-loop state distribution used at inference instead of spending the first epochs on clean teacher-forced anchors only.
+- Impact: New causal runs are not comparable to older three-phase curriculum runs without noting the curriculum change. Monitor `train_state_mode`, `train_rollout_depth`, `train_retokenization_invalid_frac`, and speed-ratio diagnostics early in training.
+
 ## Decision: Use SMART-style speed-referenced commit reranking for causal diffusion
 - Date: 2026-06-12
 - Context: Causal v2 safe sampling remained conservative because commit selection could prefer low-speed tokens and then use the slowed predicted history as the next speed reference.

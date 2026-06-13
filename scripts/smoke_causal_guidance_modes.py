@@ -18,6 +18,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from smart.datasets.scalable_dataset import MultiDataset
 from smart.model import SMARTCausalDiffusion
+from smart.model import SMARTCausalFlowMatching
 from smart.transforms import WaymoTargetBuilder
 from smart.utils.config import load_config_act
 from smart.utils.torch_compat import register_checkpoint_safe_globals
@@ -55,10 +56,23 @@ def _load_dataset(config, raw_dir):
 
 def _load_model(config, ckpt_path, device):
     register_checkpoint_safe_globals()
-    model = SMARTCausalDiffusion(config.Model)
-    checkpoint = torch.load(ckpt_path, map_location="cpu")
-    state_dict = checkpoint.get("state_dict", checkpoint)
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    predictor_map = {
+        "smart_causal_diffusion": SMARTCausalDiffusion,
+        "smart_causal_flow_matching": SMARTCausalFlowMatching,
+    }
+    predictor_name = str(getattr(config.Model, "predictor", "smart_causal_diffusion"))
+    if predictor_name not in predictor_map:
+        raise ValueError(
+            "causal guidance smoke only supports smart_causal_diffusion "
+            "and smart_causal_flow_matching predictors."
+        )
+    model = predictor_map[predictor_name](config.Model)
+    if ckpt_path:
+        checkpoint = torch.load(ckpt_path, map_location="cpu")
+        state_dict = checkpoint.get("state_dict", checkpoint)
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    else:
+        missing, unexpected = [], []
     if missing:
         print(f"[load_model] missing keys: {len(missing)}")
     if unexpected:
