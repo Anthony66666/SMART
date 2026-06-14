@@ -259,11 +259,11 @@ class SMARTCausalFlowMatching(SMARTCausalDiffusion):
         )
 
         if frontier_mask.any():
-            loss = F.mse_loss(
-                velocity[frontier_mask],
-                target_velocity[frontier_mask],
-            ) * self.flow_loss_weight
-            predicted_target = (flow_probs + velocity).argmax(dim=-1)
+            token_loss = (
+                velocity[frontier_mask] - target_velocity[frontier_mask]
+            ).pow(2)
+            loss = token_loss.sum(dim=-1).mean() * self.flow_loss_weight
+            predicted_target = (source + velocity).argmax(dim=-1)
             acc = (
                 predicted_target[frontier_mask] == gt[frontier_mask]
             ).float().mean()

@@ -1,6 +1,13 @@
 # Progress
 
 ## 2026-06-14 CST
+- Task: Fixed misleading causal flow-matching objective diagnostics.
+- Result: `smart_causal_flow_matching` no longer averages flow MSE across the 2048 token vocabulary dimension before reducing over supervised tokens; loss now sums per-token velocity-vector error and then averages over frontier tokens. `val_ar_window_mask_acc` also no longer uses the teacher-forced interpolated `flow_state` to decide accuracy; it estimates the final token from `source + predicted_velocity` so a zero-velocity decoder cannot score as correct.
+- Finding: The previous flow-matching `val_ar_window_loss`/`val_ar_window_mask_acc` could be misleading: a zero velocity field has MSE near `1 / token_size` under the old reduction, and the old accuracy can be `1.0` because `flow_state` already has the GT token as argmax for any `t > 0`. This explains why later checkpoints can show very low loss/high acc while visual rollout quality is poor.
+- Validation: Added regressions in `tests/test_smart_causal_flow_matching.py`; the new tests fail on the old reduction/accuracy and pass after the fix. `python -m unittest tests.test_smart_causal_flow_matching tests.test_smart_causal_diffusion -v` passes.
+- Next: Retrain causal flow matching before comparing quality again; old flow-matching window loss/acc values are not comparable with the fixed objective diagnostics.
+
+## 2026-06-14 CST
 - Task: Completed the matched 1000-step causal flow-matching local run and four-model comparison.
 - Result: `configs/train/train_scalable_causal_flow_matching_1000.yaml` completed `max_steps=1000`, triggered step-1000 validation, and wrote `checkpoints/causal_flow_matching_1000/last.ckpt`. Validation/step visualization outputs were generated under `outputs/val_causal_flow_matching_1000/` and `outputs/step_causal_flow_matching_1000/`.
 - Metrics: Final logged flow-matching validation metrics were `val_minADE=2.450`, `val_minFDE=8.410`, `val_ar_window_loss=0.000464`, `val_ar_window_mask_acc=1.000`, `val_rollout_score=19.40`, and `train_loss_epoch=0.158`.

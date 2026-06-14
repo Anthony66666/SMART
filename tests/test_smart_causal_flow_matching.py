@@ -112,6 +112,80 @@ class CausalFlowMatchingObjectiveTest(unittest.TestCase):
             torch.full((model.token_size,), 1.0 / model.token_size),
         ))
 
+    def test_zero_velocity_has_full_token_vector_loss(self):
+        model = _flow_shell()
+        model.training = False
+        model._sample_frontier_ids = MethodType(
+            lambda self, loss_mask_base, chunk_ids: torch.tensor(
+                [0],
+                device=chunk_ids.device,
+            ),
+            model,
+        )
+
+        def zero_decode(
+            self,
+            flow_probs,
+            proxy_token_ids,
+            packed,
+            summary,
+            t,
+            geometry_known_mask,
+            **_kwargs,
+        ):
+            del self, proxy_token_ids, packed, summary, t
+            del geometry_known_mask, _kwargs
+            return torch.zeros_like(flow_probs)
+
+        model._decode_flow_velocity = MethodType(zero_decode, model)
+        packed = {
+            'token_ids': torch.tensor([[3]]),
+            'valid_mask': torch.ones(1, 1, dtype=torch.bool),
+            'loss_mask_base': torch.ones(1, 1, dtype=torch.bool),
+            'chunk_ids': torch.tensor([[0]]),
+        }
+
+        loss, _acc = model._compute_diffusion_loss(packed, torch.zeros(1, 4))
+
+        self.assertAlmostEqual(float(loss), 0.8, places=6)
+
+    def test_zero_velocity_does_not_get_teacher_forced_accuracy(self):
+        model = _flow_shell()
+        model.training = False
+        model._sample_frontier_ids = MethodType(
+            lambda self, loss_mask_base, chunk_ids: torch.tensor(
+                [0],
+                device=chunk_ids.device,
+            ),
+            model,
+        )
+
+        def zero_decode(
+            self,
+            flow_probs,
+            proxy_token_ids,
+            packed,
+            summary,
+            t,
+            geometry_known_mask,
+            **_kwargs,
+        ):
+            del self, proxy_token_ids, packed, summary, t
+            del geometry_known_mask, _kwargs
+            return torch.zeros_like(flow_probs)
+
+        model._decode_flow_velocity = MethodType(zero_decode, model)
+        packed = {
+            'token_ids': torch.tensor([[3]]),
+            'valid_mask': torch.ones(1, 1, dtype=torch.bool),
+            'loss_mask_base': torch.ones(1, 1, dtype=torch.bool),
+            'chunk_ids': torch.tensor([[0]]),
+        }
+
+        _loss, acc = model._compute_diffusion_loss(packed, torch.zeros(1, 4))
+
+        self.assertAlmostEqual(float(acc), 0.0, places=6)
+
 
 class CausalFlowMatchingSamplerTest(unittest.TestCase):
     def test_sampling_integrates_frontier_flow_and_returns_token_confidence(self):
