@@ -9,6 +9,8 @@ from smart.model import SMARTDiffusion
 from smart.model import SMARTAutoregressiveDiffusion
 from smart.model import SMARTCausalDiffusion
 from smart.model import SMARTCausalFlowMatching
+from smart.model import SMARTEmbeddedLanguageFlow
+from smart.model import SMARTHybridDiffusion
 from smart.transforms import WaymoTargetBuilder
 from smart.utils.config import load_config_act
 from smart.utils.log import Logging
@@ -43,6 +45,8 @@ if __name__ == '__main__':
         "smart_ar_diffusion": SMARTAutoregressiveDiffusion,
         "smart_causal_diffusion": SMARTCausalDiffusion,
         "smart_causal_flow_matching": SMARTCausalFlowMatching,
+        "smart_elf": SMARTEmbeddedLanguageFlow,
+        "smart_hybrid_diffusion": SMARTHybridDiffusion,
     }
 
     data_config = config.Dataset

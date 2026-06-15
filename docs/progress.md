@@ -1,5 +1,55 @@
 # Progress
 
+## 2026-06-15 CST
+- Task: Removed road centerline rendering from the multi-camera layout default.
+- Result: `scripts/render_multicamera_layout.py` now keeps map polylines disabled by default so camera-layout conditioning images contain agent 3D boxes without road centerline overlays. A new `--draw-map-polylines` flag keeps the old map-line drawing path available only for debugging.
+- Output: Re-rendered a real checkpoint smoke from `checkpoints/causal_diffusion_1000/last.ckpt` to `outputs/multicamera_layout_causal_diffusion_idx0_no_centerline/` with 4 frames, 6 cameras, `draw_map_polylines: false`, and a 6-view preview at `preview_frame_0000_grid.png`.
+- Validation: Added regressions for default no-map-line rendering and opt-in debug map-line rendering. `python -m unittest tests.test_multicamera_layout -v` passed 5 tests; `python -m py_compile scripts/render_multicamera_layout.py tests/test_multicamera_layout.py` passed.
+
+## 2026-06-15 CST
+- Task: Added MVP-0 multi-camera layout export for SMART-generated scenarios.
+- Result: Added `scripts/render_multicamera_layout.py`, which loads a normal SMART validation config/checkpoint, runs inference on the original SMART `HeteroData` / `Batch` input, converts predicted trajectories into a scene layout, and renders six synthetic camera-view PNG streams plus `manifest.json`. The renderer also exposes pure geometry helpers and a synthetic scene path for fast tests.
+- Files: `scripts/render_multicamera_layout.py`, `tests/test_multicamera_layout.py`, and durable docs.
+- Validation: `python -m unittest tests.test_multicamera_layout -v` passed 3 tests; `python -m py_compile scripts/render_multicamera_layout.py tests/test_multicamera_layout.py` passed; `python scripts/render_multicamera_layout.py --help` printed the CLI usage successfully.
+- Next: Run the exporter on a trained checkpoint and inspect projected agent counts/images before attaching a downstream video generator.
+
+## 2026-06-15 CST
+- Task: Added a composition-based SMART hybrid diffusion predictor.
+- Result: Added `smart_hybrid_diffusion` as a `pl.LightningModule` that does not inherit existing SMART predictor classes. It keeps original SMART batch inputs, composes the causal closed-loop SMART-token rollout core, registers train/validation/comparison entry points, and adds hybrid configs for local, matched 1000-step, and validation runs. The hybrid commit-speed energy now penalizes executable chunk-0 tokens that are too slow or too fast relative to the observed/reference speed band.
+- Files: `smart/model/smart_hybrid_diffusion.py`, `smart/model/__init__.py`, `train.py`, `val.py`, `scripts/compare_motion_models.py`, hybrid train/validation configs, focused tests, and durable docs.
+- Validation: `python -m unittest tests.test_smart_hybrid_diffusion tests.test_train_entrypoint_config tests.test_compare_motion_models -v` passed 14 tests; `python -m unittest tests.test_smart_causal_diffusion -v` passed 42 tests; `py_compile` passed for touched Python files; `git diff --check` passed. A config construction smoke printed `SMARTHybridDiffusion SMARTCausalDiffusion closed_loop_frontier_v1 True 1.25`.
+- Next: Train `configs/train/train_scalable_hybrid_diffusion_1000.yaml`, then rerun `scripts/compare_motion_models.py` with the hybrid checkpoint included on the same validation slice.
+
+## 2026-06-15 CST
+- Task: Aligned SMART ELF training loss with one-token commit inference.
+- Result: `SMARTEmbeddedLanguageFlow` now trains with commit-primary ELF loss: chunk-0 committed tokens use full weight and uncommitted tail proposal chunks use `elf_tail_loss_weight` as an auxiliary loss. The 1000-step and 3-epoch ELF configs keep `prediction_tokens: 4`, `commit_tokens: 1`, `carry_tail_proposal: true`, rolling-anchor training, and model-rollout state exposure, with `elf_tail_loss_weight: 0.25`.
+- Validation: Added regressions for commit-primary ELF loss weighting and ELF config invariants. `python -m unittest tests.test_smart_elf -v` passed after the implementation change.
+
+## 2026-06-15 CST
+- Task: Fixed two SMART ELF review issues against the original ELF behavior.
+- Result: `SMARTEmbeddedLanguageFlow` now computes flow MSE with an embedding-dimension mean before token averaging, matching original ELF loss scaling, and applies current-state context when `current_state_enabled` is true even though the ELF config keeps `ar_objective: maskgit`.
+- Validation: Added regressions for ELF flow-loss scaling and current-state context injection. The two focused tests passed after the code change.
+
+## 2026-06-15 CST
+- Task: Added a local 3-epoch SMART ELF training config.
+- Result: Added `configs/train/train_scalable_elf_3epoch_local.yaml`, which trains `smart_elf` for three full epochs on `/home/anthony/SimAgentJEPA/data/waymo/training_subset_10pct`, disables step-based truncation with `max_steps: -1`, validates once per epoch on eight validation batches, saves epoch checkpoints plus `last.ckpt`, and writes visualizations under `outputs/val_elf_3epoch/` and `outputs/step_elf_3epoch/`.
+- Validation: `python -m unittest tests.test_smart_elf.EmbeddedLanguageFlowConfigTest -v` passed; `python -m py_compile tests/test_smart_elf.py` passed; `git diff --check` passed.
+
+## 2026-06-15 CST
+- Task: Diagnosed and fixed the SMART ELF visualization issue where visibly moving vehicles appeared to only turn right.
+- Result: The issue was not a plotting bug. With the original sampler, the 1000-step ELF checkpoint's visibly moving agents on validation indices 0-3 had `dist>=10m` left/straight/right counts of `0/3/25`, and committed token ids collapsed to 40 unique ids. The root cause was final sampling from the weak auxiliary decoder logits rather than from the integrated ELF embedding state.
+- Fix: `SMARTEmbeddedLanguageFlow._diffusion_sample()` now projects final integrated embeddings back to token ids with `_elf_proxy_token_ids()` and uses auxiliary decoder logits only for confidence. Added `EmbeddedLanguageFlowSamplerTest.test_sampling_projects_final_embeddings_instead_of_auxiliary_logits` to prevent regression.
+- Evidence: Re-evaluating the same `checkpoints/elf_ar_1000/last.ckpt` with the fixed sampler on indices 0-3 wrote repaired PNGs under `outputs/elf_proxy_fix_diag/`; the diagnostic nearest-neighbor sampler produced `dist>=10m` left/straight/right counts of `32/15/20` and 525 unique committed token ids. The 4-scene repaired comparison summary was ADE/FDE `8.010/18.059` with coverage `1.0`.
+- Validation: `python -m unittest tests.test_smart_elf tests.test_compare_motion_models tests.test_smart_causal_flow_matching -v` passed 17 tests; the touched files passed `py_compile`; `git diff --check` passed.
+
+## 2026-06-15 CST
+- Task: Added a SMART Embedded Language Flow predictor and ran the matched 1000-step local training job.
+- Result: `smart_elf` now reuses the SMART autoregressive rollout shell for committed-state, map, and agent-context refresh, while its inner prediction window uses non-causal full-window embedding flow matching and a final token decoder. Registries and configs now support `Model.predictor: smart_elf`; `configs/train/train_scalable_elf_1000.yaml` completed `max_steps=1000` and wrote `checkpoints/elf_ar_1000/last.ckpt` with `global_step=1000`.
+- Metrics: Final logged validation metrics were `val_minADE=3.638`, `val_minFDE=9.644`, `val_ar_window_loss=52.870`, `val_ar_window_mask_acc=0.232`, `val_conflict_rate=0.217`, and `val_interaction_consistency=0.985`. ELF does not log causal-specific `val_rollout_score`, so the ELF 1000-step config now monitors `val_minADE`.
+- Outputs: Validation visualization wrote four 1440x1440 PNGs under `outputs/val_elf_1000/smart_elf/epoch_001/`; step visualization wrote four 1440x1440 PNGs under `outputs/step_elf_1000/smart_elf/step_001000/`.
+- Validation: `python -m unittest tests.test_smart_elf tests.test_compare_motion_models tests.test_smart_causal_flow_matching -v` passed 16 tests; `python -m py_compile smart/model/smart_elf.py smart/modules/elf_decoder.py tests/test_smart_elf.py tests/test_compare_motion_models.py train.py val.py scripts/compare_motion_models.py` passed; `git diff --check` passed. A real CUDA batch smoke produced finite ELF training loss before the 1000-step run.
+- Next: Add `smart_elf` to the matched comparison script invocation and compare it against `ar_baseline`, `ar_frontier`, `causal_diffusion`, and `causal_flow_matching` on the same validation slice before judging quality.
+
 ## 2026-06-14 CST
 - Task: Fixed misleading causal flow-matching objective diagnostics.
 - Result: `smart_causal_flow_matching` no longer averages flow MSE across the 2048 token vocabulary dimension before reducing over supervised tokens; loss now sums per-token velocity-vector error and then averages over frontier tokens. `val_ar_window_mask_acc` also no longer uses the teacher-forced interpolated `flow_state` to decide accuracy; it estimates the final token from `source + predicted_velocity` so a zero-velocity decoder cannot score as correct.

@@ -3,3 +3,5 @@ from smart.model.smart_diffusion import SMARTDiffusion
 from smart.model.smart_ar_diffusion import SMARTAutoregressiveDiffusion
 from smart.model.smart_causal_diffusion import SMARTCausalDiffusion
 from smart.model.smart_causal_flow_matching import SMARTCausalFlowMatching
+from smart.model.smart_elf import SMARTEmbeddedLanguageFlow
+from smart.model.smart_hybrid_diffusion import SMARTHybridDiffusion

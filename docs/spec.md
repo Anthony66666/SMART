@@ -11,6 +11,9 @@ Maintain this repository as the primary implementation repo for SMART baseline r
 - SMART-AR causal-frontier experiments that preserve the AR rollout interface while testing causal diffusion training ideas
 - Inference-time causal diffusion guidance for safe rollout and ego-centric safety-critical counterfactual editing without retraining
 - SMART causal flow-matching experiments that reuse the same causal rollout and visualization interfaces as causal diffusion
+- SMART embedded-language-flow experiments that reuse the SMART autoregressive rollout shell while replacing the inner short-window decoder with non-causal embedding-space flow matching
+- SMART hybrid diffusion experiments that keep the original SMART input batch, avoid existing predictor inheritance, and combine closed-loop causal frontier rollout with bidirectional commit-speed calibration
+- Multi-camera layout export for SMART-generated scenarios, producing camera-view conditioning frames for downstream driving video generation without changing SMART model inputs
 - Config, evaluation, visualization, and workflow support needed to compare baseline SMART and SMART-Diffusion
 - Historical JEPA code/config retention without active `train.py` / `val.py` predictor support
 - Repo-local operating workflow for graph-first code exploration and durable task memory
@@ -46,9 +49,12 @@ Maintain this repository as the primary implementation repo for SMART baseline r
 7. Train `smart_causal_diffusion` v2 from scratch as the road-stability redesign: discrete frontier supervision, four-token revisable plans with one-token commits, proposal carry, recency/current-motion context, current-anchor interaction edges, epoch-0 model-rollout curriculum, retokenization recovery, and commit-aware safety reranking.
 8. Use `smart_causal_diffusion` checkpoints for inference-time ego-centric scene editing through `guidance.mode = none | safe | ego_stress | ego_edit`; keep the training objective unchanged while steering editable target agents with a generic ego-risk / low-TTC objective. Predefined event targets such as cut-in or lead-hard-brake are legacy ablations, not the default research direction.
 9. Keep `smart_causal_flow_matching` additive: it should not delete or rename the causal diffusion path, and should preserve the same receding-horizon sim-agent inference output surface for validation and visualization.
-10. Keep causal LR scheduling epoch-based: 32-epoch server runs use `warmup_steps: 2`, `total_steps: 32`, and encoder LR scale 0.5.
-11. After meaningful work, update `docs/progress.md` and refresh `docs/next.md`.
-12. Update `docs/spec.md` and `docs/decisions.md` only when project direction or durable decisions change.
+10. Keep `smart_elf` additive: use the SMART AR outer loop to refresh committed state, local map context, and surrounding agents. Inside each four-token prediction window, use non-causal embedded language flow as a proposal decoder, but make the training objective commit-primary so chunk 0 matches the executed one-token commit and chunks 1-3 remain lower-weight revisable tail proposals.
+11. Keep `smart_hybrid_diffusion` additive: expose a new Lightning predictor that does not inherit existing SMART predictor classes, keeps original SMART `HeteroData` / `Batch` inputs, reuses the causal closed-loop SMART-token rollout surface by composition, and replaces one-sided slow-token speed reranking with a bidirectional commit-speed band.
+12. Keep the first multi-camera video-conditioning bridge as an additive exporter: consume normal SMART validation batches/checkpoints, render synthetic camera-view layout PNGs plus a manifest, and defer calibrated real-camera projection or video-model integration until the layout artifact is inspected.
+13. Keep causal LR scheduling epoch-based: 32-epoch server runs use `warmup_steps: 2`, `total_steps: 32`, and encoder LR scale 0.5.
+14. After meaningful work, update `docs/progress.md` and refresh `docs/next.md`.
+15. Update `docs/spec.md` and `docs/decisions.md` only when project direction or durable decisions change.
 
 ## Risks
 

@@ -1,5 +1,40 @@
 # Decisions
 
+## Decision: Add a synthetic multi-camera layout exporter before video generation
+- Date: 2026-06-15
+- Context: The user wanted a VectorWorld-style bridge from generated trajectory scenarios to multi-camera layout conditioning for downstream driving video generation, but the first step should be minimal and not commit to a specific video generator.
+- Decision: Add `scripts/render_multicamera_layout.py` as an additive MVP-0 exporter. It loads normal SMART configs/checkpoints, runs inference on the original SMART `HeteroData` / `Batch` validation input, and renders six synthetic nuScenes-like pinhole camera layout streams plus `manifest.json`.
+- Why: This isolates the trajectory-to-layout adapter from the much heavier video synthesis stage and keeps the SMART model interface unchanged. The exporter consumes generated trajectories after inference; it does not predict tokens and then convert tokens back into model input.
+- Impact: The first layouts are camera-conditioning artifacts, not calibrated sensor renderings. They show 3D agent boxes with an approximate camera rig and do not draw road/map centerlines by default; `--draw-map-polylines` is only for geometry debugging. The next quality gate is visual inspection on real checkpoints before choosing a downstream video model.
+
+## Decision: Add composition-based SMART hybrid diffusion
+- Date: 2026-06-15
+- Context: AR diffusion rollouts can over-speed straight vehicles and drift off map late, while causal diffusion safe guidance can become too conservative. The user wanted a new model path that does not inherit existing SMART predictor classes, while keeping original SMART inputs and reusing official SMART encoder/token structures.
+- Decision: Add `smart_hybrid_diffusion` as an additive `pl.LightningModule` predictor that composes the causal SMART-token closed-loop rollout core instead of inheriting from existing predictor classes. The public model keeps the original SMART `HeteroData` / `Batch` input and uses `diffusion.hybrid_objective: closed_loop_frontier_v1`.
+- Why: This preserves train/validation/visualization compatibility and avoids another deep inheritance layer, while letting the first hybrid experiment focus on closed-loop quality and commit-token speed calibration.
+- Impact: Hybrid configs set `commit_min_speed_ratio: 0.75`, `commit_max_speed_ratio: 1.25`, and `commit_speed_reference_decay: 1.0`. The speed energy now penalizes both too-slow and too-fast executable chunk-0 tokens; tail proposals remain revisable.
+
+## Decision: Train SMART ELF with commit-primary proposal loss
+- Date: 2026-06-15
+- Context: `smart_elf` inference predicts a four-token window but only commits the first token into history before rebuilding the next AR view. Equal full-window ELF supervision over-optimized uncommitted tail proposals that are revisable at inference.
+- Decision: Keep the four-token prediction window, one-token commit, tail proposal carry, and rolling-anchor/model-rollout training view, but weight the ELF objective as committed chunk loss plus `elf_tail_loss_weight` times tail proposal loss. The active ELF configs set `elf_tail_loss_weight: 0.25`.
+- Why: This keeps lookahead proposals available for geometry and warm-starting while making the dominant training signal match the executed receding-horizon action.
+- Impact: Old `elf_ar_1000` metrics are not comparable to new ELF training losses. New ELF runs should report the tail weight and use rollout ADE/FDE, not full-window loss alone, for quality comparison.
+
+## Decision: Discretize SMART ELF sampling from final flow embeddings
+- Date: 2026-06-15
+- Context: The first `smart_elf` 1000-step visualization showed that visibly moving vehicles almost all turned to one side. A diagnostic on validation indices 0-3 showed the original decoder-logit sampler produced `dist>=10m` left/straight/right counts of `0/3/25` and only 40 unique committed token ids, while the same checkpoint with final-embedding nearest-neighbor projection produced `32/15/20` and 525 unique ids.
+- Decision: Use the integrated ELF embedding state as the source of truth for final token ids via `_elf_proxy_token_ids()`. Keep the auxiliary decoder logits for confidence scoring and training CE, but do not let the weak auxiliary head choose sampled token ids.
+- Why: ELF's core prediction is the embedding flow. Early 1000-step auxiliary logits can collapse to a few frequent token ids even when the final embedding state carries more diverse trajectory information.
+- Impact: Existing `checkpoints/elf_ar_1000/last.ckpt` can be re-evaluated with the fixed sampler without retraining. Use `outputs/elf_proxy_fix_diag/` as the first repaired visualization check.
+
+## Decision: Build SMART ELF as AR outer loop plus non-causal embedded language flow
+- Date: 2026-06-15
+- Context: The user wanted an ELF-style model adapted to the sim-agent SMART task and clarified that the original ELF objective is not a causal frontier decoder. The task still needs dynamic map refresh and surrounding-agent context refresh during rollout.
+- Decision: Add `smart_elf` as an independent predictor that inherits the SMART autoregressive rollout shell, but replaces the inner short-window objective with full-window embedding-space flow matching and a final token decoder. The ELF inner window uses `diffusion.elf_objective: embedded_language_flow_v1`; it does not use `causal_objective` or causal frontier sampling.
+- Why: The AR outer loop preserves the receding-horizon sim-agent behavior needed for updated map/agent context, while the inner ELF objective stays faithful to ELF's non-causal full-window embedding flow idea.
+- Impact: Use `configs/train/train_scalable_elf_1000.yaml` for the matched 1000-step local ELF run and `configs/validation/validation_scalable_elf.yaml` for checkpoint validation. Select ELF checkpoints with `val_minADE`, because this path logs standard AR validation metrics but not causal-specific `val_rollout_score`.
+
 ## Decision: Add a config-gated AR causal-frontier objective
 - Date: 2026-06-14
 - Context: The user wanted a major improvement to original `smart_ar_diffusion` by transplanting the most useful causal diffusion ideas while preserving the original AR rollout surface for comparison.

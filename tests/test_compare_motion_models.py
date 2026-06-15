@@ -49,6 +49,14 @@ class CompareMotionModelsTest(unittest.TestCase):
                 "smart_causal_flow_matching",
                 "flow_matching_v1",
             ),
+            "configs/train/train_scalable_elf_1000.yaml": (
+                "smart_elf",
+                "embedded_language_flow_v1",
+            ),
+            "configs/train/train_scalable_hybrid_diffusion_1000.yaml": (
+                "smart_hybrid_diffusion",
+                "closed_loop_frontier_v1",
+            ),
         }
         for path, (predictor, objective) in expected.items():
             with self.subTest(path=path):
@@ -65,6 +73,10 @@ class CompareMotionModelsTest(unittest.TestCase):
                 self.assertEqual(cfg.Model.predictor, predictor)
                 if predictor == "smart_ar_diffusion":
                     self.assertEqual(cfg.Model.diffusion.ar_objective, objective)
+                elif predictor == "smart_elf":
+                    self.assertEqual(cfg.Model.diffusion.elf_objective, objective)
+                elif predictor == "smart_hybrid_diffusion":
+                    self.assertEqual(cfg.Model.diffusion.hybrid_objective, objective)
                 else:
                     self.assertEqual(cfg.Model.diffusion.causal_objective, objective)
 
