@@ -7,6 +7,7 @@ from torch_geometric.data import HeteroData
 
 from smart.model.smart_causal_diffusion import SMARTCausalDiffusion
 from smart.modules.causal_diffusion_decoder import CausalDiffusionDecoder
+from smart.modules.diffusion_decoder import DiffusionDecoder
 from smart.modules.trajectory_energy import TrajectoryEnergy
 from scripts.calibrate_causal_retokenization import compute_type_thresholds
 from smart.utils.config import load_config_act
@@ -48,6 +49,40 @@ class CausalDiffusionDecoderTest(unittest.TestCase):
         target_chunks = chunk_ids.reshape(-1)[edge_index[1]]
         self.assertGreater(edge_index.shape[1], 0)
         self.assertTrue(torch.all(source_chunks < target_chunks))
+
+    def test_spatial_edges_only_connect_agents_in_the_same_chunk(self):
+        decoder = DiffusionDecoder(
+            hidden_dim=16,
+            token_size=32,
+            num_future_chunks=4,
+            num_heads=2,
+            head_dim=8,
+            dropout=0.0,
+            num_freq_bands=4,
+            a2a_radius=20.0,
+            pl2a_radius=20.0,
+            time_span=None,
+            future_chunk_steps=5,
+            num_layers=1,
+            num_token_types=4,
+        )
+        chunk_ids = torch.arange(4).repeat(2).unsqueeze(0)
+        positions = torch.zeros(1, 8, 2)
+        positions[0, 4:, 1] = 1.0
+
+        edge_index, _ = decoder._build_spatial_token_edges(
+            positions=positions,
+            headings=torch.zeros(1, 8),
+            chunk_ids=chunk_ids,
+            valid_mask=torch.ones(1, 8, dtype=torch.bool),
+        )
+
+        source_chunks = chunk_ids.reshape(-1)[edge_index[0]]
+        target_chunks = chunk_ids.reshape(-1)[edge_index[1]]
+        self.assertEqual(edge_index.shape[1], 8)
+        self.assertTrue(torch.all(source_chunks == target_chunks))
+        for chunk_id in range(4):
+            self.assertEqual(int((source_chunks == chunk_id).sum().item()), 2)
 
     def test_proposal_embedding_changes_masked_token_logits(self):
         torch.manual_seed(0)

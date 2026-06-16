@@ -94,8 +94,8 @@ Model:
     rolling_anchor_training: true
     state_perturb_pos_sigma_m: 0.3
     state_perturb_heading_sigma_rad: 0.05
-    closed_loop_max_depth: 4
-    closed_loop_batch_ratio_max: 0.5
+    closed_loop_max_depth: 1
+    closed_loop_batch_ratio_max: 0
     current_state_enabled: true
     current_state_edges: true
     history_recency_decay: 0.5

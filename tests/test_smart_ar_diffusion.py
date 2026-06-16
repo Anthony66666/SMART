@@ -509,6 +509,7 @@ class SMARTAutoregressiveDiffusionTest(unittest.TestCase):
 
         self.assertIn("predictor: smart_ar_diffusion", text)
         self.assertIn("ar_objective: maskgit", text)
+        self.assertIn("causal_temporal_edges: true", text)
         self.assertIn("sampling_guidance:", text)
         self.assertIn("enabled: true", text)
         self.assertIn("mode: safe_speed", text)
@@ -525,6 +526,7 @@ class SMARTAutoregressiveDiffusionTest(unittest.TestCase):
         self.assertIn("/raid/haoq_lab/wangshijie/data/waymo/training", text)
         self.assertIn("predictor: smart_ar_diffusion", text)
         self.assertIn("ar_objective: maskgit", text)
+        self.assertIn("causal_temporal_edges: true", text)
         self.assertIn("prediction_tokens: 4", text)
         self.assertIn("commit_tokens: 1", text)
         self.assertIn("causal_noise_schedule: false", text)
@@ -538,6 +540,7 @@ class SMARTAutoregressiveDiffusionTest(unittest.TestCase):
 
         self.assertIn('mode: "validation"', text)
         self.assertIn("ar_objective: maskgit", text)
+        self.assertIn("causal_temporal_edges: true", text)
         self.assertIn("sampling_guidance:", text)
         self.assertIn("mode: safe_speed", text)
         self.assertIn("commit_min_speed_ratio: 0.75", text)

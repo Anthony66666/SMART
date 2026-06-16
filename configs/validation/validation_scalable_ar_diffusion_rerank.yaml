@@ -60,6 +60,7 @@ Model:
   rollout_num: 1
   diffusion:
     ar_objective: maskgit
+    causal_temporal_edges: true
     future_chunk_steps: 5
     history_tokens: 2
     prediction_tokens: 4

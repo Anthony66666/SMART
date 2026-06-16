@@ -534,3 +534,45 @@
 - Files: `train.py`, `val.py`, `tests/test_pretrain_checkpoint_loading.py`
 - Validation: The new pretrain checkpoint loading test passed; `py_compile` passed for both entry points and the test.
 - Next: Use `--pretrain_ckpt` rather than `--ckpt_path` for new AR diffusion finetunes, and confirm server LR is nonzero plus GPU0 no longer accumulates per-rank checkpoint-loading contexts.
+
+## 2026-06-15 CST
+- Task: Rewrote `smart_elf` as a standalone official-ELF-style predictor instead of the previous AR-inherited wrapper.
+- Result: `SMARTEmbeddedLanguageFlow` now inherits only `pl.LightningModule`, composes the SMART map/history encoder, packs the full 16-token future sequence, and uses an independent ELF decoder with embedding-space flow plus factored token decoding. ELF configs no longer include AR/causal rollout, retokenization, or guidance fields.
+- Files: `smart/model/smart_elf.py`, `smart/modules/elf_decoder.py`, `configs/train/train_scalable_elf_1000.yaml`, `configs/train/train_scalable_elf_3epoch_local.yaml`, `configs/validation/validation_scalable_elf.yaml`, `tests/test_smart_elf.py`, `docs/spec.md`, `docs/next.md`, `docs/decisions.md`
+- Validation: `tests.test_smart_elf` and `tests.test_compare_motion_models` passed; `py_compile` passed for ELF code and entrypoint tests; a real validation-sample CPU smoke produced finite loss and `pred_traj=(73, 80, 2)`, `next_token_idx=(73, 16)`.
+- Next: Retrain standalone ELF before comparing loss/accuracy or visual quality; old `elf_ar_*` checkpoints and visualizations are architecture-incompatible.
+
+## 2026-06-16 CST
+- Task: Converted standalone `smart_elf` from one-shot full-horizon inference to receding-horizon simulation-agent rollout.
+- Result: ELF now samples four-token windows, commits one token, updates the rolled history anchor, and re-encodes map/history context before the next window. Training samples shifted GT windows and moves the previous GT anchor into the history state so later windows learn with local map context.
+- Files: `smart/model/smart_elf.py`, ELF train/validation configs, `tests/test_smart_elf.py`, `docs/spec.md`, `docs/next.md`, `docs/decisions.md`
+- Validation: `tests.test_smart_elf` and `tests.test_compare_motion_models` passed; `py_compile` passed; real `data/valid_demo` CPU smoke passed for both a two-token rolling check and full 16-token rollout with finite `pred_traj=(58, 80, 2)` and `next_token_idx=(58, 16)`.
+- Next: Retrain with `checkpoints/elf_receding_3epoch`, then inspect map-constraint violations on trajectory tails before comparing against causal/hybrid runs.
+
+## 2026-06-16 CST
+- Task: Added an AR-first rerank diffusion variant without causal-frontier training.
+- Result: `smart_ar_diffusion` can now keep the MaskGIT AR window objective while applying safe-speed top-k reranking only to committed tokens after sampling. The rerank variant also exposes map-token noise and history-context dropout as config-gated SMART-style conditioning perturbations.
+- Files: `smart/model/smart_ar_diffusion.py`, `smart/model/smart_diffusion.py`, `configs/train/train_scalable_ar_diffusion_rerank_1000.yaml`, `configs/validation/validation_scalable_ar_diffusion_rerank.yaml`, `tests/test_smart_ar_diffusion.py`, `docs/spec.md`, `docs/next.md`, `docs/decisions.md`
+- Validation: `tests.test_smart_ar_diffusion` plus `tests.test_train_entrypoint_config` passed 34 tests locally; `py_compile` passed for touched Python files; `git diff --check` passed.
+- Next: Train `configs/train/train_scalable_ar_diffusion_rerank_1000.yaml`, then compare straight-vehicle moving-speed ratios against AR baseline, AR frontier, causal diffusion, and hybrid diffusion on the same validation scenes.
+
+## 2026-06-16 CST
+- Task: Added the server training config for the AR-first rerank diffusion run.
+- Result: `configs/train/train_scalable_ar_diffusion_rerank.yaml` uses the full server Waymo paths, 14-GPU DDP settings, 32 epochs, 4-token prediction, 1-token commit, `ar_objective: maskgit`, safe-speed commit rerank, map-token noise, and history-context dropout.
+- Files: `configs/train/train_scalable_ar_diffusion_rerank.yaml`, `tests/test_smart_ar_diffusion.py`, `docs/next.md`, `docs/progress.md`
+- Validation: Focused AR rerank config tests passed; YAML syntax/field check passed for the server config; `git diff --check` passed.
+- Next: Upload this config with the rerank code and launch `python -u train.py --config configs/train/train_scalable_ar_diffusion_rerank.yaml --save_ckpt_path checkpoints/ar_rerank`.
+
+## 2026-06-16 CST
+- Task: Fixed standalone ELF window attention to match receding-horizon causality.
+- Result: `EmbeddedLanguageFlowDecoder` now builds a chunk-causal pairwise attention mask. Same-chunk agents can attend to each other, later chunks are hidden from earlier chunk queries, and prefix tokens cannot aggregate data-token content.
+- Files: `smart/modules/elf_decoder.py`, `tests/test_smart_elf.py`, `docs/next.md`, `docs/decisions.md`, `docs/progress.md`
+- Validation: `tests.test_smart_elf` and `tests.test_compare_motion_models` passed; `py_compile` and `git diff --check` passed; a real `data/valid_demo` CPU inference smoke produced finite `pred_traj=(58, 80, 2)` and `next_token_idx=(58, 16)`.
+- Next: Retrain receding ELF after the attention-mask change before interpreting map-compliance metrics.
+
+## 2026-06-16 CST
+- Task: Fixed AR rerank diffusion token attention semantics before server training.
+- Result: AR rerank train/validation configs now enable `causal_temporal_edges: true` while keeping `ar_objective: maskgit`. `DiffusionDecoder` now builds spatial token radius-graph groups in contiguous `(scene, chunk)` order and remaps edges back to the packed sequence, so same-window agents interact only within the same chunk.
+- Files: `smart/modules/diffusion_decoder.py`, AR rerank train/validation configs, `tests/test_smart_causal_diffusion.py`, `tests/test_smart_ar_diffusion.py`, and durable docs.
+- Validation: Focused decoder/config tests passed; `tests.test_smart_ar_diffusion` passed 28 tests; `tests.test_smart_causal_diffusion` passed 43 tests.
+- Next: Retrain AR rerank checkpoints; older rerank runs should be treated as stale for attention-causality comparisons.

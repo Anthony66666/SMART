@@ -165,17 +165,28 @@ class DiffusionDecoder(nn.Module):
         flat_batch = self._flat_batch_ids(valid_mask)
         flat_chunk = chunk_ids.reshape(-1)
         head_vector = torch.stack([flat_head.cos(), flat_head.sin()], dim=-1)
+        group_ids = flat_batch * self.num_future_chunks + flat_chunk
+        search_nodes = torch.nonzero(search_mask, as_tuple=False).squeeze(-1)
+        sort_order = torch.argsort(group_ids[search_nodes])
+        sorted_nodes = search_nodes[sort_order]
         edge_index, r_raw = build_radius_interaction_edges(
-            pos_s=flat_pos,
-            head_s=flat_head,
-            head_vector_s=head_vector,
-            batch_s=flat_batch * self.num_future_chunks + flat_chunk,
-            mask_s=search_mask,
+            pos_s=flat_pos[sorted_nodes],
+            head_s=flat_head[sorted_nodes],
+            head_vector_s=head_vector[sorted_nodes],
+            batch_s=group_ids[sorted_nodes],
+            mask_s=torch.ones(sorted_nodes.numel(), dtype=torch.bool, device=device),
             radius_m=self.a2a_radius,
         )
         if edge_index.numel() == 0:
             return edge_index, self.r_a2a_embedding(continuous_inputs=r_raw, categorical_embs=None)
-        keep = flat_source[edge_index[0]] & flat_target[edge_index[1]]
+        edge_index = sorted_nodes[edge_index]
+        src, dst = edge_index
+        keep = (
+            flat_source[src]
+            & flat_target[dst]
+            & (flat_batch[src] == flat_batch[dst])
+            & (flat_chunk[src] == flat_chunk[dst])
+        )
         edge_index = edge_index[:, keep]
         r_raw = r_raw[keep]
         if edge_index.numel() == 0:

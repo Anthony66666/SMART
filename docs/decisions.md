@@ -1,5 +1,12 @@
 # Decisions
 
+## Decision: Use chunk-causal token attention for AR rerank without frontier loss
+- Date: 2026-06-16
+- Context: The AR rerank variant should keep the MaskGIT AR objective and SMART-style perturbations, but the executable earlier chunks must not read later future-token states inside the four-token window.
+- Decision: Set the AR rerank train/validation configs to use `causal_temporal_edges: true`, and make diffusion spatial token edges robustly same-scene/same-chunk by building radius-graph batches in contiguous `(scene, chunk)` order before remapping to the packed sequence.
+- Why: This preserves the user's requested AR-first rerank path without frontier supervision, while matching the intended attention semantics: same-timestep agents can interact, but earlier chunks cannot depend on later chunks.
+- Impact: Retrain AR rerank checkpoints after this change. Existing rerank checkpoints trained with bidirectional temporal attention or non-contiguous spatial batching should be treated as stale for attention-causality comparisons.
+
 ## Decision: Add a synthetic multi-camera layout exporter before video generation
 - Date: 2026-06-15
 - Context: The user wanted a VectorWorld-style bridge from generated trajectory scenarios to multi-camera layout conditioning for downstream driving video generation, but the first step should be minimal and not commit to a specific video generator.
@@ -272,3 +279,31 @@
 - Decision: Treat `smart_val_compatible` as official current-valid validation semantics. Keep `category == 3` for diffusion/token supervision and explicit `smart_category3` ablations only. Validation ADE/FDE must use raw official future validity directly and run on every validation batch, matching upstream SMART; `pred_valid_mask` is not part of the official metric mask.
 - Why: This matches upstream SMART validation behavior and prevents validation visualizations from hiding generated non-target vehicles because the randomized target category changed between steps.
 - Impact: Diffusion and AR diffusion outputs now expose `official_valid_mask`; visualization defaults to official view while target/supervision view remains optional for debugging training targets. Missing prediction coverage should be diagnosed separately from ADE/FDE.
+
+## Decision: Rebuild SMART ELF as a standalone official-ELF-style predictor
+- Date: 2026-06-15
+- Context: The first `smart_elf` implementation inherited `SMARTAutoregressiveDiffusion` and reused `DiffusionDecoder`, so low loss / acceptable token accuracy could still come from AR-shell or decoder-logit behavior rather than a true ELF implementation.
+- Decision: Make `SMARTEmbeddedLanguageFlow` inherit only `pl.LightningModule`, compose the SMART map/history encoder, pack the full 16-token future sequence, and use an independent ELF decoder adapted from the official ELF architecture: RMSNorm/SwiGLU blocks, time prefix tokens, embedding-space flow output, and factored token decoder head.
+- Why: This satisfies the requested from-scratch ELF path while keeping SMART data/token interfaces and train/validation entry points stable.
+- Impact: Old `elf_ar_*` checkpoints and visualizations are architecture-incompatible with the standalone ELF model. Retrain before interpreting ELF loss, token accuracy, ADE/FDE, or visual quality.
+
+## Decision: Make standalone SMART ELF receding-horizon for map-grounded rollout
+- Date: 2026-06-16
+- Context: Full-16-token standalone ELF encoded map/history once, so late generated tokens had no refreshed map query after the trajectory moved away from the original anchor.
+- Decision: Keep `smart_elf` standalone, but make inference sample short ELF windows (`elf_window_tokens: 4`), commit one token (`elf_commit_tokens: 1`), write the committed anchor into the history state, and re-encode before the next window. Train the same window objective from randomly shifted GT anchors so later windows see map context around future positions.
+- Why: This preserves the official-ELF-style embedded flow decoder while restoring the sim-agent invariant that each executed step gets map/history context at the current rolled state.
+- Impact: Previous standalone full-window ELF checkpoints are stale. New ELF runs should use the receding configs and inspect map compliance separately from token loss.
+
+## Decision: Use chunk-causal attention inside SMART ELF windows
+- Date: 2026-06-16
+- Context: The first standalone ELF decoder used only a padding key mask inside the four-token window, so chunk-0 queries could attend to chunks 1-3 and leak future-token information.
+- Decision: Build a pairwise attention mask from `chunk_ids`: data queries can attend to prefix tokens and valid data keys with `key_chunk <= query_chunk`; prefix queries attend only to prefix tokens. Agents at the same chunk remain mutually visible.
+- Why: This keeps same-time interaction modeling while preserving the sim-agent causality requirement that earlier committed-token decisions cannot see later token content.
+- Impact: ELF loss still supervises tail chunks, but chunk-0 predictions can no longer use future chunk embeddings through attention. Retrain receding ELF checkpoints after this mask change.
+
+## Decision: Add AR MaskGIT rerank without frontier training
+- Date: 2026-06-16
+- Context: Hybrid diffusion kept causal-frontier semantics, so it did not isolate the original AR diffusion advantage for straight-vehicle speed.
+- Decision: Keep `smart_ar_diffusion` on `ar_objective: maskgit` for the rerank variant, with 4-token prediction, 1-token commit, and carried tail proposals. Add sampling-time top-k reranking only for committed slots using lane, dynamics, collision, and bidirectional commit-speed energy. Add SMART-style map-token noise and history-context dropout as training perturbations, while validation keeps these perturbations disabled.
+- Why: This tests the user's requested AR-first hypothesis directly: use AR rollout semantics, avoid frontier loss, and borrow only the sampling rerank plus original SMART conditioning perturbations.
+- Impact: Use `configs/train/train_scalable_ar_diffusion_rerank_1000.yaml` for the matched short run and `configs/validation/validation_scalable_ar_diffusion_rerank.yaml` for deterministic evaluation.
