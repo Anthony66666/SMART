@@ -84,8 +84,8 @@ Model:
     eps: 1.0e-3
     min_t: 1.0e-3
     use_type_embedding: true
-    target_category_only: true
-    supervision_mode: smart_category3
+    target_category_only: false
+    supervision_mode: all_agents
     metric_mode: smart_val_compatible
     remask_confidence_temperature: 1.0
     debug_validation_logging: true

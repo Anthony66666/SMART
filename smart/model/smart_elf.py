@@ -134,8 +134,8 @@ class SMARTEmbeddedLanguageFlow(pl.LightningModule):
             1e-4,
             float(getattr(diffusion_cfg, "remask_confidence_temperature", 1.0)),
         )
-        self.target_category_only = bool(getattr(diffusion_cfg, "target_category_only", True))
-        self.supervision_mode = str(getattr(diffusion_cfg, "supervision_mode", "smart_category3"))
+        self.target_category_only = bool(getattr(diffusion_cfg, "target_category_only", False))
+        self.supervision_mode = str(getattr(diffusion_cfg, "supervision_mode", "all_agents"))
         self.metric_mode = str(getattr(diffusion_cfg, "metric_mode", "smart_val_compatible"))
         self.encoder_lr_scale = max(0.0, float(getattr(diffusion_cfg, "encoder_lr_scale", 1.0)))
         self.ntp_aux_loss_weight = 0.0
@@ -482,8 +482,8 @@ class SMARTEmbeddedLanguageFlow(pl.LightningModule):
             pad_len = sequence_tokens - token_ids.shape[1]
             token_ids = F.pad(token_ids, (0, pad_len), value=0)
             token_valid = F.pad(token_valid, (0, pad_len), value=False)
-        current_valid = data["agent"]["valid_mask"][:, self.num_historical_steps - 1].bool()
-        token_valid = token_valid & current_valid.unsqueeze(-1) & (data["agent"]["type"] != 3).unsqueeze(-1)
+        generation_agents = self._elf_generation_agent_mask(data).to(device=token_valid.device)
+        token_valid = token_valid & generation_agents.unsqueeze(-1)
         return token_ids, token_valid
 
     def _agent_batch(self, data, num_agents, device):
@@ -513,11 +513,7 @@ class SMARTEmbeddedLanguageFlow(pl.LightningModule):
         )
         agent_context = context["x_a_history"][:, history_index].to(device=device)
         token_context = agent_context[:, None, :].expand(-1, sequence_tokens, -1)
-        category = data["agent"]["category"].long().to(device)
-        if self.supervision_mode in ("smart_category3", "target", "category3"):
-            loss_agent_mask = category == 3
-        else:
-            loss_agent_mask = torch.ones_like(category, dtype=torch.bool)
+        loss_agent_mask = self._elf_supervision_agent_mask(data).to(device=device)
         loss_mask_agent = token_valid & loss_agent_mask.unsqueeze(-1)
 
         lengths = []
@@ -584,7 +580,10 @@ class SMARTEmbeddedLanguageFlow(pl.LightningModule):
         sequence_tokens=None,
     ):
         del rollout_valid
-        context = self.encoder.encode_history_context(data)
+        context = self.encoder.encode_history_context(
+            data,
+            map_agent_mask=self._elf_generation_agent_mask(data),
+        )
         if token_start is None and sequence_tokens is None:
             packed, summary = self._pack_future_window(data, context)
         else:
@@ -1080,6 +1079,114 @@ class SMARTEmbeddedLanguageFlow(pl.LightningModule):
         valid = valid & (agent["type"] != 3)
         return valid
 
+    def _elf_generation_agent_mask(self, data):
+        agent = data["agent"]
+        current_index = min(
+            max(self.num_historical_steps - 1, 0),
+            agent["valid_mask"].shape[1] - 1,
+        )
+        return agent["valid_mask"][:, current_index].bool() & (agent["type"] != 3)
+
+    def _elf_supervision_agent_mask(self, data):
+        generation_agents = self._elf_generation_agent_mask(data)
+        if self.supervision_mode in ("smart_category3", "target", "category3"):
+            category = data["agent"]["category"].long().to(device=generation_agents.device)
+            return generation_agents & (category == 3)
+        return generation_agents
+
+    def _roll_elf_history_state(self, history, committed, generation_agents):
+        history_steps = int(history.shape[1])
+        if history_steps <= 0:
+            return history
+        committed = committed.to(device=history.device, dtype=history.dtype)
+        rolled = torch.cat([history, committed], dim=1)[:, -history_steps:]
+        result = history.clone()
+        update = generation_agents.to(device=history.device, dtype=torch.bool)
+        result[update] = rolled[update]
+        return result
+
+    def _write_elf_history_tokens(
+        self,
+        data,
+        history_token_ids,
+        history_token_pos,
+        history_token_heading,
+        history_token_valid,
+        generation_agents,
+    ):
+        agent = data["agent"]
+        history_steps = min(int(self.history_tokens), int(history_token_pos.shape[1]))
+        if history_steps <= 0:
+            return data
+        update = generation_agents.to(device=history_token_pos.device, dtype=torch.bool)
+        if "token_idx" in agent and history_token_ids is not None:
+            target = agent["token_idx"][:, :history_steps]
+            target_update = update.to(device=target.device)
+            target[target_update] = history_token_ids[:, :history_steps].to(
+                device=target.device,
+                dtype=target.dtype,
+            )[target_update]
+        if "token_pos" in agent:
+            target = agent["token_pos"][:, :history_steps]
+            target_update = update.to(device=target.device)
+            target[target_update] = history_token_pos[:, :history_steps].to(
+                device=target.device,
+                dtype=target.dtype,
+            )[target_update]
+        if "token_heading" in agent:
+            target = agent["token_heading"][:, :history_steps]
+            target_update = update.to(device=target.device)
+            target[target_update] = history_token_heading[:, :history_steps].to(
+                device=target.device,
+                dtype=target.dtype,
+            )[target_update]
+        if "agent_valid_mask" in agent:
+            target = agent["agent_valid_mask"][:, :history_steps]
+            target_update = update.to(device=target.device)
+            target[target_update] = history_token_valid[:, :history_steps].to(
+                device=target.device,
+                dtype=target.dtype,
+            )[target_update]
+        return data
+
+    def _write_elf_history_frames(
+        self,
+        data,
+        history_frame_pos,
+        history_frame_heading,
+        history_frame_valid,
+        generation_agents,
+    ):
+        agent = data["agent"]
+        frame_steps = min(int(self.num_historical_steps), int(history_frame_pos.shape[1]))
+        if frame_steps <= 0:
+            return data
+        update = generation_agents.to(device=history_frame_pos.device, dtype=torch.bool)
+        if "position" in agent:
+            target = agent["position"][:, :frame_steps]
+            target_update = update.to(device=target.device)
+            pos_dim = min(target.shape[-1], history_frame_pos.shape[-1])
+            source = history_frame_pos[:, :frame_steps, :pos_dim].to(
+                device=target.device,
+                dtype=target.dtype,
+            )
+            target[target_update, :, :pos_dim] = source[target_update]
+        if "heading" in agent:
+            target = agent["heading"][:, :frame_steps]
+            target_update = update.to(device=target.device)
+            target[target_update] = history_frame_heading[:, :frame_steps].to(
+                device=target.device,
+                dtype=target.dtype,
+            )[target_update]
+        if "valid_mask" in agent:
+            target = agent["valid_mask"][:, :frame_steps]
+            target_update = update.to(device=target.device)
+            target[target_update] = history_frame_valid[:, :frame_steps].to(
+                device=target.device,
+                dtype=target.dtype,
+            )[target_update]
+        return data
+
     def _write_elf_history_anchor(
         self,
         data,
@@ -1165,28 +1272,47 @@ class SMARTEmbeddedLanguageFlow(pl.LightningModule):
         if window_offset <= 0:
             return data
         view = self._clone_elf_data(data)
-        anchor_slot = self.history_tokens + window_offset - 1
         agent = data["agent"]
-        anchor_slot = min(max(anchor_slot, 0), agent["token_pos"].shape[1] - 1)
-        active = self._history_anchor_mask(data, anchor_slot)
-        anchor_pos = agent["token_pos"][:, anchor_slot, :2].to(
-            device=agent["position"].device,
-            dtype=agent["position"].dtype,
+        token_start = self.history_tokens + window_offset
+        history_start = max(0, token_start - self.history_tokens)
+        history_end = min(token_start, agent["token_pos"].shape[1])
+        generation_agents = self._elf_generation_agent_mask(data)
+        history_token_pos = agent["token_pos"][:, history_start:history_end]
+        history_token_heading = agent["token_heading"][:, history_start:history_end]
+        history_token_valid = agent["agent_valid_mask"][:, history_start:history_end].bool()
+        history_token_valid = history_token_valid & generation_agents[:, None].to(
+            device=history_token_valid.device,
+            dtype=torch.bool,
         )
-        anchor_heading = agent["token_heading"][:, anchor_slot].to(
-            device=agent["heading"].device,
-            dtype=agent["heading"].dtype,
-        )
-        anchor_token_ids = None
-        if "token_idx" in agent:
-            anchor_token_ids = agent["token_idx"][:, anchor_slot]
-        return self._write_elf_history_anchor(
+        history_token_ids = agent["token_idx"][:, history_start:history_end] if "token_idx" in agent else None
+        self._write_elf_history_tokens(
             view,
-            anchor_pos,
-            anchor_heading,
-            active,
-            anchor_token_ids=anchor_token_ids,
+            history_token_ids,
+            history_token_pos,
+            history_token_heading,
+            history_token_valid,
+            generation_agents,
         )
+        frame_end = min(
+            self.num_historical_steps + window_offset * self.future_chunk_steps,
+            agent["position"].shape[1],
+        )
+        frame_start = max(0, frame_end - self.num_historical_steps)
+        history_frame_pos = agent["position"][:, frame_start:frame_end, :2]
+        history_frame_heading = agent["heading"][:, frame_start:frame_end]
+        history_frame_valid = agent["valid_mask"][:, frame_start:frame_end].bool()
+        history_frame_valid = history_frame_valid & generation_agents[:, None].to(
+            device=history_frame_valid.device,
+            dtype=torch.bool,
+        )
+        self._write_elf_history_frames(
+            view,
+            history_frame_pos,
+            history_frame_heading,
+            history_frame_valid,
+            generation_agents,
+        )
+        return view
 
     def _sample_elf_training_window_offset(self, data):
         max_offset = max(0, self.elf_sequence_tokens - self.elf_window_tokens)
@@ -1353,14 +1479,71 @@ class SMARTEmbeddedLanguageFlow(pl.LightningModule):
                 :frame_count,
             ].to(device=agent["valid_mask"].device)
 
-        anchor_index = commit_tokens - 1
-        return self._write_elf_history_anchor(
-            data,
-            commit_token_pos[:, anchor_index],
-            commit_token_heading[:, anchor_index],
-            commit_valid[:, anchor_index],
-            anchor_token_ids=commit_ids[:, anchor_index],
-        )
+        generation_agents = self._elf_generation_agent_mask(data).to(device=commit_ids.device)
+        history_steps = min(int(self.history_tokens), int(agent["token_pos"].shape[1]))
+        if history_steps > 0:
+            committed_valid = commit_valid & generation_agents[:, None].to(
+                device=commit_valid.device,
+                dtype=torch.bool,
+            )
+            history_token_ids = self._roll_elf_history_state(
+                agent["token_idx"][:, :history_steps],
+                commit_ids,
+                generation_agents,
+            ) if "token_idx" in agent else None
+            history_token_pos = self._roll_elf_history_state(
+                agent["token_pos"][:, :history_steps],
+                commit_token_pos,
+                generation_agents,
+            )
+            history_token_heading = self._roll_elf_history_state(
+                agent["token_heading"][:, :history_steps],
+                commit_token_heading,
+                generation_agents,
+            )
+            history_token_valid = self._roll_elf_history_state(
+                agent["agent_valid_mask"][:, :history_steps].bool(),
+                committed_valid,
+                generation_agents,
+            )
+            self._write_elf_history_tokens(
+                data,
+                history_token_ids,
+                history_token_pos,
+                history_token_heading,
+                history_token_valid,
+                generation_agents,
+            )
+
+        frame_steps = min(int(self.num_historical_steps), int(agent["position"].shape[1]))
+        if frame_steps > 0:
+            frame_valid = commit_frame_valid & generation_agents[:, None].to(
+                device=commit_frame_valid.device,
+                dtype=torch.bool,
+            )
+            history_frame_pos = self._roll_elf_history_state(
+                agent["position"][:, :frame_steps, :2],
+                commit_traj,
+                generation_agents,
+            )
+            history_frame_heading = self._roll_elf_history_state(
+                agent["heading"][:, :frame_steps],
+                commit_head,
+                generation_agents,
+            )
+            history_frame_valid = self._roll_elf_history_state(
+                agent["valid_mask"][:, :frame_steps].bool(),
+                frame_valid,
+                generation_agents,
+            )
+            self._write_elf_history_frames(
+                data,
+                history_frame_pos,
+                history_frame_heading,
+                history_frame_valid,
+                generation_agents,
+            )
+        return data
 
     def _decode_token_rollout(self, data, token_ids, token_confidence, token_valid):
         device = token_ids.device

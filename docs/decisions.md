@@ -1,5 +1,12 @@
 # Decisions
 
+## Decision: Align SMART ELF with all-agent sim-agent rollout state
+- Date: 2026-06-17
+- Context: Receding ELF was generating and validating all current-valid non-background agents, but the active configs supervised only `category == 3` and SMART history-context map attention still connected map tokens only to category-3 agents. Its receding commit path also overwrote only the last history anchor, leaving older history tokens/frames stale after each generated step.
+- Decision: Treat active `smart_elf` as an all-agent sim-agent rollout path. ELF configs use `supervision_mode: all_agents` and `target_category_only: false`; `SMARTDecoder.encode_history_context()` accepts an optional `map_agent_mask` so ELF can give every generated agent direct map2agent attention while other paths keep category-3 default behavior. ELF training views and inference commits roll the token and frame history windows before re-encoding.
+- Why: The agent set used for loss, map conditioning, validation, and visualization must match the generated rollout set. Receding-history context must represent the latest generated state sequence, not a stale original-history token plus a new final anchor.
+- Impact: Existing ELF checkpoints trained with category-only supervision or overwrite-only history should be treated as stale for map-compliance evaluation. Retrain ELF before judging late-horizon lane adherence.
+
 ## Decision: Use chunk-causal token attention for AR rerank without frontier loss
 - Date: 2026-06-16
 - Context: The AR rerank variant should keep the MaskGIT AR objective and SMART-style perturbations, but the executable earlier chunks must not read later future-token states inside the four-token window.

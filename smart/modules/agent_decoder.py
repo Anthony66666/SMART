@@ -253,7 +253,8 @@ class SMARTAgentDecoder(nn.Module):
     def encode_history_context(self,
                                data: HeteroData,
                                map_enc: Mapping[str, torch.Tensor],
-                               agent_history_mask: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+                               agent_history_mask: Optional[torch.Tensor] = None,
+                               map_agent_mask: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         pos_a = data['agent']['token_pos']
         head_a = data['agent']['token_heading']
         head_vector_a = torch.stack([head_a.cos(), head_a.sin()], dim=-1)
@@ -281,7 +282,11 @@ class SMARTAgentDecoder(nn.Module):
         mask_s = temporal_mask.transpose(0, 1).reshape(-1)
         edge_index_a2a, r_a2a = self.build_interaction_edge(pos_a, head_a, head_vector_a, batch_s, mask_s)
         map_mask = temporal_mask.clone()
-        map_mask[agent_category != 3] = False
+        if map_agent_mask is None:
+            map_mask[agent_category != 3] = False
+        else:
+            map_agent_mask = map_agent_mask.to(device=map_mask.device, dtype=torch.bool)
+            map_mask = map_mask & map_agent_mask[:, None]
         edge_index_pl2a, r_pl2a = self.build_map2agent_edge(
             data,
             num_step,

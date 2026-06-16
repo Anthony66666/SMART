@@ -9,6 +9,7 @@ from smart.model import SMARTEmbeddedLanguageFlow
 from smart.model.smart_ar_diffusion import SMARTAutoregressiveDiffusion
 from smart.model.smart_causal_diffusion import SMARTCausalDiffusion
 from smart.model.smart_diffusion import SMARTDiffusion
+from smart.modules.agent_decoder import SMARTAgentDecoder
 from smart.modules.diffusion_decoder import DiffusionDecoder
 from smart.modules.elf_decoder import EmbeddedLanguageFlowDecoder
 from smart.utils.config import load_config_act
@@ -490,6 +491,60 @@ class EmbeddedLanguageFlowAttentionTest(unittest.TestCase):
 
 
 class EmbeddedLanguageFlowCurrentStateTest(unittest.TestCase):
+    def test_agent_history_context_map_mask_can_include_all_generation_agents(self):
+        decoder = SimpleNamespace(
+            num_historical_steps=11,
+            shift=5,
+            hidden_dim=3,
+            num_layers=0,
+        )
+        data = {
+            'agent': {
+                'token_pos': torch.zeros(3, 2, 2),
+                'token_heading': torch.zeros(3, 2),
+                'category': torch.tensor([1, 3, 2]),
+                'token_idx': torch.zeros(3, 2, dtype=torch.long),
+                'agent_valid_mask': torch.ones(3, 2, dtype=torch.bool),
+            }
+        }
+        captured = {}
+
+        def fake_agent_token_embedding(data_arg, category, token_index, pos, head_vector):
+            del data_arg, category, token_index, pos, head_vector
+            return torch.zeros(3, 2, 3), None
+
+        def fake_temporal_edge(*_args, **_kwargs):
+            return torch.empty(2, 0, dtype=torch.long), torch.empty(0, 3)
+
+        def fake_temporal_batches(_data, num_step, pos):
+            del _data
+            return torch.arange(num_step).repeat_interleave(pos.shape[0]), torch.arange(num_step), torch.zeros(pos.shape[0], dtype=torch.long)
+
+        def fake_interaction_edge(*_args, **_kwargs):
+            return torch.empty(2, 0, dtype=torch.long), torch.empty(0, 3)
+
+        def fake_map2agent_edge(_data, num_step, agent_category, pos_a, head_a, head_vector_a, mask, *_args, **_kwargs):
+            del _data, num_step, agent_category, pos_a, head_a, head_vector_a
+            captured['map_mask'] = mask.clone()
+            return torch.empty(2, 0, dtype=torch.long), torch.empty(0, 3)
+
+        decoder.agent_token_embedding = fake_agent_token_embedding
+        decoder.build_temporal_edge = fake_temporal_edge
+        decoder._build_temporal_batches = fake_temporal_batches
+        decoder.build_interaction_edge = fake_interaction_edge
+        decoder.build_map2agent_edge = fake_map2agent_edge
+        map_agent_mask = torch.tensor([True, True, False])
+
+        context = SMARTAgentDecoder.encode_history_context(
+            decoder,
+            data,
+            {'x_pt': torch.zeros(1, 3)},
+            map_agent_mask=map_agent_mask,
+        )
+
+        self.assertTrue(torch.equal(captured['map_mask'], map_agent_mask[:, None].expand(-1, 2)))
+        self.assertEqual(tuple(context['x_a_history'].shape), (3, 2, 3))
+
     def test_build_inputs_uses_standalone_encoder_and_packer(self):
         model = _elf_shell()
         context = {'x_a_history': torch.ones(1, 2, 3)}
@@ -499,8 +554,8 @@ class EmbeddedLanguageFlowCurrentStateTest(unittest.TestCase):
         }
         calls = []
 
-        def fake_encode(data):
-            calls.append(('encode', data))
+        def fake_encode(data, **kwargs):
+            calls.append(('encode', data, kwargs))
             return context
 
         def fake_pack(self, data, context_arg):
@@ -509,11 +564,21 @@ class EmbeddedLanguageFlowCurrentStateTest(unittest.TestCase):
 
         model.encoder = SimpleNamespace(encode_history_context=fake_encode)
         model._pack_future_window = MethodType(fake_pack, model)
-        data = object()
+        data = {
+            'agent': {
+                'valid_mask': torch.ones(1, model.num_historical_steps, dtype=torch.bool),
+                'type': torch.zeros(1, dtype=torch.long),
+            }
+        }
+        expected_map_agent_mask = torch.ones(1, dtype=torch.bool)
 
         output = model._build_diffusion_inputs(data)
 
-        self.assertEqual(calls, [('encode', data), ('pack', data, context)])
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0][0], 'encode')
+        self.assertIs(calls[0][1], data)
+        self.assertTrue(torch.equal(calls[0][2]['map_agent_mask'], expected_map_agent_mask))
+        self.assertEqual(calls[1], ('pack', data, context))
         self.assertIs(output[0], packed)
 
     def test_build_inputs_accepts_receding_window_bounds(self):
@@ -525,8 +590,8 @@ class EmbeddedLanguageFlowCurrentStateTest(unittest.TestCase):
         }
         calls = []
 
-        def fake_encode(data):
-            calls.append(('encode', data))
+        def fake_encode(data, **kwargs):
+            calls.append(('encode', data, kwargs))
             return context
 
         def fake_pack(self, data, context_arg, *, token_start, sequence_tokens):
@@ -535,11 +600,21 @@ class EmbeddedLanguageFlowCurrentStateTest(unittest.TestCase):
 
         model.encoder = SimpleNamespace(encode_history_context=fake_encode)
         model._pack_future_window = MethodType(fake_pack, model)
-        data = object()
+        data = {
+            'agent': {
+                'valid_mask': torch.ones(1, model.num_historical_steps, dtype=torch.bool),
+                'type': torch.zeros(1, dtype=torch.long),
+            }
+        }
+        expected_map_agent_mask = torch.ones(1, dtype=torch.bool)
 
         output = model._build_diffusion_inputs(data, token_start=7, sequence_tokens=2)
 
-        self.assertEqual(calls, [('encode', data), ('pack', data, context, 7, 2)])
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0][0], 'encode')
+        self.assertIs(calls[0][1], data)
+        self.assertTrue(torch.equal(calls[0][2]['map_agent_mask'], expected_map_agent_mask))
+        self.assertEqual(calls[1], ('pack', data, context, 7, 2))
         self.assertIs(output[0], packed)
 
     def test_inference_reencodes_after_each_committed_window(self):
@@ -623,6 +698,9 @@ class EmbeddedLanguageFlowCurrentStateTest(unittest.TestCase):
             'heading': torch.zeros(1, model.num_historical_steps + model.num_future_steps),
             'valid_mask': torch.ones(1, model.num_historical_steps + model.num_future_steps, dtype=torch.bool),
         }
+        frame_anchor = model.num_historical_steps + 2 * model.future_chunk_steps - 1
+        agent['position'][0, frame_anchor, :2] = torch.tensor([9.0, 3.0])
+        agent['heading'][0, frame_anchor] = 0.9
         data = {'agent': agent}
 
         view = model._build_elf_training_view(data, window_offset=2)
@@ -633,6 +711,80 @@ class EmbeddedLanguageFlowCurrentStateTest(unittest.TestCase):
             torch.tensor([9.0, 3.0]),
         ))
         self.assertAlmostEqual(float(view['agent']['heading'][0, model.num_historical_steps - 1]), 0.9)
+
+    def test_training_view_rolls_history_tokens_to_preceding_window_slots(self):
+        model = _elf_shell()
+        agent = {
+            'token_idx': torch.tensor([[10, 11, 12, 13, 14]]),
+            'token_pos': torch.tensor([[[0.0, 0.0], [1.0, 0.0], [6.0, 2.0], [9.0, 3.0], [12.0, 4.0]]]),
+            'token_heading': torch.tensor([[0.0, 0.1, 0.6, 0.9, 1.2]]),
+            'agent_valid_mask': torch.ones(1, 5, dtype=torch.bool),
+            'type': torch.zeros(1, dtype=torch.long),
+            'position': torch.zeros(1, model.num_historical_steps + model.num_future_steps, 3),
+            'heading': torch.zeros(1, model.num_historical_steps + model.num_future_steps),
+            'valid_mask': torch.ones(1, model.num_historical_steps + model.num_future_steps, dtype=torch.bool),
+        }
+        data = {'agent': agent}
+
+        view = model._build_elf_training_view(data, window_offset=2)
+
+        self.assertTrue(torch.equal(view['agent']['token_idx'][0, :2], torch.tensor([12, 13])))
+        self.assertTrue(torch.allclose(
+            view['agent']['token_pos'][0, :2],
+            torch.tensor([[6.0, 2.0], [9.0, 3.0]]),
+        ))
+        self.assertTrue(torch.allclose(
+            view['agent']['token_heading'][0, :2],
+            torch.tensor([0.6, 0.9]),
+        ))
+
+    def test_commit_rolls_history_tokens_after_receding_step(self):
+        model = _elf_shell()
+        total_frames = model.num_historical_steps + model.num_future_steps
+        agent = {
+            'token_idx': torch.tensor([[10, 11, 0, 0]]),
+            'token_pos': torch.tensor([[[0.0, 0.0], [1.0, 0.0], [0.0, 0.0], [0.0, 0.0]]]),
+            'token_heading': torch.tensor([[0.0, 0.1, 0.0, 0.0]]),
+            'agent_valid_mask': torch.tensor([[True, True, False, False]]),
+            'type': torch.zeros(1, dtype=torch.long),
+            'position': torch.zeros(1, total_frames, 3),
+            'heading': torch.zeros(1, total_frames),
+            'valid_mask': torch.ones(1, total_frames, dtype=torch.bool),
+        }
+        agent['position'][0, model.num_historical_steps - 1, :2] = torch.tensor([1.0, 0.0])
+        agent['heading'][0, model.num_historical_steps - 1] = 0.1
+        data = {'agent': agent}
+
+        def fake_decode(self, batch, token_ids, token_valid, start_pos, start_heading):
+            del batch, token_ids, token_valid, start_pos, start_heading
+            return (
+                torch.tensor([[[2.0, 0.0], [2.5, 0.0], [3.0, 0.0], [3.5, 0.0], [4.0, 0.0]]]),
+                torch.full((1, 5), 0.4),
+                torch.ones(1, 5, dtype=torch.bool),
+                torch.tensor([[[4.0, 0.0]]]),
+                torch.tensor([[0.4]]),
+                torch.tensor([[4.0, 0.0]]),
+                torch.tensor([0.4]),
+            )
+
+        model._decode_elf_token_sequence = MethodType(fake_decode, model)
+
+        updated = model._commit_elf_tokens_to_rollout_data(
+            data,
+            torch.tensor([[4]]),
+            torch.ones(1, 1),
+            torch.ones(1, 1, dtype=torch.bool),
+            token_start=model.history_tokens,
+            commit_tokens=1,
+        )
+
+        self.assertTrue(torch.equal(updated['agent']['token_idx'][0, :2], torch.tensor([11, 4])))
+        self.assertTrue(torch.allclose(
+            updated['agent']['token_pos'][0, :2],
+            torch.tensor([[1.0, 0.0], [4.0, 0.0]]),
+        ))
+        self.assertTrue(torch.allclose(updated['agent']['token_heading'][0, :2], torch.tensor([0.1, 0.4])))
+        self.assertTrue(torch.equal(updated['agent']['agent_valid_mask'][0, :2], torch.tensor([True, True])))
 
 
 class EmbeddedLanguageFlowConfigTest(unittest.TestCase):
@@ -649,6 +801,8 @@ class EmbeddedLanguageFlowConfigTest(unittest.TestCase):
         self.assertTrue(config.Model.diffusion.elf_receding_horizon)
         self.assertEqual(config.Model.diffusion.elf_decoder_prob, 0.25)
         self.assertAlmostEqual(config.Model.diffusion.elf_tail_loss_weight, 0.25)
+        self.assertFalse(config.Model.diffusion.target_category_only)
+        self.assertEqual(config.Model.diffusion.supervision_mode, 'all_agents')
         self.assertEqual(config.Trainer.max_steps, 1000)
         self.assertEqual(config.Trainer.val_check_interval, 1000)
         self.assertEqual(config.Trainer.monitor_metric, 'val_minADE')
@@ -666,6 +820,8 @@ class EmbeddedLanguageFlowConfigTest(unittest.TestCase):
         self.assertTrue(config.Model.diffusion.elf_receding_horizon)
         self.assertEqual(config.Model.diffusion.elf_decoder_prob, 0.25)
         self.assertAlmostEqual(config.Model.diffusion.elf_tail_loss_weight, 0.25)
+        self.assertFalse(config.Model.diffusion.target_category_only)
+        self.assertEqual(config.Model.diffusion.supervision_mode, 'all_agents')
         self.assertEqual(config.Trainer.max_epochs, 3)
         self.assertEqual(config.Trainer.max_steps, -1)
         self.assertEqual(config.Trainer.val_check_interval, 1.0)

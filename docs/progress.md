@@ -1,5 +1,11 @@
 # Progress
 
+## 2026-06-17 CST
+- Task: Fixed SMART ELF map/context drift in receding-horizon rollout.
+- Result: `smart_elf` now aligns generation, supervision, metric, and map-attention masks for sim-agent rollout by training active ELF configs on all current-valid non-background agents and passing an explicit generation-agent mask into SMART history-context map attention. Receding ELF training views and inference commits now roll token history and frame history instead of only overwriting the final history anchor.
+- Files: `smart/model/smart_elf.py`, `smart/modules/agent_decoder.py`, `smart/modules/smart_decoder.py`, ELF train/validation configs, and `tests/test_smart_elf.py`.
+- Validation: Added regressions for all-generation-agent map masks, rolling training history tokens, rolling committed inference history tokens, and all-agent ELF config invariants. `python -m unittest tests.test_smart_elf tests.test_compare_motion_models -v` passed 20 tests; `python -m unittest tests.test_agent_decoder_history_context -v` passed; `py_compile` passed for touched Python files; `git diff --check` passed. A real `data/valid_demo` CPU inference smoke produced finite output with `pred_traj=(58, 80, 2)`, `next_token_idx=(58, 16)`, and `valid_frames=3777`.
+
 ## 2026-06-15 CST
 - Task: Removed road centerline rendering from the multi-camera layout default.
 - Result: `scripts/render_multicamera_layout.py` now keeps map polylines disabled by default so camera-layout conditioning images contain agent 3D boxes without road centerline overlays. A new `--draw-map-polylines` flag keeps the old map-line drawing path available only for debugging.

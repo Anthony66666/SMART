@@ -74,12 +74,14 @@ class SMARTDecoder(nn.Module):
         data: HeteroData,
         map_visible_mask: Optional[torch.Tensor] = None,
         agent_history_mask: Optional[torch.Tensor] = None,
+        map_agent_mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         map_enc = self.map_encoder(data, polygon_visible_mask=map_visible_mask, disable_prediction=True)
         agent_context = self.agent_encoder.encode_history_context(
             data,
             map_enc,
             agent_history_mask=agent_history_mask,
+            map_agent_mask=map_agent_mask,
         )
         return {**map_enc, **agent_context}
 
