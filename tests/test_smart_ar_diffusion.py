@@ -288,6 +288,103 @@ class SMARTAutoregressiveDiffusionTest(unittest.TestCase):
         ))
         self.assertTrue(torch.equal(out['next_token_idx'][0], torch.tensor([0, 10])))
 
+    def test_safe_speed_rerank_replaces_commit_token_only(self):
+        model = _ar_shell()
+        model.ar_commit_tokens = 1
+        model.ar_sampling_guidance_enabled = True
+        model.ar_sampling_guidance_mode = "safe_speed"
+        model.ar_sampling_guidance_topk = 2
+        model.model_config.decoder.token_size = 5
+        model.diffusion_decoder = SimpleNamespace(mask_token_id=5)
+        model.min_t = 1.0e-3
+        model.use_proposal_geometry = False
+        model.geometry_confidence_source_threshold = 0.2
+        model.lane_distance_energy_weight = 0.0
+        model.lane_heading_energy_weight = 0.0
+        model.dynamics_energy_weight = 0.0
+        model.collision_energy_weight = 0.0
+        model.commit_speed_energy_weight = 2.0
+        model.commit_min_speed_ratio = 0.75
+        model.commit_max_speed_ratio = 1.25
+        model.commit_speed_threshold = 1.0
+
+        class ZeroEnergy:
+            dt = 0.1
+
+            def lane_energy(self, candidate_positions, candidate_headings, *args, **kwargs):
+                return (
+                    candidate_positions.new_zeros(candidate_positions.shape[:2]),
+                    candidate_positions.new_zeros(candidate_positions.shape[:2]),
+                )
+
+            def dynamics_energy(self, candidate_positions, candidate_headings, **kwargs):
+                return candidate_positions.new_zeros(candidate_positions.shape[:2])
+
+            def collision_energy(self, candidate_positions, nominal_other, **kwargs):
+                return candidate_positions.new_zeros(candidate_positions.shape[:2])
+
+        def fake_decode(self, sampled, packed, summary, t, geometry_known_mask, **_kwargs):
+            logits = torch.full((1, 4, 5), -20.0)
+            logits[0, 0, 0] = 3.0
+            logits[0, 0, 1] = 2.0
+            logits[0, 1:, 2] = 5.0
+            return logits
+
+        def fake_token_world(self, token_ids, _agent_types, positions, headings):
+            step = torch.arange(1, 6, dtype=positions.dtype, device=positions.device).view(-1, 1)
+            world = positions[:, None, :].expand(-1, 5, -1).clone()
+            moving = token_ids == 1
+            world[moving, :, 0] = positions[moving, 0:1] + 0.5 * step.squeeze(-1)
+            return world, headings[:, None].expand(-1, 5)
+
+        model.trajectory_energy = ZeroEnergy()
+        model._decode_diffusion_logits = MethodType(fake_decode, model)
+        model._token_chunk_world = MethodType(fake_token_world, model)
+        packed = {
+            "agent_maps": [(0, 0, torch.tensor([0]))],
+            "valid_mask": torch.ones(1, 4, dtype=torch.bool),
+            "token_positions": torch.zeros(1, 4, 2),
+            "token_headings": torch.zeros(1, 4),
+            "token_agent_ids": torch.zeros(1, 4, dtype=torch.long),
+            "chunk_ids": torch.arange(4).unsqueeze(0),
+            "agent_context": torch.zeros(1, 4, 1),
+            "agent_type_ids": torch.zeros(1, 4, dtype=torch.long),
+            "agent_shape_embeddings": torch.zeros(1, 4, 1),
+            "agent_start_positions": torch.zeros(1, 2),
+            "agent_start_headings": torch.zeros(1),
+            "agent_types_global": torch.zeros(1, dtype=torch.long),
+            "current_velocities": torch.tensor([[[5.0, 0.0]] * 4]),
+            "current_headings": torch.zeros(1, 4),
+            "commit_speed_reference": torch.full((1, 4), 5.0),
+        }
+        sampled = torch.tensor([[0, 2, 3, 4]])
+        confidence = torch.tensor([[0.9, 0.8, 0.7, 0.6]])
+
+        reranked, reranked_confidence = model._ar_rerank_commit_tokens(
+            sampled,
+            confidence,
+            packed,
+            torch.zeros(1, 1),
+        )
+
+        self.assertTrue(torch.equal(reranked, torch.tensor([[1, 2, 3, 4]])))
+        self.assertLess(float(reranked_confidence[0, 0]), 0.9)
+        self.assertTrue(torch.equal(reranked_confidence[0, 1:], confidence[0, 1:]))
+
+    def test_history_context_dropout_masks_conditioning_without_mutating_labels(self):
+        model = _ar_shell()
+        model.ar_history_context_dropout_enabled = True
+        model.ar_history_context_dropout_prob = 1.0
+        model.training = True
+        data = _toy_sequence(num_agents=1, num_tokens=6, num_frames=31)
+        original_valid = data["agent"]["agent_valid_mask"].clone()
+
+        mask = model._ar_history_context_mask(data)
+
+        self.assertFalse(mask[:, :model.ar_history_tokens].any())
+        self.assertTrue(mask[:, model.ar_history_tokens:].all())
+        self.assertTrue(torch.equal(data["agent"]["agent_valid_mask"], original_valid))
+
 
     def test_non_target_generation_agent_is_not_in_loss_mask(self):
         model = _ar_shell()
@@ -406,6 +503,47 @@ class SMARTAutoregressiveDiffusionTest(unittest.TestCase):
         validation_text = Path("configs/validation/validation_scalable_ar_diffusion.yaml").read_text()
         self.assertIn("visible_token_corruption_prob: 0.0", validation_text)
         self.assertIn("visible_token_corruption_topk: 5", validation_text)
+
+    def test_ar_rerank_config_keeps_maskgit_and_enables_safe_speed_guidance(self):
+        text = Path("configs/train/train_scalable_ar_diffusion_rerank_1000.yaml").read_text()
+
+        self.assertIn("predictor: smart_ar_diffusion", text)
+        self.assertIn("ar_objective: maskgit", text)
+        self.assertIn("sampling_guidance:", text)
+        self.assertIn("enabled: true", text)
+        self.assertIn("mode: safe_speed", text)
+        self.assertIn("commit_min_speed_ratio: 0.75", text)
+        self.assertIn("commit_max_speed_ratio: 1.25", text)
+        self.assertIn("map_token_noise:", text)
+        self.assertIn("history_context_dropout:", text)
+
+    def test_ar_rerank_server_config_uses_full_server_training_paths(self):
+        text = Path("configs/train/train_scalable_ar_diffusion_rerank.yaml").read_text()
+
+        self.assertIn('strategy: ddp_find_unused_parameters_true', text)
+        self.assertIn("devices: 14", text)
+        self.assertIn("/raid/haoq_lab/wangshijie/data/waymo/training", text)
+        self.assertIn("predictor: smart_ar_diffusion", text)
+        self.assertIn("ar_objective: maskgit", text)
+        self.assertIn("prediction_tokens: 4", text)
+        self.assertIn("commit_tokens: 1", text)
+        self.assertIn("causal_noise_schedule: false", text)
+        self.assertIn("sampling_guidance:", text)
+        self.assertIn("mode: safe_speed", text)
+        self.assertIn("map_token_noise:", text)
+        self.assertIn("history_context_dropout:", text)
+
+    def test_ar_rerank_validation_config_keeps_guidance_without_training_dropout(self):
+        text = Path("configs/validation/validation_scalable_ar_diffusion_rerank.yaml").read_text()
+
+        self.assertIn('mode: "validation"', text)
+        self.assertIn("ar_objective: maskgit", text)
+        self.assertIn("sampling_guidance:", text)
+        self.assertIn("mode: safe_speed", text)
+        self.assertIn("commit_min_speed_ratio: 0.75", text)
+        self.assertIn("commit_max_speed_ratio: 1.25", text)
+        self.assertIn("history_context_dropout:", text)
+        self.assertIn("enabled: false", text)
 
 
     def test_unused_self_condition_options_are_removed_from_code_and_configs(self):

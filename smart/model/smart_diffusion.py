@@ -1029,8 +1029,18 @@ class SMARTDiffusion(SMART):
             return ref_tensor.new_zeros(())
         return self._compute_ntp_loss(self(data))
 
+    def _history_context_mask(self, data):
+        return None
+
     def _build_diffusion_inputs(self, data, rollout_valid=False):
-        ctx = self.encoder.encode_history_context(data)
+        history_context_mask = self._history_context_mask(data)
+        if history_context_mask is None:
+            ctx = self.encoder.encode_history_context(data)
+        else:
+            ctx = self.encoder.encode_history_context(
+                data,
+                agent_history_mask=history_context_mask,
+            )
         ft, fv, generation_agents, supervision_agents = self._build_future_token_targets(
             data,
             rollout_valid=rollout_valid,

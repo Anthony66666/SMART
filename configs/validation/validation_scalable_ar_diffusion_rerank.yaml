@@ -1,0 +1,122 @@
+time_info: &time_info
+  num_historical_steps: 11
+  num_future_steps: 80
+  token_size: 2048
+
+Dataset:
+  root:
+  batch_size: 4
+  shuffle: True
+  num_workers: 4
+  pin_memory: True
+  persistent_workers: True
+  train_raw_dir:
+  val_raw_dir: ["/home/anthony/SimAgentJEPA/data/waymo/validation"]
+  test_raw_dir:
+  TargetBuilder: WaymoTargetBuilder
+  train_processed_dir:
+  val_processed_dir:
+  test_processed_dir:
+  dataset: "scalable"
+  <<: *time_info
+
+Trainer:
+  strategy: ddp_find_unused_parameters_false
+  accelerator: "gpu"
+  devices: 1
+  max_epochs: 32
+  save_ckpt_path:
+  num_nodes: 1
+  mode:
+  ckpt_path:
+  precision: 32
+  accumulate_grad_batches: 1
+
+Model:
+  mode: "validation"
+  predictor: smart_ar_diffusion
+  dataset: "waymo"
+  input_dim: 2
+  hidden_dim: 128
+  output_dim: 2
+  output_head: False
+  num_heads: 8
+  <<: *time_info
+  head_dim: 16
+  dropout: 0.1
+  num_freq_bands: 64
+  lr: 0.0005
+  warmup_steps: 0
+  total_steps: 32
+  decoder:
+    <<: *time_info
+    num_map_layers: 3
+    num_agent_layers: 6
+    a2a_radius: 60
+    pl2pl_radius: 10
+    pl2a_radius: 30
+    time_span: 30
+  inference_token: True
+  rollout_num: 1
+  diffusion:
+    ar_objective: maskgit
+    future_chunk_steps: 5
+    history_tokens: 2
+    prediction_tokens: 4
+    commit_tokens: 1
+    carry_tail_proposal: true
+    causal_noise_schedule: false
+    causal_chunk_mask_multipliers: [1, 1, 1, 1]
+    causal_loss_weights: [1.0, 1.0, 1.0, 1.0]
+    token_steps: 5
+    total_rollout_steps: 80
+    local_map_refresh: rescreen
+    rolling_anchor_training: true
+    state_perturb_prob: 0.5
+    state_perturb_pos_sigma_m: 0.3
+    state_perturb_heading_sigma_rad: 0.05
+    sampling_guidance:
+      enabled: true
+      mode: safe_speed
+      safe_topk: 16
+    lane_distance_energy_weight: 1.0
+    lane_heading_energy_weight: 0.5
+    dynamics_energy_weight: 0.25
+    collision_energy_weight: 2.0
+    commit_speed_energy_weight: 2.0
+    commit_min_speed_ratio: 0.75
+    commit_max_speed_ratio: 1.25
+    commit_speed_threshold: 1.0
+    commit_speed_reference_decay: 1.0
+    map_token_noise:
+      enabled: false
+    history_context_dropout:
+      enabled: false
+      prob: 0.0
+    num_steps: 32
+    num_layers: 6
+    eps: 1.0e-3
+    min_t: 1.0e-3
+    ntp_aux_loss_weight: 0
+    use_agent_context: true
+    use_type_embedding: true
+    use_map_context: true
+    max_map_tokens: 0
+    geometry_dropout_prob: 0.0
+    visible_token_corruption_prob: 0.0
+    visible_token_corruption_topk: 5
+    target_category_only: true
+    agent_selection_mode: smart_inference
+    supervision_mode: smart_category3
+    metric_mode: smart_val_compatible
+    low_variance_masking: true
+    mask_count_mode: exact
+    antithetic_mask_ranking: true
+    remask_sampling: true
+    remask_confidence_temperature: 1.0
+    prefix_constrained_sampling: false
+    prefix_constrained_training: false
+    use_proposal_geometry: true
+    geometry_confidence_source_threshold: 0.35
+    debug_validation_logging: true
+    freeze_encoder: false

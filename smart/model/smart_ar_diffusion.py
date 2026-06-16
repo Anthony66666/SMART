@@ -9,6 +9,7 @@ from torch_geometric.data import Batch
 
 from smart.model.smart_diffusion import SMARTDiffusion
 from smart.modules.causal_diffusion_decoder import CausalDiffusionDecoder
+from smart.modules.trajectory_energy import TrajectoryEnergy
 from smart.utils import wrap_angle
 
 
@@ -72,6 +73,88 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
         self.ar_state_perturb_prob = min(max(self.ar_state_perturb_prob, 0.0), 1.0)
         self.ar_state_perturb_pos_sigma_m = float(getattr(diffusion_cfg, 'state_perturb_pos_sigma_m', 0.3))
         self.ar_state_perturb_heading_sigma_rad = float(getattr(diffusion_cfg, 'state_perturb_heading_sigma_rad', 0.05))
+        sampling_guidance_cfg = getattr(diffusion_cfg, 'sampling_guidance', None)
+        self.ar_sampling_guidance_enabled = bool(
+            getattr(
+                sampling_guidance_cfg,
+                'enabled',
+                getattr(diffusion_cfg, 'sampling_guidance_enabled', False),
+            )
+        )
+        self.ar_sampling_guidance_mode = str(
+            getattr(
+                sampling_guidance_cfg,
+                'mode',
+                getattr(diffusion_cfg, 'sampling_guidance_mode', 'none'),
+            )
+        ).lower()
+        self.ar_sampling_guidance_topk = max(
+            1,
+            int(
+                getattr(
+                    sampling_guidance_cfg,
+                    'safe_topk',
+                    getattr(diffusion_cfg, 'sampling_guidance_topk', 16),
+                )
+            ),
+        )
+        self.lane_distance_energy_weight = float(
+            getattr(diffusion_cfg, 'lane_distance_energy_weight', 1.0)
+        )
+        self.lane_heading_energy_weight = float(
+            getattr(diffusion_cfg, 'lane_heading_energy_weight', 0.5)
+        )
+        self.dynamics_energy_weight = float(
+            getattr(diffusion_cfg, 'dynamics_energy_weight', 0.25)
+        )
+        self.collision_energy_weight = float(
+            getattr(diffusion_cfg, 'collision_energy_weight', 2.0)
+        )
+        self.commit_speed_energy_weight = float(
+            getattr(diffusion_cfg, 'commit_speed_energy_weight', 2.0)
+        )
+        self.commit_min_speed_ratio = float(
+            getattr(diffusion_cfg, 'commit_min_speed_ratio', 0.75)
+        )
+        self.commit_max_speed_ratio = float(
+            getattr(diffusion_cfg, 'commit_max_speed_ratio', 1.25)
+        )
+        self.commit_speed_threshold = float(
+            getattr(diffusion_cfg, 'commit_speed_threshold', 1.0)
+        )
+        self.commit_speed_reference_decay = float(
+            getattr(diffusion_cfg, 'commit_speed_reference_decay', 1.0)
+        )
+        map_token_noise_cfg = getattr(diffusion_cfg, 'map_token_noise', None)
+        self.map_token_noise_enabled = bool(
+            getattr(
+                map_token_noise_cfg,
+                'enabled',
+                getattr(diffusion_cfg, 'map_token_noise_enabled', getattr(self, 'noise', True)),
+            )
+        )
+        self.noise = self.map_token_noise_enabled
+        history_dropout_cfg = getattr(diffusion_cfg, 'history_context_dropout', None)
+        self.ar_history_context_dropout_enabled = bool(
+            getattr(
+                history_dropout_cfg,
+                'enabled',
+                getattr(diffusion_cfg, 'history_context_dropout_enabled', False),
+            )
+        )
+        self.ar_history_context_dropout_prob = min(
+            1.0,
+            max(
+                0.0,
+                float(
+                    getattr(
+                        history_dropout_cfg,
+                        'prob',
+                        getattr(diffusion_cfg, 'history_context_dropout_prob', 0.0),
+                    )
+                ),
+            ),
+        )
         self.ar_local_map_radius = float(
             getattr(diffusion_cfg, 'local_map_radius', getattr(model_config.decoder, 'pl2a_radius', 30.0))
         )
@@ -121,6 +204,8 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
                 nn.SiLU(),
                 nn.Linear(self.hidden_dim, self.hidden_dim),
             )
+        if self.ar_sampling_guidance_enabled:
+            self.trajectory_energy = TrajectoryEnergy(dt=0.1)
         self._token_center_vocab_cache = None
 
     def _num_ar_rollout_rounds(self):
@@ -128,6 +213,338 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
 
     def _use_causal_temporal_decoder(self):
         return bool(getattr(self, 'ar_causal_temporal_edges', False))
+
+    def _ar_sampling_guidance_active(self):
+        return (
+            bool(getattr(self, 'ar_sampling_guidance_enabled', False))
+            and str(getattr(self, 'ar_sampling_guidance_mode', 'none')).lower()
+            in ('safe_speed', 'safe')
+        )
+
+    def _history_context_mask(self, data):
+        return self._ar_history_context_mask(data)
+
+    def _ar_history_context_mask(self, data):
+        if (
+            not bool(getattr(self, 'ar_history_context_dropout_enabled', False))
+            or not bool(getattr(self, 'training', False))
+        ):
+            return None
+        drop_prob = float(getattr(self, 'ar_history_context_dropout_prob', 0.0))
+        if drop_prob <= 0.0:
+            return None
+        base_mask = data['agent']['agent_valid_mask'].bool()
+        mask = base_mask.clone()
+        history_steps = min(int(getattr(self, 'ar_history_tokens', 0)), mask.shape[1])
+        if history_steps <= 0:
+            return mask
+        drop = torch.rand(
+            mask[:, :history_steps].shape,
+            device=mask.device,
+        ) < drop_prob
+        mask[:, :history_steps] = mask[:, :history_steps] & ~drop
+        return mask
+
+    def _attach_ar_sampling_guidance_context(
+        self,
+        packed,
+        current_velocities,
+        current_headings,
+        reference_speeds,
+    ):
+        if packed is None:
+            return
+        current_velocities = current_velocities.to(
+            device=packed['valid_mask'].device,
+            dtype=packed['token_positions'].dtype,
+        )
+        current_headings = current_headings.to(
+            device=packed['valid_mask'].device,
+            dtype=packed['token_headings'].dtype,
+        )
+        reference_speeds = reference_speeds.to(
+            device=packed['valid_mask'].device,
+            dtype=packed['token_positions'].dtype,
+        )
+        velocity_window = current_velocities[:, None, :].expand(
+            -1,
+            self.ar_prediction_tokens,
+            -1,
+        )
+        heading_window = current_headings[:, None].expand(
+            -1,
+            self.ar_prediction_tokens,
+        )
+        speed_window = reference_speeds[:, None].expand(
+            -1,
+            self.ar_prediction_tokens,
+        )
+        packed['current_velocities'] = self._pack_agent_window_values(
+            velocity_window,
+            packed,
+            fill_value=0.0,
+        )
+        packed['current_headings'] = self._pack_agent_window_values(
+            heading_window,
+            packed,
+            fill_value=0.0,
+        )
+        packed['commit_speed_reference'] = self._pack_agent_window_values(
+            speed_window,
+            packed,
+            fill_value=0.0,
+        )
+
+    def _ar_commit_speed_energy(
+        self,
+        candidate_positions,
+        anchor_positions,
+        current_velocities,
+        commit_chunk_ids,
+        reference_speeds=None,
+    ):
+        energy = candidate_positions.new_zeros(candidate_positions.shape[:2])
+        if current_velocities is None or candidate_positions.numel() == 0:
+            return energy
+        commit_mask = commit_chunk_ids.to(device=candidate_positions.device) < int(
+            getattr(self, 'ar_commit_tokens', 1)
+        )
+        if not commit_mask.any():
+            return energy
+
+        current_velocities = current_velocities.to(
+            device=candidate_positions.device,
+            dtype=candidate_positions.dtype,
+        )
+        anchor_positions = anchor_positions.to(
+            device=candidate_positions.device,
+            dtype=candidate_positions.dtype,
+        )
+        current_speed = torch.norm(current_velocities, dim=-1)
+        if reference_speeds is not None:
+            reference_speeds = reference_speeds.to(
+                device=candidate_positions.device,
+                dtype=candidate_positions.dtype,
+            )
+            current_speed = torch.maximum(current_speed, reference_speeds.clamp_min(0.0))
+
+        moving_mask = commit_mask & (
+            current_speed >= float(getattr(self, 'commit_speed_threshold', 1.0))
+        )
+        if not moving_mask.any():
+            return energy
+
+        dt = float(getattr(getattr(self, 'trajectory_energy', None), 'dt', 0.1))
+        step_dt = max(dt, 1e-3)
+        anchor = anchor_positions[:, None, None, :].expand(
+            -1,
+            candidate_positions.shape[1],
+            1,
+            -1,
+        )
+        position_chain = torch.cat([anchor, candidate_positions], dim=-2)
+        step_speed = torch.norm(
+            position_chain[:, :, 1:] - position_chain[:, :, :-1],
+            dim=-1,
+        ) / step_dt
+        candidate_speed = step_speed.median(dim=-1).values
+        minimum_speed = (
+            current_speed * float(getattr(self, 'commit_min_speed_ratio', 0.75))
+        ).unsqueeze(-1)
+        maximum_speed = (
+            current_speed * float(getattr(self, 'commit_max_speed_ratio', 1.25))
+        ).unsqueeze(-1)
+        speed_deficit = (minimum_speed - candidate_speed).clamp_min(0.0)
+        speed_excess = (candidate_speed - maximum_speed).clamp_min(0.0)
+        scale = max(float(getattr(self, 'commit_speed_threshold', 1.0)), 1.0)
+        energy[moving_mask] = (
+            (speed_deficit[moving_mask] / scale) ** 2
+            + (speed_excess[moving_mask] / scale) ** 2
+        )
+        return energy
+
+    def _ar_rerank_commit_tokens(
+        self,
+        sampled_ids,
+        sampled_confidence,
+        packed,
+        summary,
+        initial_proposal_token_ids=None,
+        initial_proposal_confidence=None,
+    ):
+        if (
+            not self._ar_sampling_guidance_active()
+            or packed is None
+            or sampled_ids.numel() == 0
+        ):
+            return sampled_ids, sampled_confidence
+        commit_mask = (
+            packed['valid_mask']
+            & (packed['chunk_ids'] < int(getattr(self, 'ar_commit_tokens', 1)))
+        )
+        if not commit_mask.any():
+            return sampled_ids, sampled_confidence
+
+        rerank_noisy = sampled_ids.clone()
+        rerank_noisy[commit_mask] = self.mask_token_id
+        geometry_known = packed['valid_mask'] & (rerank_noisy != self.mask_token_id)
+        t_batch = torch.full(
+            (sampled_ids.shape[0],),
+            float(getattr(self, 'min_t', 1.0e-3)),
+            device=sampled_ids.device,
+        )
+        logits = self._decode_diffusion_logits(
+            rerank_noisy,
+            packed,
+            summary,
+            t_batch,
+            geometry_known,
+            proposal_token_ids=initial_proposal_token_ids,
+            proposal_confidence=initial_proposal_confidence,
+        )
+        flat_commit = torch.nonzero(commit_mask.reshape(-1), as_tuple=False).squeeze(-1)
+        commit_logits = logits.reshape(-1, logits.shape[-1])[flat_commit]
+        if commit_logits.numel() == 0:
+            return sampled_ids, sampled_confidence
+        topk = min(
+            int(getattr(self, 'ar_sampling_guidance_topk', 16)),
+            int(commit_logits.shape[-1]),
+        )
+        topk_log_probabilities, topk_ids = F.log_softmax(
+            commit_logits,
+            dim=-1,
+        ).topk(topk, dim=-1)
+
+        anchor_positions, anchor_headings, _geometry_confidence = self._refresh_token_geometry(
+            rerank_noisy,
+            packed,
+            geometry_known_mask=geometry_known,
+            proposal_token_ids=initial_proposal_token_ids,
+            proposal_confidence=initial_proposal_confidence,
+        )
+        flat_positions = anchor_positions.reshape(-1, 2)[flat_commit]
+        flat_headings = anchor_headings.reshape(-1)[flat_commit]
+        flat_agent_types = packed['agent_type_ids'].reshape(-1)[flat_commit]
+        commit_chunk_ids = packed['chunk_ids'].reshape(-1)[flat_commit]
+        num_commit = int(flat_commit.numel())
+        repeated_positions = flat_positions[:, None].expand(
+            -1,
+            topk,
+            -1,
+        ).reshape(-1, 2)
+        repeated_headings = flat_headings[:, None].expand(
+            -1,
+            topk,
+        ).reshape(-1)
+        repeated_types = flat_agent_types[:, None].expand(
+            -1,
+            topk,
+        ).reshape(-1)
+        candidate_positions, candidate_headings = self._token_chunk_world(
+            topk_ids.reshape(-1),
+            repeated_types,
+            repeated_positions,
+            repeated_headings,
+        )
+        candidate_positions = candidate_positions.reshape(
+            num_commit,
+            topk,
+            self.ar_token_steps,
+            2,
+        )
+        candidate_headings = candidate_headings.reshape(
+            num_commit,
+            topk,
+            self.ar_token_steps,
+        )
+
+        sequence_length = packed['valid_mask'].shape[1]
+        candidate_batch = torch.div(
+            flat_commit,
+            sequence_length,
+            rounding_mode='floor',
+        )
+        trajectory_energy = getattr(self, 'trajectory_energy', None)
+        if trajectory_energy is None:
+            trajectory_energy = TrajectoryEnergy(dt=0.1).to(candidate_positions.device)
+        lane_distance, lane_heading = trajectory_energy.lane_energy(
+            candidate_positions,
+            candidate_headings,
+            packed.get('map_positions'),
+            packed.get('map_orientations'),
+            candidate_batch=candidate_batch,
+            map_batch=packed.get('map_batch'),
+            map_valid_mask=packed.get('map_valid_mask'),
+        )
+        dynamics = trajectory_energy.dynamics_energy(
+            candidate_positions,
+            candidate_headings,
+        )
+        commit_speed_energy = candidate_positions.new_zeros(candidate_positions.shape[:2])
+        if packed.get('current_velocities') is not None:
+            current_velocities = packed['current_velocities'].reshape(-1, 2)[flat_commit]
+            current_headings = packed.get(
+                'current_headings',
+                anchor_headings,
+            ).reshape(-1)[flat_commit]
+            reference_speeds = None
+            if packed.get('commit_speed_reference') is not None:
+                reference_speeds = packed['commit_speed_reference'].reshape(-1)[flat_commit]
+            transition_dynamics = trajectory_energy.dynamics_energy(
+                candidate_positions,
+                candidate_headings,
+                current_positions=flat_positions,
+                current_velocities=current_velocities,
+                current_headings=current_headings,
+            )
+            dynamics = transition_dynamics
+            commit_speed_energy = self._ar_commit_speed_energy(
+                candidate_positions,
+                flat_positions,
+                current_velocities,
+                commit_chunk_ids,
+                reference_speeds=reference_speeds,
+            )
+
+        preliminary_energy = (
+            self.lane_distance_energy_weight * lane_distance
+            + self.lane_heading_energy_weight * lane_heading
+            + self.dynamics_energy_weight * dynamics
+            + self.commit_speed_energy_weight * commit_speed_energy
+        )
+        preliminary_selection = (
+            topk_log_probabilities - preliminary_energy
+        ).argmax(dim=-1)
+        row = torch.arange(num_commit, device=topk_ids.device)
+        nominal_other = candidate_positions[row, preliminary_selection]
+        commit_agent_ids = packed['token_agent_ids'].reshape(-1)[flat_commit]
+        collision = trajectory_energy.collision_energy(
+            candidate_positions,
+            nominal_other,
+            candidate_batch=candidate_batch,
+            other_batch=candidate_batch,
+            candidate_agent_ids=commit_agent_ids,
+            other_agent_ids=commit_agent_ids,
+        )
+        total_energy = (
+            self.lane_distance_energy_weight * lane_distance
+            + self.lane_heading_energy_weight * lane_heading
+            + self.dynamics_energy_weight * dynamics
+            + self.commit_speed_energy_weight * commit_speed_energy
+            + self.collision_energy_weight * collision
+        )
+        selected = (topk_log_probabilities - total_energy).argmax(dim=-1)
+        reranked_ids = sampled_ids.clone()
+        reranked_ids.reshape(-1)[flat_commit] = topk_ids[row, selected]
+        if sampled_confidence is None:
+            reranked_confidence = sampled_confidence
+        else:
+            reranked_confidence = sampled_confidence.clone()
+            reranked_confidence.reshape(-1)[flat_commit] = topk_log_probabilities[
+                row,
+                selected,
+            ].exp()
+        return reranked_ids, reranked_confidence
 
     def _ar_closed_loop_curriculum(self, epoch):
         epoch = max(0, int(epoch))
@@ -1318,6 +1735,29 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
                 f"ar_inference_round_packed round={round_idx + 1}/{rounds} "
                 f"packed_tokens={packed_tokens} map_tokens={map_tokens}"
             )
+            if self._ar_sampling_guidance_active():
+                if history_frame_pos.shape[1] >= 2:
+                    guidance_velocity = (
+                        history_frame_pos[:, -1] - history_frame_pos[:, -2]
+                    ) / 0.1
+                    guidance_valid = history_frame_valid[:, -1] & history_frame_valid[:, -2]
+                    guidance_velocity = guidance_velocity.masked_fill(
+                        ~guidance_valid.unsqueeze(-1),
+                        0.0,
+                    )
+                else:
+                    guidance_velocity = torch.zeros(
+                        num_agents,
+                        2,
+                        device=device,
+                        dtype=history_frame_pos.dtype,
+                    )
+                self._attach_ar_sampling_guidance_context(
+                    packed,
+                    guidance_velocity,
+                    current_heading,
+                    reference_speed,
+                )
             initial_proposal_ids = None
             initial_proposal_confidence = None
             if (
@@ -1399,6 +1839,14 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
                 sample_kwargs['editable_mask'] = editable_mask
                 sample_kwargs['seed_trajs'] = seed_trajs
             sampled_ids, sampled_confidence = self._diffusion_sample(**sample_kwargs)
+            sampled_ids, sampled_confidence = self._ar_rerank_commit_tokens(
+                sampled_ids,
+                sampled_confidence,
+                packed,
+                summary,
+                initial_proposal_token_ids=initial_proposal_ids,
+                initial_proposal_confidence=initial_proposal_confidence,
+            )
             self._debug_log(
                 f"ar_inference_round_sample_done round={round_idx + 1}/{rounds} "
                 f"sample_elapsed={time.perf_counter() - sample_start:.2f}s"
