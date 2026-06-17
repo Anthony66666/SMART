@@ -125,6 +125,24 @@ class SMARTEmbeddedLanguageFlow(pl.LightningModule):
         ).lower()
         if self.elf_sampling_strategy not in ("argmax", "multinomial"):
             raise ValueError("diffusion.elf_sampling_strategy must be argmax or multinomial.")
+        self.elf_map_commit_score_weight = max(
+            0.0,
+            float(getattr(diffusion_cfg, "elf_map_commit_score_weight", 0.0)),
+        )
+        self.elf_map_commit_loss_weight = max(
+            0.0,
+            float(getattr(diffusion_cfg, "elf_map_commit_loss_weight", 0.0)),
+        )
+        self.elf_geometry_energy_weight = max(
+            0.0,
+            float(getattr(diffusion_cfg, "elf_geometry_energy_weight", 0.0)),
+        )
+        self.elf_geometry_topk = max(0, int(getattr(diffusion_cfg, "elf_geometry_topk", 16)))
+        self.elf_map_score_temperature = max(
+            1e-4,
+            float(getattr(diffusion_cfg, "elf_map_score_temperature", 1.0)),
+        )
+        self.elf_map_score_normalize = bool(getattr(diffusion_cfg, "elf_map_score_normalize", True))
         self.elf_time_schedule = str(getattr(diffusion_cfg, "elf_time_schedule", "uniform"))
         self.elf_denoiser_p_mean = float(getattr(diffusion_cfg, "elf_denoiser_p_mean", -0.8))
         self.elf_denoiser_p_std = float(getattr(diffusion_cfg, "elf_denoiser_p_std", 0.8))
@@ -181,6 +199,7 @@ class SMARTEmbeddedLanguageFlow(pl.LightningModule):
             num_model_mode_tokens=1,
             num_token_types=4,
         )
+        self.elf_map_score_proj = nn.Linear(self.hidden_dim, self.hidden_dim)
 
         self.minADE = minADE(max_guesses=1)
         self.minFDE = minFDE(max_guesses=1)
@@ -470,6 +489,136 @@ class SMARTEmbeddedLanguageFlow(pl.LightningModule):
             proxy[type_mask] = logits.argmax(dim=-1)
         return proxy.masked_fill(~valid_mask, 0)
 
+    def _elf_token_similarity_logits(self, elf_embeddings, agent_type_ids, valid_mask):
+        fill_value = torch.finfo(elf_embeddings.dtype).min
+        logits = elf_embeddings.new_full(
+            (*valid_mask.shape, self.token_size),
+            fill_value,
+        )
+        if not valid_mask.any():
+            return logits
+        for type_id, table in self._token_embedding_tables(
+            elf_embeddings.device,
+            elf_embeddings.dtype,
+        ):
+            type_mask = valid_mask & (agent_type_ids.to(device=valid_mask.device) == type_id)
+            if not type_mask.any():
+                continue
+            emb = elf_embeddings[type_mask]
+            type_logits = 2.0 * emb.matmul(table.t()) - table.pow(2).sum(dim=-1).unsqueeze(0)
+            logits[type_mask] = type_logits.to(dtype=logits.dtype)
+        return logits
+
+    def _map_conditioned_token_logits(self, packed, valid_mask):
+        context = packed.get("context")
+        if context is None:
+            return torch.zeros(
+                *valid_mask.shape,
+                self.token_size,
+                dtype=torch.float32,
+                device=valid_mask.device,
+            )
+        query = context.to(device=valid_mask.device, dtype=torch.float32)
+        if hasattr(self, "elf_map_score_proj"):
+            query = self.elf_map_score_proj(query)
+        logits = query.new_zeros((*valid_mask.shape, self.token_size))
+        if not valid_mask.any():
+            return logits
+        agent_type_ids = packed["agent_type_ids"].to(device=valid_mask.device)
+        for type_id, table in self._token_embedding_tables(valid_mask.device, query.dtype):
+            type_mask = valid_mask & (agent_type_ids == type_id)
+            if not type_mask.any():
+                continue
+            token_table = table.to(device=query.device, dtype=query.dtype)
+            type_query = query[type_mask]
+            if getattr(self, "elf_map_score_normalize", True):
+                type_query = F.normalize(type_query, dim=-1)
+                token_table = F.normalize(token_table, dim=-1)
+                scale = self.elf_map_score_temperature
+            else:
+                scale = math.sqrt(float(max(type_query.shape[-1], 1))) * self.elf_map_score_temperature
+            logits[type_mask] = type_query.matmul(token_table.t()) / scale
+        return logits
+
+    def _combined_elf_token_logits(self, elf_embeddings, packed, valid_mask):
+        logits = self._elf_token_similarity_logits(
+            elf_embeddings,
+            packed["agent_type_ids"],
+            valid_mask,
+        )
+        score_weight = float(getattr(self, "elf_map_commit_score_weight", 0.0))
+        if score_weight > 0.0:
+            map_logits = self._map_conditioned_token_logits(packed, valid_mask).to(
+                device=logits.device,
+                dtype=logits.dtype,
+            )
+            logits = logits + score_weight * map_logits
+        return self._apply_map_geometry_energy(logits, packed, valid_mask)
+
+    def _apply_map_geometry_energy(self, logits, packed, valid_mask):
+        energy_weight = float(getattr(self, "elf_geometry_energy_weight", 0.0))
+        topk = int(getattr(self, "elf_geometry_topk", 0))
+        if energy_weight <= 0.0 or topk <= 0 or not valid_mask.any():
+            return logits
+        required = ("anchor_pos", "anchor_heading", "map_positions", "map_batch", "slot_batch")
+        if any(key not in packed for key in required):
+            return logits
+        k = min(topk, int(logits.shape[-1]))
+        top_scores, top_ids = torch.topk(logits, k=k, dim=-1)
+        energy = self._token_map_geometry_energy(top_ids, packed, valid_mask).to(
+            device=logits.device,
+            dtype=logits.dtype,
+        )
+        adjusted = logits.new_full(logits.shape, torch.finfo(logits.dtype).min)
+        adjusted.scatter_(-1, top_ids, top_scores - energy_weight * energy)
+        return adjusted
+
+    def _token_map_geometry_energy(self, token_ids, packed, valid_mask):
+        energy = token_ids.new_zeros(token_ids.shape, dtype=torch.float32)
+        map_positions = packed["map_positions"].to(device=token_ids.device, dtype=torch.float32)
+        map_batch = packed["map_batch"].to(device=token_ids.device, dtype=torch.long)
+        map_valid_mask = packed.get("map_valid_mask")
+        if map_valid_mask is not None:
+            map_valid_mask = map_valid_mask.to(device=token_ids.device, dtype=torch.bool)
+        batch_indices = torch.nonzero(valid_mask, as_tuple=False)
+        if batch_indices.numel() == 0:
+            return energy
+        for batch_idx, slot_idx in batch_indices.tolist():
+            scene_idx = int(packed["slot_batch"][batch_idx, slot_idx].item())
+            scene_map = map_batch == scene_idx
+            if map_valid_mask is not None:
+                scene_map = scene_map & map_valid_mask
+            if not scene_map.any():
+                continue
+            ids = token_ids[batch_idx, slot_idx].view(1, -1)
+            agent_type = packed["agent_type_ids"][batch_idx, slot_idx].view(1)
+            local = self._select_token_traj_all(ids, agent_type)[0]
+            theta = packed["anchor_heading"][batch_idx, slot_idx].to(
+                device=token_ids.device,
+                dtype=torch.float32,
+            )
+            cos, sin = theta.cos(), theta.sin()
+            rot = torch.stack(
+                [
+                    torch.stack([cos, sin]),
+                    torch.stack([-sin, cos]),
+                ],
+                dim=0,
+            )
+            world = torch.matmul(local, rot)
+            world = world + packed["anchor_pos"][batch_idx, slot_idx].to(
+                device=token_ids.device,
+                dtype=torch.float32,
+            ).view(1, 1, 1, 2)
+            centers = world[:, 1:1 + self.future_chunk_steps].mean(dim=2)
+            dist = torch.cdist(
+                centers.reshape(-1, 2),
+                map_positions[scene_map],
+            )
+            nearest = dist.min(dim=-1).values.view(centers.shape[0], -1)
+            energy[batch_idx, slot_idx] = nearest.mean(dim=-1)
+        return energy
+
     def _future_token_slices(self, data, token_start=None, sequence_tokens=None):
         token_start = self.history_tokens if token_start is None else int(token_start)
         sequence_tokens = (
@@ -530,11 +679,22 @@ class SMARTEmbeddedLanguageFlow(pl.LightningModule):
         packed_chunk_ids = zeros((batch_size, max_len), torch.long)
         packed_type_ids = zeros((batch_size, max_len), torch.long)
         packed_context = zeros((batch_size, max_len, self.hidden_dim), agent_context.dtype)
+        packed_anchor_pos = zeros((batch_size, max_len, 2), torch.float32)
+        packed_anchor_heading = zeros((batch_size, max_len), torch.float32)
+        packed_slot_batch = zeros((batch_size, max_len), torch.long)
         packed_agent_indices = torch.full(
             (batch_size, max_len),
             -1,
             dtype=torch.long,
             device=device,
+        )
+        anchor_pos = data["agent"]["token_pos"][:, history_index, :2].to(
+            device=device,
+            dtype=torch.float32,
+        )
+        anchor_heading = data["agent"]["token_heading"][:, history_index].to(
+            device=device,
+            dtype=torch.float32,
         )
         for batch_idx in range(batch_size):
             agents = torch.nonzero(agent_batch == batch_idx, as_tuple=False).squeeze(-1)
@@ -548,6 +708,9 @@ class SMARTEmbeddedLanguageFlow(pl.LightningModule):
             packed_chunk_ids[batch_idx, sl] = chunk_ids_agent[agents].reshape(-1)
             packed_type_ids[batch_idx, sl] = agent_type[agents, None].expand(-1, sequence_tokens).reshape(-1)
             packed_context[batch_idx, sl] = token_context[agents].reshape(-1, self.hidden_dim)
+            packed_anchor_pos[batch_idx, sl] = anchor_pos[agents, None].expand(-1, sequence_tokens, -1).reshape(-1, 2)
+            packed_anchor_heading[batch_idx, sl] = anchor_heading[agents, None].expand(-1, sequence_tokens).reshape(-1)
+            packed_slot_batch[batch_idx, sl] = batch_idx
             packed_agent_indices[batch_idx, sl] = agents[:, None].expand(-1, sequence_tokens).reshape(-1)
 
         summary = packed_context.new_zeros(batch_size, self.hidden_dim)
@@ -561,6 +724,9 @@ class SMARTEmbeddedLanguageFlow(pl.LightningModule):
             "chunk_ids": packed_chunk_ids,
             "agent_type_ids": packed_type_ids,
             "context": packed_context,
+            "anchor_pos": packed_anchor_pos,
+            "anchor_heading": packed_anchor_heading,
+            "slot_batch": packed_slot_batch,
             "agent_indices": packed_agent_indices,
             "sequence_tokens": sequence_tokens,
             "token_start": token_start,
@@ -569,6 +735,24 @@ class SMARTEmbeddedLanguageFlow(pl.LightningModule):
             "token_ids_by_agent": token_ids,
             "token_valid_by_agent": token_valid,
         }
+        if "pt_token" in data and "position" in data["pt_token"]:
+            packed["map_positions"] = data["pt_token"]["position"][:, :2].to(
+                device=device,
+                dtype=torch.float32,
+            )
+            if isinstance(data, Batch) and "batch" in data["pt_token"]:
+                packed["map_batch"] = data["pt_token"]["batch"].to(device=device, dtype=torch.long)
+            else:
+                packed["map_batch"] = torch.zeros(
+                    int(data["pt_token"]["position"].shape[0]),
+                    dtype=torch.long,
+                    device=device,
+                )
+            if "pt_visibility_mask" in context:
+                packed["map_valid_mask"] = context["pt_visibility_mask"].to(
+                    device=device,
+                    dtype=torch.bool,
+                )
         return packed, summary
 
     def _build_diffusion_inputs(
@@ -719,12 +903,35 @@ class SMARTEmbeddedLanguageFlow(pl.LightningModule):
                 packed["chunk_ids"],
                 self.elf_tail_loss_weight,
             )
-            loss = self.elf_loss_weight * flow_loss + self.elf_decoder_loss_weight * decoder_loss
+            map_commit_loss = decoder_logits.sum() * 0.0
+            if float(getattr(self, "elf_map_commit_loss_weight", 0.0)) > 0.0:
+                map_logits = self._map_conditioned_token_logits(packed, valid_mask).to(
+                    device=decoder_logits.device,
+                    dtype=decoder_logits.dtype,
+                )
+                token_map_loss = decoder_logits.new_zeros(gt.shape)
+                token_map_loss[loss_mask] = F.cross_entropy(
+                    map_logits[loss_mask].to(torch.float32),
+                    gt[loss_mask],
+                    reduction="none",
+                ).to(dtype=decoder_logits.dtype)
+                map_commit_loss = self._masked_branch_loss(
+                    token_map_loss,
+                    loss_mask,
+                    packed["chunk_ids"],
+                    self.elf_tail_loss_weight,
+                )
+            loss = (
+                self.elf_loss_weight * flow_loss
+                + self.elf_decoder_loss_weight * decoder_loss
+                + float(getattr(self, "elf_map_commit_loss_weight", 0.0)) * map_commit_loss
+            )
             acc = (decoder_logits[loss_mask].argmax(-1) == gt[loss_mask]).float().mean()
         else:
             flow_loss = velocity.sum() * 0.0
             decoder_loss = decoder_logits.sum() * 0.0
-            loss = flow_loss + decoder_loss
+            map_commit_loss = decoder_logits.sum() * 0.0
+            loss = flow_loss + decoder_loss + map_commit_loss
             acc = velocity.new_zeros(())
 
         if self.training:
@@ -753,6 +960,15 @@ class SMARTEmbeddedLanguageFlow(pl.LightningModule):
                 on_epoch=True,
                 batch_size=1,
             )
+            if float(getattr(self, "elf_map_commit_loss_weight", 0.0)) > 0.0:
+                self.log(
+                    "train_elf_map_commit_loss",
+                    map_commit_loss,
+                    prog_bar=False,
+                    on_step=True,
+                    on_epoch=True,
+                    batch_size=1,
+                )
             if decoder_active is not None:
                 self.log(
                     "train_elf_decoder_branch_frac",
@@ -930,25 +1146,48 @@ class SMARTEmbeddedLanguageFlow(pl.LightningModule):
                 packed,
                 summary,
             )
-            if self.elf_sampling_strategy == "argmax":
-                sampled_ids = self._elf_proxy_token_ids(
+            use_combined_scores = (
+                float(getattr(self, "elf_map_commit_score_weight", 0.0)) > 0.0
+                or float(getattr(self, "elf_geometry_energy_weight", 0.0)) > 0.0
+            )
+            if use_combined_scores:
+                selection_logits = self._combined_elf_token_logits(
                     elf_embeddings,
-                    packed["agent_type_ids"],
+                    packed,
                     valid_mask,
-                )[editable_mask]
+                )
+                probabilities = F.softmax(
+                    selection_logits / self.remask_confidence_temperature,
+                    dim=-1,
+                )
+                editable_probabilities = probabilities[editable_mask].clamp_min(1e-10)
+                if self.elf_sampling_strategy == "argmax":
+                    sampled_ids = selection_logits[editable_mask].argmax(dim=-1)
+                else:
+                    sampled_ids = torch.multinomial(
+                        editable_probabilities,
+                        1,
+                    ).squeeze(-1)
             else:
+                if self.elf_sampling_strategy == "argmax":
+                    sampled_ids = self._elf_proxy_token_ids(
+                        elf_embeddings,
+                        packed["agent_type_ids"],
+                        valid_mask,
+                    )[editable_mask]
+                else:
+                    probabilities = F.softmax(
+                        decoder_logits / self.remask_confidence_temperature,
+                        dim=-1,
+                    )
+                    sampled_ids = torch.multinomial(
+                        probabilities[editable_mask].clamp_min(1e-10),
+                        1,
+                    ).squeeze(-1)
                 probabilities = F.softmax(
                     decoder_logits / self.remask_confidence_temperature,
                     dim=-1,
                 )
-                sampled_ids = torch.multinomial(
-                    probabilities[editable_mask].clamp_min(1e-10),
-                    1,
-                ).squeeze(-1)
-            probabilities = F.softmax(
-                decoder_logits / self.remask_confidence_temperature,
-                dim=-1,
-            )
             editable_probabilities = probabilities[editable_mask].clamp_min(1e-10)
             sampled_confidence = editable_probabilities.gather(
                 -1,

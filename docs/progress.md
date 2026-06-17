@@ -589,3 +589,24 @@
 - Files: `smart/modules/diffusion_decoder.py`, AR rerank train/validation configs, `tests/test_smart_causal_diffusion.py`, `tests/test_smart_ar_diffusion.py`, and durable docs.
 - Validation: Focused decoder/config tests passed; `tests.test_smart_ar_diffusion` passed 28 tests; `tests.test_smart_causal_diffusion` passed 43 tests.
 - Next: Retrain AR rerank checkpoints; older rerank runs should be treated as stale for attention-causality comparisons.
+
+## 2026-06-17 CST
+- Task: Added a map-conditioned commit scorer to standalone receding `smart_elf`.
+- Result: ELF sampling can now combine final embedding-token similarity with a map-conditioned token score from the SMART history-context feature and optional top-k map-geometry energy. Training adds a commit-scorer CE loss controlled by `elf_map_commit_loss_weight`; ELF configs enable the scorer and geometry energy while preserving the standalone ELF path.
+- Files: `smart/model/smart_elf.py`, ELF train/validation configs, `tests/test_smart_elf.py`, `docs/spec.md`, `docs/next.md`, `docs/decisions.md`
+- Validation: `tests.test_smart_elf`, `tests.test_compare_motion_models`, and `tests.test_agent_decoder_history_context` passed together; `py_compile` and `git diff --check` passed; a real validation-sample CPU smoke with the old receding checkpoint produced finite `pred_traj=(73, 80, 2)` and `next_token_idx=(73, 16)`.
+- Next: Retrain ELF with the map-conditioned scorer before judging map compliance; old receding ELF checkpoints only validate code loading, not quality.
+
+## 2026-06-18 CST
+- Task: Hardened diffusion proposal conditioning and future-token geometry refresh.
+- Result: `DiffusionDecoder` now treats non-finite proposal or geometry confidence as zero/finite bounded confidence before embedding. `_refresh_token_geometry()` now advances each agent's future pose only through a contiguous chain of known or proposal-backed chunks, so a later visible token after a masked/proposal-missing gap no longer becomes a reliable geometry source from a stale pose.
+- Files: `smart/modules/diffusion_decoder.py`, `smart/model/smart_diffusion.py`, `tests/test_smart_causal_diffusion.py`, `tests/test_smart_diffusion_smart_parity.py`, `docs/spec.md`, `docs/next.md`, `docs/decisions.md`
+- Validation: `python -m unittest tests.test_smart_causal_diffusion tests.test_smart_ar_diffusion tests.test_smart_diffusion_smart_parity -v` passed 92 tests with 1 expected Waymo-dependency skip.
+- Next: Retrain AR rerank or rerun checkpoint diagnostics before judging proposal-carry map adherence, because geometry-source confidence now differs after masked chunk gaps.
+
+## 2026-06-18 CST
+- Task: Removed two additional AR rerank state-consistency hazards from the code review follow-up.
+- Result: AR inference no longer mutates the caller's `data['agent']` with `commit_speed_reference`; guidance speed context is kept in packed sampling state instead. Physical retokenization now keeps the previous heading for stationary decoded tokens, matching the non-physical path's norm guard and avoiding cumulative heading drift from zero-displacement tokens.
+- Files: `smart/model/smart_ar_diffusion.py`, `tests/test_smart_ar_diffusion.py`, `docs/next.md`, `docs/decisions.md`, `docs/progress.md`
+- Validation: `python -m unittest tests.test_smart_ar_diffusion tests.test_smart_causal_diffusion tests.test_smart_diffusion_smart_parity -v` passed 94 tests with 1 expected Waymo-dependency skip; `python -m py_compile smart/model/smart_ar_diffusion.py tests/test_smart_ar_diffusion.py` passed.
+- Next: Treat older AR rerank diagnostics as stale for side-effect and stationary-heading checks; retrain before final map-adherence comparison.

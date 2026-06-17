@@ -296,6 +296,92 @@ class SMARTAutoregressiveDiffusionTest(unittest.TestCase):
         ))
         self.assertTrue(torch.equal(out['next_token_idx'][0], torch.tensor([0, 10])))
 
+    def test_inference_does_not_mutate_input_with_commit_speed_reference(self):
+        model = _ar_shell()
+        model.ar_commit_tokens = 1
+        model.ar_total_rollout_steps = 5
+        model.ar_carry_tail_proposal = False
+        data = _toy_sequence(num_agents=1, num_tokens=18, num_frames=91)
+
+        model._prepare_batch = MethodType(lambda self, batch: batch, model)
+
+        def fake_build_inputs(self, _rollout_view):
+            packed = {
+                'agent_maps': [(0, 0, torch.tensor([0]))],
+                'valid_mask': torch.ones(1, 4, dtype=torch.bool),
+                'token_positions': torch.zeros(1, 4, 2),
+                'token_headings': torch.zeros(1, 4),
+                'token_agent_ids': torch.zeros(1, 4, dtype=torch.long),
+                'chunk_ids': torch.arange(4).unsqueeze(0),
+                'agent_context': torch.zeros(1, 4, 1),
+                'agent_type_ids': torch.zeros(1, 4, dtype=torch.long),
+                'agent_shape_embeddings': torch.zeros(1, 4, 1),
+            }
+            summary = torch.zeros(1, 1)
+            ft = torch.zeros(1, 4, dtype=torch.long)
+            fv = torch.ones(1, 4, dtype=torch.bool)
+            generation = torch.tensor([True])
+            return packed, summary, ft, fv, generation, generation, torch.zeros(1, dtype=torch.long)
+
+        def fake_sample(self, **_kwargs):
+            return torch.tensor([[0, 1, 2, 3]]), torch.ones(1, 4)
+
+        def fake_token_world(self, token_ids, _agent_types, positions, headings):
+            step = torch.arange(1, 6, dtype=positions.dtype, device=positions.device).view(1, 5, 1)
+            world = positions[:, None, :] + torch.cat([step, torch.zeros_like(step)], dim=-1)
+            return world, headings[:, None].expand(-1, 5)
+
+        model._build_diffusion_inputs = MethodType(fake_build_inputs, model)
+        model._diffusion_sample = MethodType(fake_sample, model)
+        model._token_chunk_world = MethodType(fake_token_world, model)
+
+        model.inference(data)
+
+        self.assertNotIn("commit_speed_reference", data["agent"])
+
+    def test_retokenize_physical_decode_keeps_heading_for_stationary_token(self):
+        model = _ar_shell()
+        model.ar_prediction_tokens = 2
+        model.ar_token_steps = 5
+        model.retokenization_error_thresholds = (100.0, 100.0, 100.0)
+
+        def corners(center, heading):
+            forward = torch.tensor([heading.cos(), heading.sin()])
+            lateral = torch.tensor([-heading.sin(), heading.cos()])
+            return torch.stack([
+                center + forward,
+                center + lateral,
+                center - forward,
+                center - lateral,
+            ])
+
+        token_all = torch.zeros(3, 6, 4, 2)
+        endpoint = torch.zeros(3, 4, 2)
+        for step in range(6):
+            token_all[0, step] = corners(torch.zeros(2), torch.tensor(torch.pi / 2))
+            token_all[1, step] = corners(torch.tensor([float(step), 0.0]), torch.tensor(0.0))
+            token_all[2, step] = corners(torch.tensor([0.0, -float(step)]), -torch.tensor(torch.pi / 2))
+        endpoint[0] = corners(torch.zeros(2), torch.tensor(torch.pi / 2))
+        endpoint[1] = corners(torch.tensor([5.0, 0.0]), torch.tensor(0.0))
+        endpoint[2] = corners(torch.tensor([0.0, -5.0]), -torch.tensor(torch.pi / 2))
+        model._token_vocab_cache = {'veh': token_all, 'ped': token_all, 'cyc': token_all}
+        model._token_endpoint_vocab_cache = {'veh': endpoint, 'ped': endpoint, 'cyc': endpoint}
+        model._token_center_vocab_cache = None
+
+        future_positions = torch.zeros(1, 2, 5, 2)
+        future_positions[0, 1, :, 0] = torch.arange(1, 6, dtype=torch.float)
+
+        token_ids, _errors, valid, _local_endpoints = model._retokenize_future(
+            future_positions=future_positions,
+            future_valid=torch.ones(1, 2, 5, dtype=torch.bool),
+            start_positions=torch.zeros(1, 2),
+            start_headings=torch.zeros(1),
+            agent_types=torch.tensor([0]),
+        )
+
+        self.assertTrue(valid.all())
+        self.assertTrue(torch.equal(token_ids, torch.tensor([[0, 1]])))
+
     def test_safe_speed_rerank_replaces_commit_token_only(self):
         model = _ar_shell()
         model.ar_commit_tokens = 1

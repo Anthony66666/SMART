@@ -315,9 +315,30 @@
 - Why: This keeps same-time interaction modeling while preserving the sim-agent causality requirement that earlier committed-token decisions cannot see later token content.
 - Impact: ELF loss still supervises tail chunks, but chunk-0 predictions can no longer use future chunk embeddings through attention. Retrain receding ELF checkpoints after this mask change.
 
+## Decision: Ground SMART ELF commit selection with map-conditioned scoring
+- Date: 2026-06-17
+- Context: Receding ELF re-encoded map/history every committed token, but tail rollouts still drifted off map because final token ids were chosen from ELF embedding projection without an explicit map-conditioned commit score.
+- Decision: Keep ELF as the primary latent proposal, but score commit candidates with a product-style combination of final ELF embedding-token similarity, a map-conditioned token scorer from the SMART history-context feature, and optional top-k map-geometry energy. Do not replace ELF with the original SMART `token_predict_head`.
+- Why: This injects map attention directly into token selection while preserving a clean difference from original SMART for paper ablations.
+- Impact: Existing receding ELF checkpoints are stale for quality comparisons because the new `elf_map_score_proj` and commit-scorer loss need training.
+
 ## Decision: Add AR MaskGIT rerank without frontier training
 - Date: 2026-06-16
 - Context: Hybrid diffusion kept causal-frontier semantics, so it did not isolate the original AR diffusion advantage for straight-vehicle speed.
 - Decision: Keep `smart_ar_diffusion` on `ar_objective: maskgit` for the rerank variant, with 4-token prediction, 1-token commit, and carried tail proposals. Add sampling-time top-k reranking only for committed slots using lane, dynamics, collision, and bidirectional commit-speed energy. Add SMART-style map-token noise and history-context dropout as training perturbations, while validation keeps these perturbations disabled.
 - Why: This tests the user's requested AR-first hypothesis directly: use AR rollout semantics, avoid frontier loss, and borrow only the sampling rerank plus original SMART conditioning perturbations.
 - Impact: Use `configs/train/train_scalable_ar_diffusion_rerank_1000.yaml` for the matched short run and `configs/validation/validation_scalable_ar_diffusion_rerank.yaml` for deterministic evaluation.
+
+## Decision: Trust only contiguous future-token geometry chains
+- Date: 2026-06-18
+- Context: Diffusion geometry refresh could skip an unknown chunk and still decode a later known/proposal token from the last stale pose, marking that later token as a confident geometry source for graph attention.
+- Decision: Keep fallback query poses available for target nodes, but only assign geometry confidence and advance an agent's future pose through a contiguous chain of known or proposal-backed chunks. Sanitize proposal and geometry confidence before embedding so NaN/inf confidence cannot poison decoder activations.
+- Why: A masked chunk with no proposal means the next chunk's absolute pose is not recoverable from token-relative geometry. Treating later tokens as reliable sources creates misleading spatial/map edges, especially under high mask rates or carried proposals.
+- Impact: Older AR rerank/diffusion checkpoints remain loadable, but graph geometry confidence during training and sampling is now stricter after chunk gaps. Retrain or rerun diagnostics before comparing late-horizon map adherence against older outputs.
+
+## Decision: Keep AR rollout inputs pure and stationary headings stable
+- Date: 2026-06-18
+- Context: AR inference wrote `commit_speed_reference` into the caller's input batch, and physical retokenization updated heading directly from token box orientation even when the decoded token had near-zero final movement.
+- Decision: Keep speed-reference state local to the sampling/packed guidance path rather than mutating `data`. During physical retokenization, advance heading only when the decoded token has a non-zero final displacement, mirroring the non-physical path's norm guard.
+- Why: Validation/inference callers should be able to reuse input batches without hidden new keys. Retokenization should not accumulate arbitrary heading changes from stationary token boxes.
+- Impact: AR rerank checkpoints remain loadable, but future retokenized training views can differ for zero-displacement tokens. Retrain before judging late-horizon map adherence against older runs.

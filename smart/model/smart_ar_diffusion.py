@@ -875,11 +875,20 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
                         current_positions[agent_idx].view(1, 2),
                         current_headings[agent_idx].view(1),
                     )
-                    current_positions[agent_idx] = world[0, valid_indices[-1]]
-                    current_headings[agent_idx] = world_heading[
-                        0,
-                        valid_indices[-1],
-                    ]
+                    next_position = world[0, valid_indices[-1]]
+                    if valid_indices.numel() >= 2:
+                        last_delta = (
+                            world[0, valid_indices[-1]]
+                            - world[0, valid_indices[-2]]
+                        )
+                    else:
+                        last_delta = next_position - current_positions[agent_idx]
+                    current_positions[agent_idx] = next_position
+                    if torch.norm(last_delta) > 1e-6:
+                        current_headings[agent_idx] = world_heading[
+                            0,
+                            valid_indices[-1],
+                        ]
                 else:
                     selected = vocab[best_token]
                     endpoint_local = selected[valid_indices[-1]]
@@ -1916,7 +1925,6 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
         for round_idx in range(rounds):
             round_start = time.perf_counter()
             self._debug_log(f"ar_inference_round_start round={round_idx + 1}/{rounds}")
-            data['agent']['commit_speed_reference'] = reference_speed
             rollout_view = self._build_ar_rollout_view(
                 data,
                 history_token_ids,

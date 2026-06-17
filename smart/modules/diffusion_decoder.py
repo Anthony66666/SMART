@@ -342,15 +342,27 @@ class DiffusionDecoder(nn.Module):
             x = x + self.type_embedding(agent_type_ids.clamp(min=0, max=self.type_embedding.num_embeddings - 1))
 
         if proposal_token_embeddings is not None and proposal_confidence is not None:
+            proposal_weight = torch.nan_to_num(
+                proposal_confidence.to(dtype=x.dtype),
+                nan=0.0,
+                posinf=1.0,
+                neginf=0.0,
+            ).clamp(0.0, 1.0)
             x = x + (
                 proposal_token_embeddings.to(dtype=x.dtype)
-                * proposal_confidence.to(dtype=x.dtype).clamp(0.0, 1.0).unsqueeze(-1)
+                * proposal_weight.unsqueeze(-1)
             )
 
         if geometry_confidence is None:
             geometry_confidence = valid_mask.new_zeros(valid_mask.shape, dtype=x.dtype)
+        geometry_confidence = torch.nan_to_num(
+            geometry_confidence.to(dtype=x.dtype),
+            nan=0.0,
+            posinf=1.0,
+            neginf=0.0,
+        ).clamp(0.0, 1.0)
         x = x + self.geometry_confidence_projection(
-            geometry_confidence.to(dtype=x.dtype).clamp(0.0, 1.0).unsqueeze(-1)
+            geometry_confidence.unsqueeze(-1)
         )
 
         x = x * valid_mask.unsqueeze(-1).to(x.dtype)

@@ -70,6 +70,12 @@ Model:
     elf_tail_loss_weight: 0.25
     elf_decoder_loss_weight: 0.1
     elf_decoder_prob: 0.25
+    elf_map_commit_score_weight: 2.0
+    elf_map_commit_loss_weight: 0.5
+    elf_geometry_energy_weight: 0.05
+    elf_geometry_topk: 32
+    elf_map_score_temperature: 0.2
+    elf_map_score_normalize: true
     elf_integration_steps: 4
     elf_sampling_strategy: argmax
     elf_noise_scale: 1.0

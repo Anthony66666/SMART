@@ -28,7 +28,7 @@ Trainer:
   strategy: auto
   accelerator: "gpu"
   devices: 1
-  max_epochs: 3
+  max_epochs: 12
   max_steps: -1
   val_check_interval: 1.0
   checkpoint_every_n_train_steps:
@@ -39,7 +39,7 @@ Trainer:
   ckpt_path:
   precision: 32
   accumulate_grad_batches: 1
-  limit_val_batches: 8
+  limit_val_batches: 50
   check_val_every_n_epoch: 1
   monitor_metric: "val_minADE"
   monitor_mode: "min"
@@ -52,8 +52,8 @@ Visualization:
   max_agents: 0
   step_viz:
     enabled: true
-    interval_steps: 1000
-    sample_indices: [0, 1, 2, 3]
+    interval_steps: 2000
+    sample_indices: [110, 111, 112, 113]
     output_dir: "./outputs/step_elf_3epoch"
 
 Model:
@@ -71,7 +71,7 @@ Model:
   num_freq_bands: 64
   lr: 0.0005
   warmup_steps: 1
-  total_steps: 3
+  total_steps: 12
   inference_token: True
   rollout_num: 1
   decoder:
@@ -94,6 +94,12 @@ Model:
     elf_tail_loss_weight: 0.25
     elf_decoder_loss_weight: 0.1
     elf_decoder_prob: 0.25
+    elf_map_commit_score_weight: 2.0
+    elf_map_commit_loss_weight: 0.5
+    elf_geometry_energy_weight: 0.05
+    elf_geometry_topk: 32
+    elf_map_score_temperature: 0.2
+    elf_map_score_normalize: true
     elf_integration_steps: 4
     elf_sampling_strategy: argmax
     elf_noise_scale: 1.0

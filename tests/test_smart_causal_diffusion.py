@@ -125,6 +125,51 @@ class CausalDiffusionDecoderTest(unittest.TestCase):
 
         self.assertFalse(torch.allclose(without_proposal, with_proposal))
 
+    def test_nan_proposal_confidence_is_treated_as_zero_confidence(self):
+        torch.manual_seed(0)
+        decoder = CausalDiffusionDecoder(
+            hidden_dim=16,
+            token_size=32,
+            num_future_chunks=4,
+            num_heads=2,
+            head_dim=8,
+            dropout=0.0,
+            num_freq_bands=4,
+            a2a_radius=20.0,
+            pl2a_radius=20.0,
+            time_span=None,
+            future_chunk_steps=5,
+            num_layers=1,
+            num_token_types=4,
+        )
+        common = {
+            'noisy_token_ids': torch.tensor([[32]]),
+            'token_positions': torch.zeros(1, 1, 2),
+            'token_headings': torch.zeros(1, 1),
+            'token_agent_ids': torch.zeros(1, 1, dtype=torch.long),
+            'noisy_token_chunk_ids': torch.zeros(1, 1, dtype=torch.long),
+            'scene_summary': torch.zeros(1, 16),
+            't': torch.ones(1),
+            'valid_mask': torch.ones(1, 1, dtype=torch.bool),
+            'agent_context': torch.zeros(1, 1, 16),
+            'agent_type_ids': torch.zeros(1, 1, dtype=torch.long),
+            'agent_shape_embeddings': torch.zeros(1, 1, 16),
+            'physical_token_embeddings': torch.zeros(1, 1, 16),
+            'proposal_token_embeddings': torch.ones(1, 1, 16),
+        }
+
+        zero_confidence = decoder(
+            **common,
+            proposal_confidence=torch.zeros(1, 1),
+        )
+        nan_confidence = decoder(
+            **common,
+            proposal_confidence=torch.tensor([[float('nan')]]),
+        )
+
+        self.assertTrue(torch.isfinite(nan_confidence).all())
+        self.assertTrue(torch.allclose(nan_confidence, zero_confidence))
+
 
 class CausalFrontierPlannerTest(unittest.TestCase):
     def test_reveal_schedule_releases_one_chunk_per_sampling_step(self):

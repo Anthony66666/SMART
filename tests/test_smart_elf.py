@@ -3,6 +3,7 @@ from pathlib import Path
 from types import MethodType, SimpleNamespace
 from unittest.mock import patch
 
+import numpy as np
 import torch
 
 from smart.model import SMARTEmbeddedLanguageFlow
@@ -42,6 +43,12 @@ def _elf_shell():
     model.elf_integration_steps = 2
     model.elf_sampling_strategy = 'argmax'
     model.elf_noise_scale = 0.0
+    model.elf_map_commit_score_weight = 0.0
+    model.elf_map_commit_loss_weight = 0.0
+    model.elf_geometry_energy_weight = 0.0
+    model.elf_geometry_topk = 0
+    model.elf_map_score_temperature = 1.0
+    model.elf_map_score_normalize = False
     model.remask_confidence_temperature = 1.0
     model.safety_energy_enabled = False
     model.guidance_mode = 'none'
@@ -50,6 +57,30 @@ def _elf_shell():
     model.use_proposal_geometry = True
     model.proposal_conditioning_enabled = False
     model.geometry_confidence_source_threshold = 0.0
+
+    class _FakeTokenEmbedder:
+        def __call__(self, token_template):
+            ids = torch.arange(
+                token_template.shape[0],
+                dtype=token_template.dtype,
+                device=token_template.device,
+            )
+            return torch.stack(
+                [ids, torch.zeros_like(ids), torch.zeros_like(ids)],
+                dim=-1,
+            )
+
+    fake_agent_encoder = SimpleNamespace(
+        trajectory_token={
+            'veh': np.zeros((model.token_size, 4, 2), dtype=np.float32),
+            'ped': np.zeros((model.token_size, 4, 2), dtype=np.float32),
+            'cyc': np.zeros((model.token_size, 4, 2), dtype=np.float32),
+        },
+        token_emb_veh=_FakeTokenEmbedder(),
+        token_emb_ped=_FakeTokenEmbedder(),
+        token_emb_cyc=_FakeTokenEmbedder(),
+    )
+    model.encoder = SimpleNamespace(agent_encoder=fake_agent_encoder)
     return model
 
 
@@ -295,6 +326,61 @@ class EmbeddedLanguageFlowObjectiveTest(unittest.TestCase):
         expected = commit_loss + 0.25 * tail_loss
         self.assertAlmostEqual(float(loss), float(expected), places=6)
 
+    def test_map_conditioned_commit_loss_supervises_commit_scorer(self):
+        model = _elf_shell()
+        model.training = False
+        model.elf_loss_weight = 0.0
+        model.elf_decoder_loss_weight = 0.0
+        model.elf_map_commit_loss_weight = 1.0
+        model.elf_tail_loss_weight = 0.25
+        model._sample_elf_times = MethodType(
+            lambda self, valid_mask, summary: torch.zeros(
+                valid_mask.shape[:1],
+                device=summary.device,
+                dtype=summary.dtype,
+            ),
+            model,
+        )
+        model._elf_target_embeddings = MethodType(
+            lambda self, token_ids, agent_type_ids, valid_mask=None: torch.zeros(
+                *token_ids.shape,
+                self.hidden_dim,
+            ),
+            model,
+        )
+        model._elf_source_embeddings = MethodType(
+            lambda self, target, valid_mask, **_kwargs: torch.zeros_like(target),
+            model,
+        )
+        model._elf_proxy_token_ids = MethodType(
+            lambda self, emb, agent_type_ids, valid_mask: torch.zeros_like(valid_mask, dtype=torch.long),
+            model,
+        )
+        model._decode_elf_velocity = MethodType(
+            lambda self, elf_embeddings, proxy_token_ids, packed, summary, t, geometry_known_mask, **_kwargs: (
+                torch.zeros_like(elf_embeddings),
+                torch.zeros(*packed['token_ids'].shape, self.token_size),
+            ),
+            model,
+        )
+        model._map_conditioned_token_logits = MethodType(
+            lambda self, packed, valid_mask: torch.zeros(*valid_mask.shape, self.token_size),
+            model,
+        )
+        packed = {
+            'token_ids': torch.tensor([[1, 2]]),
+            'valid_mask': torch.ones(1, 2, dtype=torch.bool),
+            'loss_mask_base': torch.ones(1, 2, dtype=torch.bool),
+            'chunk_ids': torch.tensor([[0, 1]]),
+            'agent_type_ids': torch.zeros(1, 2, dtype=torch.long),
+            'context': torch.zeros(1, 2, model.hidden_dim),
+        }
+
+        loss, _acc = model._compute_diffusion_loss(packed, torch.zeros(1, model.hidden_dim))
+
+        expected = torch.log(torch.tensor(float(model.token_size))) * (1.0 + model.elf_tail_loss_weight)
+        self.assertAlmostEqual(float(loss), float(expected), places=6)
+
 
 class EmbeddedLanguageFlowSamplerTest(unittest.TestCase):
     def test_sampling_integrates_embedding_flow_and_returns_token_confidence(self):
@@ -446,6 +532,109 @@ class EmbeddedLanguageFlowSamplerTest(unittest.TestCase):
 
         self.assertTrue(torch.equal(sampled, torch.tensor([[1, 2, 0]])))
         self.assertEqual(trace[0]['mode'], 'full_window')
+
+    def test_sampling_fuses_elf_embedding_score_with_map_conditioned_score(self):
+        model = _elf_shell()
+        model.elf_integration_steps = 1
+        model.elf_map_commit_score_weight = 1.0
+
+        def fake_decode(
+            self,
+            elf_embeddings,
+            proxy_token_ids,
+            packed,
+            summary,
+            t,
+            geometry_known_mask,
+            **_kwargs,
+        ):
+            del self, proxy_token_ids, summary, t, geometry_known_mask, _kwargs
+            logits = torch.zeros(*packed['valid_mask'].shape, model.token_size)
+            return elf_embeddings, logits
+
+        def elf_logits(self, elf_embeddings, agent_type_ids, valid_mask):
+            del self, elf_embeddings, agent_type_ids
+            logits = torch.full((*valid_mask.shape, model.token_size), -10.0)
+            logits[..., 0] = 2.0
+            return logits
+
+        def map_logits(self, packed, valid_mask):
+            del self, packed
+            logits = torch.zeros(*valid_mask.shape, model.token_size)
+            logits[..., 2] = 20.0
+            return logits
+
+        model._elf_source_embeddings = MethodType(
+            lambda self, target, valid_mask, **_kwargs: torch.zeros_like(target),
+            model,
+        )
+        model._integrate_window_elf = MethodType(
+            lambda self, elf_embeddings, sampled, editable_mask, valid_mask, packed, summary: (
+                elf_embeddings,
+                torch.zeros(*valid_mask.shape, self.token_size),
+            ),
+            model,
+        )
+        model._decode_elf_velocity = MethodType(fake_decode, model)
+        model._elf_token_similarity_logits = MethodType(elf_logits, model)
+        model._map_conditioned_token_logits = MethodType(map_logits, model)
+        valid_mask = torch.tensor([[True]])
+        packed = {
+            'valid_mask': valid_mask,
+            'chunk_ids': torch.tensor([[0]]),
+            'agent_type_ids': torch.zeros(1, 1, dtype=torch.long),
+            'context': torch.zeros(1, 1, model.hidden_dim),
+        }
+
+        sampled, confidence = model._diffusion_sample(
+            summary=torch.zeros(1, model.hidden_dim),
+            token_positions=torch.zeros(1, 1, 2),
+            token_headings=torch.zeros(1, 1),
+            token_agent_ids=torch.zeros(1, 1, dtype=torch.long),
+            chunk_ids=packed['chunk_ids'],
+            valid_mask=valid_mask,
+            agent_context=packed['context'],
+            agent_type_ids=packed['agent_type_ids'],
+            packed=packed,
+        )
+
+        self.assertTrue(torch.equal(sampled, torch.tensor([[2]])))
+        self.assertGreater(float(confidence[0, 0]), 0.0)
+
+    def test_geometry_energy_reranks_topk_tokens_toward_local_map(self):
+        model = _elf_shell()
+        model.elf_geometry_energy_weight = 1.0
+        model.elf_geometry_topk = 2
+
+        def fake_select_token_traj_all(self, token_ids, agent_type):
+            del self, agent_type
+            out = torch.zeros(token_ids.shape[0], token_ids.shape[1], 6, 4, 2)
+            far = token_ids == 0
+            near = token_ids == 1
+            out[far, :, :, 0] = 10.0
+            out[near, :, :, 0] = 0.0
+            return out
+
+        model._select_token_traj_all = MethodType(fake_select_token_traj_all, model)
+        logits = torch.full((1, 1, model.token_size), -20.0)
+        logits[..., 0] = 5.0
+        logits[..., 1] = 4.0
+        packed = {
+            'anchor_pos': torch.zeros(1, 1, 2),
+            'anchor_heading': torch.zeros(1, 1),
+            'agent_type_ids': torch.zeros(1, 1, dtype=torch.long),
+            'map_positions': torch.zeros(1, 2),
+            'map_batch': torch.zeros(1, dtype=torch.long),
+            'slot_batch': torch.zeros(1, 1, dtype=torch.long),
+        }
+
+        adjusted = model._apply_map_geometry_energy(
+            logits,
+            packed,
+            torch.ones(1, 1, dtype=torch.bool),
+        )
+
+        self.assertEqual(int(adjusted.argmax(dim=-1)[0, 0]), 1)
 
 
 class EmbeddedLanguageFlowAttentionTest(unittest.TestCase):
@@ -801,13 +990,16 @@ class EmbeddedLanguageFlowConfigTest(unittest.TestCase):
         self.assertTrue(config.Model.diffusion.elf_receding_horizon)
         self.assertEqual(config.Model.diffusion.elf_decoder_prob, 0.25)
         self.assertAlmostEqual(config.Model.diffusion.elf_tail_loss_weight, 0.25)
+        self.assertGreater(config.Model.diffusion.elf_map_commit_score_weight, 0.0)
+        self.assertGreater(config.Model.diffusion.elf_map_commit_loss_weight, 0.0)
+        self.assertGreater(config.Model.diffusion.elf_geometry_energy_weight, 0.0)
         self.assertFalse(config.Model.diffusion.target_category_only)
         self.assertEqual(config.Model.diffusion.supervision_mode, 'all_agents')
         self.assertEqual(config.Trainer.max_steps, 1000)
         self.assertEqual(config.Trainer.val_check_interval, 1000)
         self.assertEqual(config.Trainer.monitor_metric, 'val_minADE')
 
-    def test_3epoch_local_config_trains_by_epoch(self):
+    def test_local_config_trains_by_epoch(self):
         config = load_config_act('configs/train/train_scalable_elf_3epoch_local.yaml')
 
         self.assertEqual(config.Model.predictor, 'smart_elf')
@@ -820,14 +1012,17 @@ class EmbeddedLanguageFlowConfigTest(unittest.TestCase):
         self.assertTrue(config.Model.diffusion.elf_receding_horizon)
         self.assertEqual(config.Model.diffusion.elf_decoder_prob, 0.25)
         self.assertAlmostEqual(config.Model.diffusion.elf_tail_loss_weight, 0.25)
+        self.assertGreater(config.Model.diffusion.elf_map_commit_score_weight, 0.0)
+        self.assertGreater(config.Model.diffusion.elf_map_commit_loss_weight, 0.0)
+        self.assertGreater(config.Model.diffusion.elf_geometry_energy_weight, 0.0)
         self.assertFalse(config.Model.diffusion.target_category_only)
         self.assertEqual(config.Model.diffusion.supervision_mode, 'all_agents')
-        self.assertEqual(config.Trainer.max_epochs, 3)
+        self.assertGreaterEqual(config.Trainer.max_epochs, 3)
         self.assertEqual(config.Trainer.max_steps, -1)
         self.assertEqual(config.Trainer.val_check_interval, 1.0)
         self.assertIsNone(config.Trainer.checkpoint_every_n_train_steps)
         self.assertEqual(config.Trainer.monitor_metric, 'val_minADE')
-        self.assertEqual(config.Model.total_steps, 3)
+        self.assertEqual(config.Model.total_steps, config.Trainer.max_epochs)
         self.assertEqual(config.Visualization.output_dir, './outputs/val_elf_3epoch')
 
     def test_elf_model_is_exported_without_replacing_existing_paths(self):

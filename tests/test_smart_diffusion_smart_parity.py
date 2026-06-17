@@ -324,6 +324,34 @@ class SMARTDiffusionSMARTParityTest(unittest.TestCase):
 
         self.assertTrue(torch.equal(conf, torch.tensor([[0.25, 0.75]])))
 
+    def test_refresh_geometry_does_not_advance_after_unknown_chunk_gap(self):
+        model = _diffusion_shell()
+        model.num_future_chunks = 3
+        token_all = torch.zeros(1, 6, 4, 2)
+        endpoint = torch.zeros(1, 4, 2)
+        endpoint[0, :, 0] = 10.0
+        model._token_vocab_cache = {'veh': token_all, 'ped': token_all, 'cyc': token_all}
+        model._token_endpoint_vocab_cache = {'veh': endpoint, 'ped': endpoint, 'cyc': endpoint}
+        packed = {
+            'token_positions': torch.zeros(1, 3, 2),
+            'token_headings': torch.zeros(1, 3),
+            'valid_mask': torch.tensor([[True, True, True]]),
+            'agent_maps': [(0, 0, torch.tensor([0]))],
+            'agent_start_positions': torch.zeros(1, 2),
+            'agent_start_headings': torch.zeros(1),
+            'agent_types_global': torch.tensor([0]),
+        }
+
+        positions, _headings, conf = model._refresh_token_geometry(
+            torch.tensor([[0, model.mask_token_id, 0]]),
+            packed,
+            geometry_known_mask=torch.tensor([[True, False, True]]),
+        )
+
+        self.assertTrue(torch.equal(conf, torch.tensor([[1.0, 0.0, 0.0]])))
+        self.assertAlmostEqual(float(positions[0, 1, 0]), 10.0, places=5)
+        self.assertAlmostEqual(float(positions[0, 2, 0]), 10.0, places=5)
+
     def test_real_token_four_chunk_geometry_and_heading_are_query_relative(self):
         model = _real_token_diffusion_shell()
         start_pos = torch.tensor([3.0, -2.0])

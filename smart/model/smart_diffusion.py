@@ -829,6 +829,11 @@ class SMARTDiffusion(SMART):
             cur_pos = agent_start_positions[agent_indices].clone()
             cur_heading = agent_start_headings[agent_indices].clone()
             cur_types = agent_types[agent_indices]
+            chain_active = torch.ones(
+                num_scene_agents,
+                dtype=torch.bool,
+                device=token_ids.device,
+            )
 
             for chunk_idx in range(C):
                 node_idx = offsets[:, chunk_idx]
@@ -840,6 +845,7 @@ class SMARTDiffusion(SMART):
                 chunk_tokens = token_ids[seq_idx, node_idx]
                 known = (
                     node_has_gt
+                    & chain_active
                     & (chunk_tokens >= 0)
                     & (chunk_tokens < self.token_size)
                     & (chunk_tokens != self.mask_token_id)
@@ -851,9 +857,15 @@ class SMARTDiffusion(SMART):
                 proposal_tokens = None
                 if proposal_token_ids is not None and proposal_confidence is not None:
                     proposal_tokens = proposal_token_ids[seq_idx, node_idx]
-                    proposal_conf = proposal_confidence[seq_idx, node_idx].to(dtype=torch.float)
+                    proposal_conf = torch.nan_to_num(
+                        proposal_confidence[seq_idx, node_idx].to(dtype=torch.float),
+                        nan=0.0,
+                        posinf=1.0,
+                        neginf=0.0,
+                    ).clamp(0.0, 1.0)
                     proposal_known = (
                         node_has_gt
+                        & chain_active
                         & ~known
                         & (proposal_tokens >= 0)
                         & (proposal_tokens < self.token_size)
@@ -867,6 +879,7 @@ class SMARTDiffusion(SMART):
 
                 advance = known | proposal_known
                 if not advance.any():
+                    chain_active = chain_active & advance
                     continue
 
                 advance_tokens = chunk_tokens.clone()
@@ -880,6 +893,7 @@ class SMARTDiffusion(SMART):
                 )
                 cur_pos[advance] = world[:, -1]
                 cur_heading[advance] = chunk_heading[:, -1]
+                chain_active = chain_active & advance
 
         return positions, headings, geometry_confidence
 
