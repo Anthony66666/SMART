@@ -1,6 +1,13 @@
 # Progress
 
 ## 2026-06-17 CST
+- Task: Implemented dense SMART CE and proposal-carry training for AR rerank.
+- Result: `smart_ar_diffusion` MaskGIT training can now combine the sampled diffusion-window loss with dense original-SMART next-token CE over the prepared full scene and an auxiliary next-window proposal-carry diffusion loss. Proposal-carry training builds the post-commit window, corrupts the previous window's tail tokens as noisy proposals, injects them into proposal geometry/embedding conditioning, and supervises the whole next window with a forced mask. Causal loss weighting is now an explicit config gate so old AR baseline configs are not changed accidentally.
+- Files: `smart/model/smart_ar_diffusion.py`, `smart/model/smart_diffusion.py`, AR rerank train/validation configs, `tests/test_smart_ar_diffusion.py`, and durable docs.
+- Validation: Added regressions for explicit causal loss weighting, forced-mask proposal diffusion loss, proposal-carry view construction, terminal-window skipping, and total training-loss composition. `python -m unittest tests.test_smart_ar_diffusion -v` passed 34 tests.
+- Next: Retrain AR rerank from scratch; older rerank checkpoints did not train dense full-sequence CE or proposal-carry conditioning and should be treated as stale for map/speed conclusions.
+
+## 2026-06-17 CST
 - Task: Fixed SMART ELF map/context drift in receding-horizon rollout.
 - Result: `smart_elf` now aligns generation, supervision, metric, and map-attention masks for sim-agent rollout by training active ELF configs on all current-valid non-background agents and passing an explicit generation-agent mask into SMART history-context map attention. Receding ELF training views and inference commits now roll token history and frame history instead of only overwriting the final history anchor.
 - Files: `smart/model/smart_elf.py`, `smart/modules/agent_decoder.py`, `smart/modules/smart_decoder.py`, ELF train/validation configs, and `tests/test_smart_elf.py`.

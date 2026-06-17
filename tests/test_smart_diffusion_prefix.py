@@ -137,6 +137,7 @@ class SMARTDiffusionCausalNoiseScheduleTest(unittest.TestCase):
         model = _diffusion_shell()
         model.training = False
         model.causal_noise_schedule = True
+        model.causal_loss_weighting_enabled = True
         model.causal_chunk_mask_probs = (0.20, 0.45, 0.70, 0.90)
         model.causal_chunk_mask_multipliers = ()
         model.causal_loss_weights = (1.0, 0.8, 0.4, 0.2)

@@ -1,5 +1,12 @@
 # Decisions
 
+## Decision: Train AR rerank with dense SMART CE plus proposal-carry supervision
+- Date: 2026-06-17
+- Context: The AR rerank variant predicted four tokens but committed one; the three tail tokens only acted as inference-time proposals and were not represented as proposal inputs during training. Random single-window MaskGIT training also meant each scene contributed far less dense next-token supervision than original SMART.
+- Decision: Keep `ar_objective: maskgit` and avoid frontier loss, but train AR rerank with three terms: a downweighted diffusion-window loss, dense original-SMART next-token CE over the prepared full scene, and an auxiliary next-window diffusion loss conditioned on corrupted carried tail proposals. Enable causal loss weights through an explicit `causal_loss_weighting_enabled` gate so old AR baseline configs remain unchanged unless they opt in.
+- Why: This preserves the intended AR-first design while making the four-token proposal mechanism visible to the objective and restoring full-sequence SMART CE signal.
+- Impact: Retrain AR rerank checkpoints. Existing rerank checkpoints trained before this change are stale for judging tail proposal usefulness, late map adherence, or straight-vehicle speed.
+
 ## Decision: Align SMART ELF with all-agent sim-agent rollout state
 - Date: 2026-06-17
 - Context: Receding ELF was generating and validating all current-valid non-background agents, but the active configs supervised only `category == 3` and SMART history-context map attention still connected map tokens only to category-3 agents. Its receding commit path also overwrote only the last history anchor, leaving older history tokens/frames stale after each generated step.

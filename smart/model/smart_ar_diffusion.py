@@ -37,6 +37,29 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
         self.ar_causal_temporal_edges = bool(getattr(diffusion_cfg, 'causal_temporal_edges', False))
         self.ar_rolling_anchor_training = bool(getattr(diffusion_cfg, 'rolling_anchor_training', True))
         self.current_state_enabled = bool(getattr(diffusion_cfg, 'current_state_enabled', False))
+        self.dense_smart_ce_loss_weight = max(
+            0.0,
+            float(getattr(diffusion_cfg, 'dense_smart_ce_loss_weight', 0.0)),
+        )
+        self.proposal_carry_training_enabled = bool(
+            getattr(diffusion_cfg, 'proposal_carry_training_enabled', False)
+        )
+        self.proposal_carry_loss_weight = max(
+            0.0,
+            float(getattr(diffusion_cfg, 'proposal_carry_loss_weight', 0.0)),
+        )
+        self.proposal_dropout_prob = min(
+            1.0,
+            max(0.0, float(getattr(diffusion_cfg, 'proposal_dropout_prob', 0.0))),
+        )
+        self.proposal_noise_topk = max(
+            0,
+            int(getattr(diffusion_cfg, 'proposal_noise_topk', 5)),
+        )
+        self.proposal_confidence = min(
+            1.0,
+            max(0.0, float(getattr(diffusion_cfg, 'proposal_confidence', 0.5))),
+        )
         self.ar_frontier_loss_weight = max(
             0.0,
             float(getattr(diffusion_cfg, 'frontier_loss_weight', 1.0)),
@@ -648,10 +671,14 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
             frontier_ids[batch_idx] = available[selected]
         return frontier_ids
 
-    def _compute_diffusion_loss(self, packed, summary):
+    def _compute_diffusion_loss(self, packed, summary, **kwargs):
         if getattr(self, 'ar_objective', 'maskgit') == 'causal_frontier_v1':
+            if kwargs:
+                raise ValueError(
+                    "causal_frontier_v1 does not support forced proposal diffusion loss."
+                )
             return self._compute_frontier_diffusion_loss(packed, summary)
-        return super()._compute_diffusion_loss(packed, summary)
+        return super()._compute_diffusion_loss(packed, summary, **kwargs)
 
     def _compute_frontier_diffusion_loss(self, packed, summary):
         gt = packed['token_ids']
@@ -1221,6 +1248,120 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
             return int(sample.item())
         return min_anchor
 
+    def _select_proposal_carry_anchor(self, data, anchor_token=None):
+        token_count = int(data['agent']['token_idx'].shape[1])
+        frame_count = int(data['agent']['position'].shape[1])
+        min_anchor = self.ar_history_tokens + self.ar_commit_tokens
+        max_anchor = token_count - self.ar_prediction_tokens
+        frame_max_anchor = (
+            frame_count - 1 - self.ar_prediction_tokens * self.ar_token_steps
+        ) // self.ar_token_steps
+        max_anchor = min(max_anchor, frame_max_anchor)
+        if max_anchor < min_anchor:
+            return None
+        if anchor_token is not None:
+            anchor = int(anchor_token)
+            if anchor < min_anchor or anchor > max_anchor:
+                return None
+            return anchor
+        if self.training and max_anchor > min_anchor:
+            sample = torch.randint(
+                low=min_anchor,
+                high=max_anchor + 1,
+                size=(1,),
+                device=data['agent']['token_idx'].device,
+            )
+            return int(sample.item())
+        return min_anchor
+
+    def _corrupt_proposal_tokens(self, token_ids, valid_mask, agent_types):
+        proposal_ids = torch.zeros_like(token_ids)
+        proposal_confidence = token_ids.new_zeros(token_ids.shape, dtype=torch.float)
+        if token_ids.numel() == 0:
+            return proposal_ids, proposal_confidence
+
+        safe_types = agent_types.long().clamp(min=0, max=3)
+        safe_types = safe_types.unsqueeze(-1).expand_as(token_ids)
+        candidate_mask = (
+            valid_mask.bool()
+            & (safe_types < 3)
+            & (token_ids >= 0)
+            & (token_ids < self.token_size)
+        )
+        if not candidate_mask.any():
+            return proposal_ids, proposal_confidence
+
+        topk = int(getattr(self, 'proposal_noise_topk', 5))
+        if topk > 0:
+            neighbor_table = self._token_neighbor_table(topk + 1, token_ids.device)
+            safe_tokens = token_ids.long().clamp(min=0, max=self.token_size - 1)
+            candidates = neighbor_table[safe_types, safe_tokens]
+            if candidates.shape[-1] > 1:
+                candidates = candidates[..., 1:]
+            sample_slot = torch.randint(
+                0,
+                int(candidates.shape[-1]),
+                token_ids.shape,
+                device=token_ids.device,
+            )
+            sampled_tokens = candidates.gather(
+                -1,
+                sample_slot.unsqueeze(-1),
+            ).squeeze(-1)
+        else:
+            sampled_tokens = token_ids
+
+        keep_mask = candidate_mask
+        drop_prob = float(getattr(self, 'proposal_dropout_prob', 0.0))
+        if drop_prob > 0.0:
+            keep_mask = keep_mask & (torch.rand_like(token_ids.float()) >= drop_prob)
+
+        proposal_ids[keep_mask] = sampled_tokens[keep_mask]
+        proposal_confidence[keep_mask] = float(
+            getattr(self, 'proposal_confidence', 0.5)
+        )
+        return proposal_ids, proposal_confidence
+
+    def _build_proposal_carry_training_view(self, data, anchor_token=None):
+        anchor = self._select_proposal_carry_anchor(
+            data,
+            anchor_token=anchor_token,
+        )
+        if anchor is None:
+            return None
+        tail_len = self.ar_prediction_tokens - self.ar_commit_tokens
+        if tail_len <= 0:
+            return None
+        view, _target_tokens, _target_valid, _anchor = self._build_ar_training_view(
+            data,
+            anchor_token=anchor,
+            perturb=False,
+        )
+        source_agent = data['agent']
+        tail_tokens = source_agent['token_idx'][:, anchor:anchor + tail_len].long()
+        tail_valid = source_agent['agent_valid_mask'][:, anchor:anchor + tail_len].bool()
+        corrupted_ids, corrupted_confidence = self._corrupt_proposal_tokens(
+            tail_tokens,
+            tail_valid,
+            source_agent['type'],
+        )
+        num_agents = int(source_agent['token_idx'].shape[0])
+        proposal_ids = torch.zeros(
+            num_agents,
+            self.ar_prediction_tokens,
+            dtype=torch.long,
+            device=tail_tokens.device,
+        )
+        proposal_confidence = torch.zeros(
+            num_agents,
+            self.ar_prediction_tokens,
+            dtype=torch.float,
+            device=tail_tokens.device,
+        )
+        proposal_ids[:, :tail_len] = corrupted_ids
+        proposal_confidence[:, :tail_len] = corrupted_confidence
+        return view, proposal_ids, proposal_confidence, anchor
+
     def _build_ar_training_view(self, data, anchor_token=None, perturb=None):
         anchor = self._select_anchor_token(data, anchor_token=anchor_token)
         token_start = anchor - self.ar_history_tokens
@@ -1259,6 +1400,45 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
         if do_perturb:
             self._perturb_ar_history_state(view)
         return view, target_tokens, target_valid, anchor
+
+    def _compute_dense_smart_ce_loss(self, data, ref_tensor):
+        if float(getattr(self, 'dense_smart_ce_loss_weight', 0.0)) <= 0.0:
+            return ref_tensor.new_zeros(())
+        return self._compute_ntp_loss(self(data))
+
+    def _compute_proposal_carry_training_loss(self, data, ref_tensor):
+        if (
+            getattr(self, 'ar_objective', 'maskgit') != 'maskgit'
+            or not bool(getattr(self, 'proposal_carry_training_enabled', False))
+            or float(getattr(self, 'proposal_carry_loss_weight', 0.0)) <= 0.0
+        ):
+            return ref_tensor.new_zeros(()), ref_tensor.new_zeros(()), False
+        built = self._build_proposal_carry_training_view(data)
+        if built is None:
+            return ref_tensor.new_zeros(()), ref_tensor.new_zeros(()), False
+        view, proposal_ids, proposal_confidence, _anchor = built
+        packed, summary, _ft, _fv, _generation_agents, _supervision_agents, _agent_batch = self._build_diffusion_inputs(view)
+        if packed is None:
+            return ref_tensor.new_zeros(()), ref_tensor.new_zeros(()), False
+        packed_proposal_ids = self._pack_agent_window_values(
+            proposal_ids,
+            packed,
+            fill_value=0,
+        )
+        packed_proposal_confidence = self._pack_agent_window_values(
+            proposal_confidence,
+            packed,
+            fill_value=0.0,
+        )
+        forced_mask = packed['valid_mask'].clone()
+        loss, acc = self._compute_diffusion_loss(
+            packed,
+            summary,
+            forced_mask=forced_mask,
+            initial_proposal_token_ids=packed_proposal_ids,
+            initial_proposal_confidence=packed_proposal_confidence,
+        )
+        return loss, acc, True
 
     def _perturb_ar_history_state(self, data):
         agent = data['agent']
@@ -1400,6 +1580,7 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
     def training_step(self, data, batch_idx):
         del batch_idx
         data = self._prepare_batch(data)
+        original_data = data
         retokenization = None
         state_mode = 'clean'
         rollout_depth = 0
@@ -1421,8 +1602,20 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
                 packed[key] = self._pack_agent_window_values(values, packed)
 
         diffusion_loss, mask_acc = self._compute_diffusion_loss(packed, summary)
+        dense_smart_ce_loss = self._compute_dense_smart_ce_loss(
+            original_data,
+            diffusion_loss,
+        )
+        proposal_carry_loss, proposal_carry_acc, proposal_carry_active = (
+            self._compute_proposal_carry_training_loss(original_data, diffusion_loss)
+        )
         ntp_loss = self._compute_optional_ntp_loss(data, diffusion_loss)
-        loss = diffusion_loss + self.ntp_aux_loss_weight * ntp_loss
+        loss = (
+            self.diffusion_loss_weight * diffusion_loss
+            + self.ntp_aux_loss_weight * ntp_loss
+            + float(getattr(self, 'dense_smart_ce_loss_weight', 0.0)) * dense_smart_ce_loss
+            + float(getattr(self, 'proposal_carry_loss_weight', 0.0)) * proposal_carry_loss
+        )
 
         self.log('train_empty_diffusion_batch', loss.new_zeros(()),
                  prog_bar=False, on_step=True, on_epoch=True, batch_size=1)
@@ -1432,6 +1625,15 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
                  batch_size=1)
         self.log('ntp_loss', ntp_loss, prog_bar=True, on_step=True, on_epoch=True,
                  batch_size=1)
+        self.log('dense_smart_ce_loss', dense_smart_ce_loss, prog_bar=True,
+                 on_step=True, on_epoch=True, batch_size=1)
+        self.log('proposal_carry_loss', proposal_carry_loss, prog_bar=True,
+                 on_step=True, on_epoch=True, batch_size=1)
+        self.log('proposal_carry_acc', proposal_carry_acc, on_step=True,
+                 on_epoch=True, batch_size=1)
+        self.log('train_proposal_carry_active',
+                 loss.new_tensor(float(proposal_carry_active)),
+                 prog_bar=False, on_step=True, on_epoch=True, batch_size=1)
         self.log('train_mask_acc', mask_acc, on_step=True, on_epoch=True, batch_size=1)
         if getattr(self, 'ar_objective', 'maskgit') == 'causal_frontier_v1':
             for name in ('clean', 'perturb', 'rollout'):
@@ -1486,7 +1688,10 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
         loss_start = time.perf_counter()
         diffusion_loss, mask_acc = self._compute_diffusion_loss(packed, summary)
         ntp_loss = self._compute_optional_ntp_loss(loss_data, diffusion_loss)
-        total_loss = diffusion_loss + self.ntp_aux_loss_weight * ntp_loss
+        total_loss = (
+            self.diffusion_loss_weight * diffusion_loss
+            + self.ntp_aux_loss_weight * ntp_loss
+        )
         self._debug_log(
             f"val_step_window_loss_done batch_idx={batch_idx} "
             f"loss={self._debug_scalar(total_loss):.4f} mask_acc={self._debug_scalar(mask_acc):.4f} "

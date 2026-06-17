@@ -25,6 +25,14 @@ def _ar_shell():
     model.inference_token = False
     model.ar_local_map_radius = 2.0
     model.max_map_tokens = 0
+    model.diffusion_loss_weight = 1.0
+    model.causal_loss_weighting_enabled = False
+    model.dense_smart_ce_loss_weight = 0.0
+    model.proposal_carry_training_enabled = False
+    model.proposal_carry_loss_weight = 0.0
+    model.proposal_dropout_prob = 0.0
+    model.proposal_noise_topk = 5
+    model.proposal_confidence = 0.5
     model.model_config = SimpleNamespace(decoder=SimpleNamespace(token_size=2048))
     model.encoder = SimpleNamespace(agent_encoder=SimpleNamespace(shift=5))
     return model
@@ -411,6 +419,133 @@ class SMARTAutoregressiveDiffusionTest(unittest.TestCase):
             torch.tensor([True, True, True, True, False, False, False, False]),
         ))
 
+    def test_causal_loss_weights_can_apply_without_causal_noise_schedule(self):
+        model = _ar_shell()
+        model.causal_noise_schedule = False
+        model.causal_loss_weighting_enabled = True
+        model.causal_loss_weights = (2.0, 1.0, 0.5, 0.25)
+        packed = {
+            "valid_mask": torch.ones(1, 4, dtype=torch.bool),
+            "chunk_ids": torch.arange(4).unsqueeze(0),
+        }
+
+        weights = model._training_loss_weights(packed)
+
+        self.assertTrue(torch.allclose(
+            weights,
+            torch.tensor([[2.0, 1.0, 0.5, 0.25]]),
+        ))
+
+    def test_causal_loss_weights_stay_disabled_without_explicit_gate(self):
+        model = _ar_shell()
+        model.causal_noise_schedule = False
+        model.causal_loss_weighting_enabled = False
+        model.causal_loss_weights = (2.0, 1.0, 0.5, 0.25)
+        packed = {
+            "valid_mask": torch.ones(1, 4, dtype=torch.bool),
+            "chunk_ids": torch.arange(4).unsqueeze(0),
+        }
+
+        weights = model._training_loss_weights(packed)
+
+        self.assertTrue(torch.equal(weights, torch.ones(1, 4)))
+
+    def test_diffusion_loss_accepts_forced_mask_and_initial_proposal(self):
+        model = _ar_shell()
+        model.training = True
+        model.prefix_constrained_training = False
+        model.low_variance_masking = False
+        model.causal_noise_schedule = False
+        model.causal_loss_weights = ()
+        model.geometry_dropout_prob = 0.0
+        model.use_proposal_geometry = True
+        model.self_condition_prob = 1.0
+        model.diffusion_decoder = SimpleNamespace(mask_token_id=5)
+        model.model_config.decoder.token_size = 5
+        model.noise_schedule = lambda t: (
+            torch.ones_like(t),
+            torch.full_like(t, 0.5),
+            torch.ones_like(t),
+        )
+        model._sample_diffusion_timesteps = MethodType(
+            lambda self, batch_size, device: torch.full((batch_size,), 0.5, device=device),
+            model,
+        )
+        model.log = MethodType(lambda self, *args, **kwargs: None, model)
+        captured = {}
+
+        def fake_decode(self, noisy, packed, summary, t, geometry_known_mask, **kwargs):
+            captured["noisy"] = noisy.clone()
+            captured["geometry_known_mask"] = geometry_known_mask.clone()
+            captured["proposal_token_ids"] = kwargs.get("proposal_token_ids").clone()
+            captured["proposal_confidence"] = kwargs.get("proposal_confidence").clone()
+            logits = torch.zeros(1, 4, 6)
+            for idx, token_id in enumerate(packed["token_ids"][0].tolist()):
+                logits[0, idx, token_id] = 5.0
+            return logits
+
+        model._decode_diffusion_logits = MethodType(fake_decode, model)
+        packed = {
+            "token_ids": torch.tensor([[0, 1, 2, 3]]),
+            "valid_mask": torch.ones(1, 4, dtype=torch.bool),
+            "loss_mask_base": torch.ones(1, 4, dtype=torch.bool),
+            "chunk_ids": torch.arange(4).unsqueeze(0),
+            "token_agent_ids": torch.zeros(1, 4, dtype=torch.long),
+        }
+        forced_mask = torch.tensor([[True, False, True, False]])
+        proposal_ids = torch.tensor([[10, 11, 12, 0]])
+        proposal_confidence = torch.tensor([[0.5, 0.5, 0.5, 0.0]])
+
+        loss, acc = model._compute_diffusion_loss(
+            packed,
+            torch.zeros(1, 1),
+            forced_mask=forced_mask,
+            initial_proposal_token_ids=proposal_ids,
+            initial_proposal_confidence=proposal_confidence,
+        )
+
+        self.assertGreater(float(loss), 0.0)
+        self.assertEqual(float(acc), 1.0)
+        self.assertTrue(torch.equal(captured["noisy"], torch.tensor([[5, 1, 5, 3]])))
+        self.assertTrue(torch.equal(
+            captured["geometry_known_mask"],
+            torch.tensor([[False, True, False, True]]),
+        ))
+        self.assertTrue(torch.equal(captured["proposal_token_ids"], proposal_ids))
+        self.assertTrue(torch.equal(captured["proposal_confidence"], proposal_confidence))
+
+    def test_proposal_carry_training_view_uses_next_window_and_tail_proposal(self):
+        model = _ar_shell()
+        model.ar_commit_tokens = 1
+        model.proposal_confidence = 0.5
+        data = _toy_sequence(num_agents=1, num_tokens=18, num_frames=91)
+
+        def fake_corrupt(self, token_ids, valid_mask, agent_types):
+            del agent_types
+            return token_ids + 100, valid_mask.to(dtype=torch.float) * self.proposal_confidence
+
+        model._corrupt_proposal_tokens = MethodType(fake_corrupt, model)
+
+        view, proposal_ids, proposal_confidence, anchor = model._build_proposal_carry_training_view(
+            data,
+            anchor_token=3,
+        )
+
+        self.assertEqual(anchor, 3)
+        self.assertTrue(torch.equal(view["agent"]["token_idx"][0, :6], torch.tensor([1, 2, 3, 4, 5, 6])))
+        self.assertTrue(torch.equal(proposal_ids[0], torch.tensor([103, 104, 105, 0])))
+        self.assertTrue(torch.allclose(
+            proposal_confidence[0],
+            torch.tensor([0.5, 0.5, 0.5, 0.0]),
+        ))
+
+    def test_proposal_carry_training_view_skips_terminal_incomplete_window(self):
+        model = _ar_shell()
+        model.ar_commit_tokens = 1
+        data = _toy_sequence(num_agents=1, num_tokens=18, num_frames=91)
+
+        self.assertIsNone(model._select_proposal_carry_anchor(data, anchor_token=15))
+
     def test_validation_step_uses_ar_window_loss_metrics(self):
         model = _ar_shell()
         data = _toy_sequence(num_agents=1, num_tokens=18, num_frames=91)
@@ -504,15 +639,21 @@ class SMARTAutoregressiveDiffusionTest(unittest.TestCase):
         self.assertIn("visible_token_corruption_prob: 0.0", validation_text)
         self.assertIn("visible_token_corruption_topk: 5", validation_text)
 
-    def test_ar_rerank_config_keeps_maskgit_and_enables_safe_speed_guidance(self):
+    def test_ar_rerank_config_keeps_maskgit_and_enables_proposal_training(self):
         text = Path("configs/train/train_scalable_ar_diffusion_rerank_1000.yaml").read_text()
 
         self.assertIn("predictor: smart_ar_diffusion", text)
         self.assertIn("ar_objective: maskgit", text)
         self.assertIn("causal_temporal_edges: true", text)
+        self.assertIn("causal_loss_weighting_enabled: true", text)
         self.assertIn("sampling_guidance:", text)
-        self.assertIn("enabled: true", text)
+        self.assertIn("enabled: false", text)
         self.assertIn("mode: safe_speed", text)
+        self.assertIn("dense_smart_ce_loss_weight: 1.0", text)
+        self.assertIn("diffusion_loss_weight: 0.25", text)
+        self.assertIn("proposal_carry_training_enabled: true", text)
+        self.assertIn("proposal_carry_loss_weight: 0.5", text)
+        self.assertIn("proposal_conditioning_enabled: true", text)
         self.assertIn("commit_min_speed_ratio: 0.75", text)
         self.assertIn("commit_max_speed_ratio: 1.25", text)
         self.assertIn("map_token_noise:", text)
@@ -530,7 +671,14 @@ class SMARTAutoregressiveDiffusionTest(unittest.TestCase):
         self.assertIn("prediction_tokens: 4", text)
         self.assertIn("commit_tokens: 1", text)
         self.assertIn("causal_noise_schedule: false", text)
+        self.assertIn("causal_loss_weighting_enabled: true", text)
+        self.assertIn("causal_loss_weights: [2.0, 1.0, 0.5, 0.25]", text)
+        self.assertIn("dense_smart_ce_loss_weight: 1.0", text)
+        self.assertIn("diffusion_loss_weight: 0.25", text)
+        self.assertIn("proposal_carry_training_enabled: true", text)
+        self.assertIn("proposal_conditioning_enabled: true", text)
         self.assertIn("sampling_guidance:", text)
+        self.assertIn("enabled: false", text)
         self.assertIn("mode: safe_speed", text)
         self.assertIn("map_token_noise:", text)
         self.assertIn("history_context_dropout:", text)
@@ -545,6 +693,7 @@ class SMARTAutoregressiveDiffusionTest(unittest.TestCase):
         self.assertIn("mode: safe_speed", text)
         self.assertIn("commit_min_speed_ratio: 0.75", text)
         self.assertIn("commit_max_speed_ratio: 1.25", text)
+        self.assertIn("proposal_conditioning_enabled: true", text)
         self.assertIn("history_context_dropout:", text)
         self.assertIn("enabled: false", text)
 
@@ -713,6 +862,69 @@ class SMARTAutoregressiveDiffusionTest(unittest.TestCase):
         self.assertEqual(float(loss), 2.0)
         self.assertEqual(calls["frontier_view"], 1)
         self.assertIn("train_ar_state_mode_clean", logged)
+
+    def test_maskgit_training_step_combines_dense_and_proposal_losses(self):
+        model = _ar_shell()
+        model.ar_objective = "maskgit"
+        model.ar_rolling_anchor_training = True
+        model.diffusion_loss_weight = 0.25
+        model.ntp_aux_loss_weight = 0.5
+        model.dense_smart_ce_loss_weight = 1.0
+        model.proposal_carry_loss_weight = 0.5
+        data = _toy_sequence(num_agents=1, num_tokens=18, num_frames=91)
+        view = data.clone()
+        logged = []
+        test_case = self
+
+        model._prepare_batch = MethodType(lambda self, batch: batch, model)
+        model._build_ar_training_view = MethodType(
+            lambda self, batch: (view, None, None, 2),
+            model,
+        )
+        model._build_diffusion_inputs = MethodType(
+            lambda self, batch: (
+                {
+                    "token_ids": torch.zeros(1, 4, dtype=torch.long),
+                    "valid_mask": torch.ones(1, 4, dtype=torch.bool),
+                    "chunk_ids": torch.arange(4).unsqueeze(0),
+                },
+                torch.zeros(1, 1),
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+            model,
+        )
+        model._compute_diffusion_loss = MethodType(
+            lambda self, packed, summary: (torch.tensor(10.0), torch.tensor(0.1)),
+            model,
+        )
+
+        def fake_dense(self, batch, ref):
+            test_case.assertIs(batch, data)
+            return ref.new_tensor(3.0)
+
+        def fake_proposal(self, batch, ref):
+            test_case.assertIs(batch, data)
+            return ref.new_tensor(5.0), ref.new_tensor(0.2), True
+
+        def fake_ntp(self, batch, ref):
+            test_case.assertIs(batch, view)
+            return ref.new_tensor(7.0)
+
+        model._compute_dense_smart_ce_loss = MethodType(fake_dense, model)
+        model._compute_proposal_carry_training_loss = MethodType(fake_proposal, model)
+        model._compute_optional_ntp_loss = MethodType(fake_ntp, model)
+        model.log = MethodType(lambda self, name, *args, **kwargs: logged.append(name), model)
+
+        loss = model.training_step(data, 0)
+
+        self.assertAlmostEqual(float(loss), 11.5, places=6)
+        self.assertIn("dense_smart_ce_loss", logged)
+        self.assertIn("proposal_carry_loss", logged)
+        self.assertIn("train_proposal_carry_active", logged)
 
     def test_select_closed_loop_anchor_reserves_rollout_and_prediction_room(self):
         model = _ar_shell()

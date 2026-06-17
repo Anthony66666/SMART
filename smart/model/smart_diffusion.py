@@ -85,6 +85,7 @@ class SMARTDiffusion(SMART):
         self.diffusion_eps = float(getattr(diffusion_cfg, 'eps', 1e-3))
         self.min_t = float(getattr(diffusion_cfg, 'min_t', 1e-3))
         self.freeze_encoder = bool(getattr(diffusion_cfg, 'freeze_encoder', False))
+        self.diffusion_loss_weight = float(getattr(diffusion_cfg, 'diffusion_loss_weight', 1.0))
         self.ntp_aux_loss_weight = float(getattr(diffusion_cfg, 'ntp_aux_loss_weight', 0.2))
         self.use_agent_context = bool(getattr(diffusion_cfg, 'use_agent_context', True))
         self.use_type_embedding = bool(getattr(diffusion_cfg, 'use_type_embedding', True))
@@ -115,6 +116,13 @@ class SMARTDiffusion(SMART):
         self.causal_loss_weights = tuple(
             float(x) for x in getattr(diffusion_cfg, 'causal_loss_weights', [])
         )
+        self.causal_loss_weighting_enabled = bool(
+            getattr(
+                diffusion_cfg,
+                'causal_loss_weighting_enabled',
+                getattr(diffusion_cfg, 'causal_noise_schedule', False),
+            )
+        )
         self.visible_token_corruption_prob = float(
             getattr(diffusion_cfg, 'visible_token_corruption_prob', 0.0)
         )
@@ -133,6 +141,9 @@ class SMARTDiffusion(SMART):
         self.prefix_constrained_sampling = bool(getattr(diffusion_cfg, 'prefix_constrained_sampling', False))
         self.prefix_constrained_training = bool(getattr(diffusion_cfg, 'prefix_constrained_training', False))
         self.use_proposal_geometry = bool(getattr(diffusion_cfg, 'use_proposal_geometry', True))
+        self.proposal_conditioning_enabled = bool(
+            getattr(diffusion_cfg, 'proposal_conditioning_enabled', False)
+        )
         self.geometry_confidence_source_threshold = float(
             getattr(diffusion_cfg, 'geometry_confidence_source_threshold', 0.35)
         )
@@ -415,7 +426,7 @@ class SMARTDiffusion(SMART):
 
     def _training_loss_weights(self, packed, dtype=torch.float):
         valid_mask = packed['valid_mask']
-        if not getattr(self, 'causal_noise_schedule', False):
+        if not getattr(self, 'causal_loss_weighting_enabled', False):
             return torch.ones_like(valid_mask, dtype=dtype)
         chunk_weights = self._causal_chunk_values(
             packed,
@@ -1167,7 +1178,14 @@ class SMARTDiffusion(SMART):
             geometry_known_mask = geometry_known_mask & geometry_keep
         return geometry_known_mask
 
-    def _compute_diffusion_loss(self, packed, summary):
+    def _compute_diffusion_loss(
+        self,
+        packed,
+        summary,
+        forced_mask=None,
+        initial_proposal_token_ids=None,
+        initial_proposal_confidence=None,
+    ):
         B = summary.shape[0]
         t = self._sample_diffusion_timesteps(B, summary.device)
         sigma_t, mask_prob, dsigma_t = self.noise_schedule(t)
@@ -1175,9 +1193,12 @@ class SMARTDiffusion(SMART):
         gt = packed['token_ids']
         valid_mask = packed['valid_mask']
         loss_mask_base = packed.get('loss_mask_base', valid_mask) & valid_mask
-        training_mask_prob = self._training_mask_prob(mask_prob, packed)
-        mask = self._sample_training_mask(valid_mask, training_mask_prob)
-        if self.prefix_constrained_training:
+        if forced_mask is None:
+            training_mask_prob = self._training_mask_prob(mask_prob, packed)
+            mask = self._sample_training_mask(valid_mask, training_mask_prob)
+        else:
+            mask = forced_mask.to(device=valid_mask.device, dtype=torch.bool) & valid_mask
+        if forced_mask is None and self.prefix_constrained_training:
             mask = self._apply_prefix_mask_closure(
                 mask,
                 valid_mask,
@@ -1206,10 +1227,24 @@ class SMARTDiffusion(SMART):
         proposal_confidence = None
         proposal_mask = torch.zeros_like(mask)
         proposal_input_acc = gt.new_tensor(0.0, dtype=torch.float)
+        if initial_proposal_token_ids is not None and initial_proposal_confidence is not None:
+            proposal_ids = initial_proposal_token_ids.to(device=gt.device, dtype=torch.long)
+            proposal_confidence = initial_proposal_confidence.to(
+                device=gt.device,
+                dtype=summary.dtype,
+            )
+            proposal_mask = (
+                proposal_confidence > 0.0
+            ) & valid_mask
+            if proposal_mask.any():
+                proposal_input_acc = (
+                    proposal_ids[proposal_mask] == gt[proposal_mask]
+                ).float().mean()
         should_self_condition = (
             self.training
             and self.use_proposal_geometry
             and mask.any()
+            and proposal_ids is None
             and self.self_condition_prob > 0.0
             and torch.rand((), device=gt.device) < self.self_condition_prob
         )
@@ -1305,7 +1340,10 @@ class SMARTDiffusion(SMART):
 
         diffusion_loss, mask_acc = self._compute_diffusion_loss(packed, summary)
         ntp_loss = self._compute_optional_ntp_loss(data, diffusion_loss)
-        loss = diffusion_loss + self.ntp_aux_loss_weight * ntp_loss
+        loss = (
+            self.diffusion_loss_weight * diffusion_loss
+            + self.ntp_aux_loss_weight * ntp_loss
+        )
 
         self.log('train_empty_diffusion_batch', loss.new_zeros(()),
                  prog_bar=False, on_step=True, on_epoch=True, batch_size=1)
@@ -1331,7 +1369,10 @@ class SMARTDiffusion(SMART):
 
         diffusion_loss, mask_acc = self._compute_diffusion_loss(packed, summary)
         ntp_loss = self._compute_optional_ntp_loss(data, diffusion_loss)
-        total_loss = diffusion_loss + self.ntp_aux_loss_weight * ntp_loss
+        total_loss = (
+            self.diffusion_loss_weight * diffusion_loss
+            + self.ntp_aux_loss_weight * ntp_loss
+        )
 
         self.log('val_empty_diffusion_batch', total_loss.new_zeros(()),
                  prog_bar=False, on_step=False, on_epoch=True,
