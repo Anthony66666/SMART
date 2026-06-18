@@ -1,11 +1,25 @@
 # Decisions
 
+## Decision: Use single-forward cadf_lite for active AR rerank training
+- Date: 2026-06-18
+- Context: Commitment-aware all-anchor AR rerank training aligned the loss with one-token commits, but each batch ran a diffusion-window encoder pass for every future anchor plus periodic dense SMART CE. This made local and server training too slow for iteration.
+- Decision: Make active AR rerank train configs use `ar_training_mode: cadf_lite`. A non-replay step now selects one deterministic future anchor, builds one terminal-safe 4-token window, force-masks all valid chunks with weights `[1.0, 0.3, 0.1, 0.05]`, computes local chunk-0 next-token CE from the same window encoder context, and initializes proposals by cycling `all_mask` and `carry_over`. Full-sequence SMART CE is retained as replay every `dense_smart_ce_interval: 8`; explicit proposal shift KL is disabled.
+- Why: This preserves chunk0 coverage over time and keeps proposal augmentation visible to training, while reducing the default non-replay step to one window encoder pass instead of all-anchor enumeration.
+- Impact: The older all-anchor commitment-aware path and `partial_mask` proposal mode remain available as explicit ablations, but they are no longer active rerank defaults. New AR rerank speed/quality comparisons should report `ar_training_mode: cadf_lite`, the replay interval, and the proposal init modes.
+
+## Decision: Train AR rerank with commitment-aware all-anchor windows
+- Date: 2026-06-18
+- Context: The previous AR rerank training still used a sampled 4-token window as the main diffusion objective, with proposal-carry as an auxiliary next-window loss. That meant a future token was not guaranteed to be trained as the executable chunk 0, terminal future tokens could be skipped by full-window anchoring, and shifted proposals did not have an explicit distribution-consistency objective.
+- Decision: Enable `commitment_aware_training` for AR rerank configs. The main MaskGIT diffusion loss now enumerates every valid future anchor, builds terminal-safe PAD windows, force-masks all valid chunks, and uses commit-primary chunk weights `[1.0, 0.3, 0.1, 0.05]` normalized by active supervision weight. Adjacent windows add a symmetric KL proposal shift consistency loss between previous tail logits and current head logits, while shifted proposal inputs are still simulated from corrupted GT tokens.
+- Why: This aligns training with receding-horizon execution: every committed timestep is supervised as chunk 0, tail chunks remain lookahead/proposal auxiliaries, and the model is penalized when a carried proposal changes distribution arbitrarily after the window shifts.
+- Impact: AR rerank training is expected to be substantially slower because it runs one diffusion-window encoder pass per future anchor. Report this all-anchor setting and `proposal_shift_consistency_loss_weight` when comparing new checkpoints to older rerank runs.
+
 ## Decision: Throttle AR rerank auxiliary losses for faster training
 - Date: 2026-06-18
 - Context: AR rerank training step was doing three encoder passes by default: the main AR diffusion window, dense original-SMART CE on the full scene, and proposal-carry diffusion on the next window. The latter two are useful auxiliary signals, but running both every step made training much slower than the original SMART-style baseline.
-- Decision: Keep the auxiliary objectives, but make them explicitly scheduled. `dense_smart_ce_interval` and `proposal_carry_interval` gate their execution by global step, and `proposal_carry_detach_encoder` can build the proposal-carry encoder context under `no_grad` while still training the diffusion decoder on that loss. The active rerank train configs use dense CE every 4 steps, proposal carry every 2 steps, and detach the proposal-carry encoder path.
+- Decision: Keep the auxiliary objectives scheduled for the non-commitment-aware fallback. `dense_smart_ce_interval` and `proposal_carry_interval` gate their execution by global step, and `proposal_carry_detach_encoder` can build the proposal-carry encoder context under `no_grad` while still training the diffusion decoder on that loss. The current active rerank train configs still use dense CE every 4 steps, but disable the standalone proposal-carry auxiliary because shifted proposal inputs and shift consistency are handled inside the commitment-aware all-anchor objective.
 - Why: This reduces repeated encoder forward/backward work without silently changing the default model semantics or pretending that different original/window/proposal views can share one encoder output.
-- Impact: New AR rerank speed/quality comparisons should report the auxiliary intervals. Default configs that omit these fields keep interval `1` and proposal detach disabled.
+- Impact: New AR rerank speed/quality comparisons should report whether they use the all-anchor commitment-aware objective or the older scheduled auxiliary fallback. Default configs that omit these fields keep interval `1` and proposal detach disabled.
 
 ## Decision: Train AR rerank with dense SMART CE plus proposal-carry supervision
 - Date: 2026-06-17

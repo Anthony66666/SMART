@@ -1,8 +1,22 @@
 # Progress
 
 ## 2026-06-18 CST
+- Task: Replaced active AR rerank all-anchor training with a single-forward cadf_lite path.
+- Result: `SMARTAutoregressiveDiffusion` now supports `ar_training_mode: cadf_lite`: each non-replay step selects one deterministic future anchor, uses a terminal-safe PAD window, force-masks valid chunks with commit-primary weights, computes local chunk0 NTP CE from the same encoder context, and cycles all-mask/carry-over proposal initialization. Active rerank train configs disable explicit shift KL and replay full-sequence SMART CE every 8 steps.
+- Files: `smart/model/smart_ar_diffusion.py`, `smart/model/smart_diffusion.py`, AR rerank train configs, `tests/test_smart_ar_diffusion.py`, and durable docs.
+- Validation: Added cadf_lite regressions for deterministic anchor cycling, proposal init modes, and single-window training-step behavior. `tests.test_smart_ar_diffusion` and diffusion/causal/smart-parity regressions passed locally.
+- Next: Retrain AR rerank from scratch with the cadf_lite configs before comparing speed, ADE/FDE, or late map adherence against all-anchor or older rerank checkpoints.
+
+## 2026-06-18 CST
+- Task: Converted AR rerank diffusion training to commitment-aware all-anchor windows.
+- Result: `SMARTAutoregressiveDiffusion` now supports `commitment_aware_training` and `proposal_shift_consistency_loss_weight`. In this mode the MaskGIT diffusion loss enumerates every future anchor, permits terminal PAD windows, force-masks valid chunks with commit-primary loss weights, injects shifted proposal inputs for non-initial anchors, and adds adjacent-window proposal shift consistency. Rerank train configs now use `causal_loss_weights: [1.0, 0.3, 0.1, 0.05]`, `commitment_aware_training: true`, `proposal_shift_consistency_loss_weight: 0.1`, and disable the older standalone proposal-carry auxiliary loss.
+- Files: `smart/model/smart_ar_diffusion.py`, `smart/model/smart_diffusion.py`, AR rerank train configs, `tests/test_smart_ar_diffusion.py`, and durable docs.
+- Validation: Added regressions for terminal PAD windows, all-future chunk0 anchor coverage, forced valid-window masks, proposal shift consistency, and supervision-weight loss normalization. Focused AR rerank tests passed.
+- Next: Retrain AR rerank from scratch and expect slower steps because one batch now runs all future-anchor diffusion windows.
+
+## 2026-06-18 CST
 - Task: Added a fast auxiliary-loss schedule for AR rerank training.
-- Result: `SMARTAutoregressiveDiffusion` now supports `dense_smart_ce_interval`, `proposal_carry_interval`, and `proposal_carry_detach_encoder`. Dense original-SMART CE and proposal-carry diffusion can be skipped on non-interval steps, and proposal-carry input construction can run under `no_grad` while the diffusion decoder loss remains trainable. The AR rerank train configs use dense CE every 4 steps, proposal carry every 2 steps, and detached proposal-carry encoder context.
+- Result: `SMARTAutoregressiveDiffusion` added `dense_smart_ce_interval`, `proposal_carry_interval`, and `proposal_carry_detach_encoder`. Dense original-SMART CE and proposal-carry diffusion can be skipped on non-interval steps, and proposal-carry input construction can run under `no_grad` while the diffusion decoder loss remains trainable. This was the fast auxiliary schedule before the later commitment-aware all-anchor rerank objective disabled the standalone proposal-carry auxiliary in active rerank configs.
 - Files: `smart/model/smart_ar_diffusion.py`, AR rerank train configs, `tests/test_smart_ar_diffusion.py`, and durable docs.
 - Validation: Added red/green regressions for dense CE interval skipping, proposal-carry interval skipping, proposal-carry encoder detach, and fast rerank config fields. Focused tests passed after implementation.
 - Next: Run full AR diffusion regression tests and then retrain AR rerank with the fast schedule before judging speed/quality.

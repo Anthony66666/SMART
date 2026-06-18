@@ -1057,7 +1057,7 @@ class SMARTDiffusion(SMART):
     def _history_context_mask(self, data):
         return None
 
-    def _build_diffusion_inputs(self, data, rollout_valid=False):
+    def _build_diffusion_inputs(self, data, rollout_valid=False, return_context=False):
         history_context_mask = self._history_context_mask(data)
         if history_context_mask is None:
             ctx = self.encoder.encode_history_context(data)
@@ -1095,7 +1095,10 @@ class SMARTDiffusion(SMART):
             agent_shape_embeddings,
         )
         if packed is None:
-            return None, None, ft, fv, generation_agents, supervision_agents, agent_batch
+            result = (None, None, ft, fv, generation_agents, supervision_agents, agent_batch)
+            if return_context:
+                return (*result, ctx)
+            return result
 
         summary = self._pool_scene_summary(ctx['x_a_history'], ctx['history_token_mask'],
                                            agent_batch, data['agent']['type'])
@@ -1113,7 +1116,10 @@ class SMARTDiffusion(SMART):
         packed['map_orientations'] = map_orientations
         packed['map_batch'] = map_batch
         packed['map_valid_mask'] = map_valid_mask
-        return packed, summary, ft, fv, generation_agents, supervision_agents, agent_batch
+        result = (packed, summary, ft, fv, generation_agents, supervision_agents, agent_batch)
+        if return_context:
+            return (*result, ctx)
+        return result
 
     def _decode_diffusion_logits(
         self,
@@ -1199,6 +1205,8 @@ class SMARTDiffusion(SMART):
         forced_mask=None,
         initial_proposal_token_ids=None,
         initial_proposal_confidence=None,
+        return_details=False,
+        loss_normalization='base',
     ):
         B = summary.shape[0]
         t = self._sample_diffusion_timesteps(B, summary.device)
@@ -1305,7 +1313,11 @@ class SMARTDiffusion(SMART):
             chunk_loss_weight = self._training_loss_weights(packed, dtype=nll.dtype)
             supervision_weight = loss_mask.to(dtype=nll.dtype) * chunk_loss_weight
             loss = (weight * nll * supervision_weight).sum()
-            loss = loss / loss_mask_base.to(dtype=nll.dtype).sum().clamp_min(1.0)
+            if str(loss_normalization).lower() == 'supervision_weight':
+                denominator = supervision_weight.sum().clamp_min(1.0)
+            else:
+                denominator = loss_mask_base.to(dtype=nll.dtype).sum().clamp_min(1.0)
+            loss = loss / denominator
             acc = (logits[loss_mask].argmax(-1) == gt[loss_mask]).float().mean()
         else:
             loss = logits.sum() * 0.0
@@ -1341,6 +1353,14 @@ class SMARTDiffusion(SMART):
                 chunk_covered = (loss_mask & chunk_mask).to(dtype=torch.float).sum() / chunk_total
                 self.log(f'train_loss_chunk_{chunk_idx:02d}', chunk_covered,
                          prog_bar=False, on_step=True, on_epoch=True, batch_size=1)
+        if return_details:
+            return loss, acc, {
+                'logits': logits,
+                'mask': mask,
+                'loss_mask': loss_mask,
+                'loss_mask_base': loss_mask_base,
+                'proposal_mask': proposal_mask,
+            }
         return loss, acc
 
     def training_step(self, data, batch_idx):

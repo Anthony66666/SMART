@@ -89,7 +89,12 @@ Model:
     causal_noise_schedule: false
     causal_chunk_mask_multipliers: [0.70, 0.90, 1.10, 1.30]
     causal_loss_weighting_enabled: true
-    causal_loss_weights: [2.0, 1.0, 0.5, 0.25]
+    causal_loss_weights: [1.0, 0.3, 0.1, 0.05]
+    ar_training_mode: cadf_lite
+    commitment_aware_training: false
+    proposal_shift_consistency_loss_weight: 0.0
+    cadf_lite_local_ntp_loss_weight: 1.0
+    cadf_lite_proposal_init_modes: [all_mask, carry_over]
     token_steps: 5
     total_rollout_steps: 80
     local_map_refresh: rescreen
@@ -120,11 +125,11 @@ Model:
     eps: 1.0e-3
     min_t: 1.0e-3
     dense_smart_ce_loss_weight: 1.0
-    dense_smart_ce_interval: 4
+    dense_smart_ce_interval: 8
     diffusion_loss_weight: 0.25
     ntp_aux_loss_weight: 0
-    proposal_carry_training_enabled: true
-    proposal_carry_loss_weight: 0.5
+    proposal_carry_training_enabled: false
+    proposal_carry_loss_weight: 0.0
     proposal_carry_interval: 2
     proposal_carry_detach_encoder: true
     proposal_dropout_prob: 0.3

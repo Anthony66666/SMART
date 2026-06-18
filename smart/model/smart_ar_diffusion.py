@@ -59,6 +59,47 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
         self.proposal_carry_detach_encoder = bool(
             getattr(diffusion_cfg, 'proposal_carry_detach_encoder', False)
         )
+        commitment_aware_training = bool(
+            getattr(diffusion_cfg, 'commitment_aware_training', False)
+        )
+        self.ar_training_mode = str(
+            getattr(
+                diffusion_cfg,
+                'ar_training_mode',
+                'commitment_aware' if commitment_aware_training else 'window',
+            )
+        ).lower()
+        if self.ar_training_mode not in ('window', 'commitment_aware', 'cadf_lite'):
+            raise ValueError(
+                f"Unsupported diffusion.ar_training_mode: {self.ar_training_mode}"
+            )
+        self.cadf_lite_local_ntp_loss_weight = max(
+            0.0,
+            float(getattr(diffusion_cfg, 'cadf_lite_local_ntp_loss_weight', 1.0)),
+        )
+        proposal_init_modes = getattr(
+            diffusion_cfg,
+            'cadf_lite_proposal_init_modes',
+            ('all_mask', 'carry_over'),
+        )
+        self.cadf_lite_proposal_init_modes = tuple(
+            str(mode).lower() for mode in proposal_init_modes
+        )
+        valid_proposal_modes = {'all_mask', 'carry_over', 'partial_mask'}
+        invalid_modes = [
+            mode for mode in self.cadf_lite_proposal_init_modes
+            if mode not in valid_proposal_modes
+        ]
+        if invalid_modes:
+            raise ValueError(
+                "diffusion.cadf_lite_proposal_init_modes contains unsupported "
+                f"modes: {invalid_modes}"
+            )
+        self.commitment_aware_training = commitment_aware_training
+        self.proposal_shift_consistency_loss_weight = max(
+            0.0,
+            float(getattr(diffusion_cfg, 'proposal_shift_consistency_loss_weight', 0.0)),
+        )
         self.proposal_dropout_prob = min(
             1.0,
             max(0.0, float(getattr(diffusion_cfg, 'proposal_dropout_prob', 0.0))),
@@ -645,10 +686,11 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
                     state_embeddings[agent_idx]
                 )
 
-    def _build_diffusion_inputs(self, data, rollout_valid=False):
+    def _build_diffusion_inputs(self, data, rollout_valid=False, return_context=False):
         result = super()._build_diffusion_inputs(
             data,
             rollout_valid=rollout_valid,
+            return_context=return_context,
         )
         packed = result[0]
         if (
@@ -1245,14 +1287,41 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
             return view, metadata, 'perturb', 0
         return view, self._clean_retokenization_metadata(view), 'clean', 0
 
-    def _select_anchor_token(self, data, anchor_token=None):
+    def _last_incomplete_anchor_token(self, data):
+        token_count = int(data['agent']['token_idx'].shape[1])
+        frame_count = int(data['agent']['position'].shape[1])
+        max_token_anchor = token_count - 1
+        max_frame_anchor = (frame_count - 2) // self.ar_token_steps
+        return min(max_token_anchor, max_frame_anchor)
+
+    def _commitment_training_anchors(self, data):
+        min_anchor = self.ar_history_tokens
+        max_anchor = self._last_incomplete_anchor_token(data)
+        if max_anchor < min_anchor:
+            return []
+        return list(range(min_anchor, max_anchor + 1))
+
+    def _select_anchor_token(self, data, anchor_token=None, allow_incomplete_window=False):
         if anchor_token is not None:
-            return int(anchor_token)
+            anchor = int(anchor_token)
+            if allow_incomplete_window:
+                min_anchor = self.ar_history_tokens
+                max_anchor = self._last_incomplete_anchor_token(data)
+                if anchor < min_anchor or anchor > max_anchor:
+                    raise ValueError(
+                        f"AR diffusion anchor {anchor} is outside incomplete-window range "
+                        f"[{min_anchor}, {max_anchor}]."
+                    )
+            return anchor
         token_count = int(data['agent']['token_idx'].shape[1])
         min_anchor = self.ar_history_tokens
-        max_anchor = token_count - self.ar_prediction_tokens
+        if allow_incomplete_window:
+            max_anchor = self._last_incomplete_anchor_token(data)
+        else:
+            max_anchor = token_count - self.ar_prediction_tokens
         frame_max_anchor = (int(data['agent']['position'].shape[1]) - 1 - self.ar_prediction_tokens * self.ar_token_steps) // self.ar_token_steps
-        max_anchor = min(max_anchor, frame_max_anchor)
+        if not allow_incomplete_window:
+            max_anchor = min(max_anchor, frame_max_anchor)
         if max_anchor < min_anchor:
             raise ValueError(
                 f"AR diffusion needs at least {self.ar_history_tokens + self.ar_prediction_tokens} "
@@ -1272,11 +1341,7 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
         token_count = int(data['agent']['token_idx'].shape[1])
         frame_count = int(data['agent']['position'].shape[1])
         min_anchor = self.ar_history_tokens + self.ar_commit_tokens
-        max_anchor = token_count - self.ar_prediction_tokens
-        frame_max_anchor = (
-            frame_count - 1 - self.ar_prediction_tokens * self.ar_token_steps
-        ) // self.ar_token_steps
-        max_anchor = min(max_anchor, frame_max_anchor)
+        max_anchor = min(token_count - 1, (frame_count - 2) // self.ar_token_steps)
         if max_anchor < min_anchor:
             return None
         if anchor_token is not None:
@@ -1342,6 +1407,120 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
         )
         return proposal_ids, proposal_confidence
 
+    def _source_token_window(self, source_agent, start_token, length):
+        token_source = source_agent['token_idx']
+        valid_source = source_agent['agent_valid_mask'].bool()
+        num_agents = int(token_source.shape[0])
+        token_count = int(token_source.shape[1])
+        device = token_source.device
+        tokens = torch.zeros(
+            num_agents,
+            length,
+            dtype=torch.long,
+            device=device,
+        )
+        valid = torch.zeros(
+            num_agents,
+            length,
+            dtype=torch.bool,
+            device=device,
+        )
+        src_start = max(0, int(start_token))
+        src_end = min(token_count, int(start_token) + int(length))
+        if src_end <= src_start:
+            return tokens, valid
+        dst_start = src_start - int(start_token)
+        dst_end = dst_start + (src_end - src_start)
+        tokens[:, dst_start:dst_end] = token_source[:, src_start:src_end].long()
+        valid[:, dst_start:dst_end] = valid_source[:, src_start:src_end]
+        return tokens, valid
+
+    def _copy_agent_token_window(self, target_agent, source_agent, token_start, total_tokens):
+        token_count = int(source_agent['token_idx'].shape[1])
+        num_agents = int(source_agent['token_idx'].shape[0])
+        device = source_agent['token_idx'].device
+        target_agent['token_idx'] = torch.zeros(
+            num_agents,
+            total_tokens,
+            dtype=torch.long,
+            device=device,
+        )
+        target_agent['agent_valid_mask'] = torch.zeros(
+            num_agents,
+            total_tokens,
+            dtype=torch.bool,
+            device=device,
+        )
+        src_start = max(0, int(token_start))
+        src_end = min(token_count, int(token_start) + int(total_tokens))
+        if src_end > src_start:
+            dst_start = src_start - int(token_start)
+            dst_end = dst_start + (src_end - src_start)
+            target_agent['token_idx'][:, dst_start:dst_end] = (
+                source_agent['token_idx'][:, src_start:src_end].long()
+            )
+            target_agent['agent_valid_mask'][:, dst_start:dst_end] = (
+                source_agent['agent_valid_mask'][:, src_start:src_end].bool()
+            )
+        for key, fill_shape, dtype in (
+            ('token_pos', (2,), torch.float),
+            ('token_heading', (), torch.float),
+        ):
+            if key not in source_agent:
+                continue
+            source = source_agent[key]
+            shape = (num_agents, total_tokens) + fill_shape
+            target = torch.zeros(
+                shape,
+                dtype=source.dtype if hasattr(source, 'dtype') else dtype,
+                device=source.device,
+            )
+            if src_end > src_start:
+                target[:, dst_start:dst_end] = source[:, src_start:src_end].clone()
+            target_agent[key] = target
+
+    def _copy_agent_frame_window(self, target_agent, source_agent, frame_start, total_frames):
+        frame_count = int(source_agent['position'].shape[1])
+        num_agents = int(source_agent['position'].shape[0])
+        for key in ('position', 'heading', 'valid_mask'):
+            if key not in source_agent:
+                continue
+            source = source_agent[key]
+            fill_shape = tuple(source.shape[2:])
+            if source.dtype == torch.bool:
+                target = torch.zeros(
+                    (num_agents, total_frames) + fill_shape,
+                    dtype=torch.bool,
+                    device=source.device,
+                )
+            else:
+                target = torch.zeros(
+                    (num_agents, total_frames) + fill_shape,
+                    dtype=source.dtype,
+                    device=source.device,
+                )
+            src_start = max(0, int(frame_start))
+            src_end = min(frame_count, int(frame_start) + int(total_frames))
+            if src_end > src_start:
+                dst_start = src_start - int(frame_start)
+                dst_end = dst_start + (src_end - src_start)
+                target[:, dst_start:dst_end] = source[:, src_start:src_end].clone()
+            target_agent[key] = target
+        if 'shape' in source_agent and source_agent['shape'].dim() == 3:
+            source = source_agent['shape']
+            target = torch.zeros(
+                (num_agents, total_frames, source.shape[-1]),
+                dtype=source.dtype,
+                device=source.device,
+            )
+            src_start = max(0, int(frame_start))
+            src_end = min(frame_count, int(frame_start) + int(total_frames))
+            if src_end > src_start:
+                dst_start = src_start - int(frame_start)
+                dst_end = dst_start + (src_end - src_start)
+                target[:, dst_start:dst_end] = source[:, src_start:src_end].clone()
+            target_agent['shape'] = target
+
     def _build_proposal_carry_training_view(self, data, anchor_token=None):
         anchor = self._select_proposal_carry_anchor(
             data,
@@ -1356,10 +1535,14 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
             data,
             anchor_token=anchor,
             perturb=False,
+            allow_incomplete_window=True,
         )
         source_agent = data['agent']
-        tail_tokens = source_agent['token_idx'][:, anchor:anchor + tail_len].long()
-        tail_valid = source_agent['agent_valid_mask'][:, anchor:anchor + tail_len].bool()
+        tail_tokens, tail_valid = self._source_token_window(
+            source_agent,
+            anchor,
+            tail_len,
+        )
         corrupted_ids, corrupted_confidence = self._corrupt_proposal_tokens(
             tail_tokens,
             tail_valid,
@@ -1382,14 +1565,31 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
         proposal_confidence[:, :tail_len] = corrupted_confidence
         return view, proposal_ids, proposal_confidence, anchor
 
-    def _build_ar_training_view(self, data, anchor_token=None, perturb=None):
-        anchor = self._select_anchor_token(data, anchor_token=anchor_token)
+    def _build_ar_training_view(
+        self,
+        data,
+        anchor_token=None,
+        perturb=None,
+        allow_incomplete_window=False,
+    ):
+        anchor = self._select_anchor_token(
+            data,
+            anchor_token=anchor_token,
+            allow_incomplete_window=allow_incomplete_window,
+        )
         token_start = anchor - self.ar_history_tokens
-        token_end = anchor + self.ar_prediction_tokens
+        total_tokens = self.ar_history_tokens + self.ar_prediction_tokens
         frame_anchor = anchor * self.ar_token_steps
         frame_start = frame_anchor - (self.num_historical_steps - 1)
-        frame_end = frame_anchor + self.ar_prediction_tokens * self.ar_token_steps
-        if frame_start < 0 or frame_end >= int(data['agent']['position'].shape[1]):
+        total_frames = self.num_historical_steps + self.ar_prediction_tokens * self.ar_token_steps
+        frame_end = frame_start + total_frames - 1
+        if (
+            not allow_incomplete_window
+            and (
+                frame_start < 0
+                or frame_end >= int(data['agent']['position'].shape[1])
+            )
+        ):
             raise ValueError(
                 f"AR diffusion anchor {anchor} maps to invalid frame window "
                 f"[{frame_start}, {frame_end}] for {data['agent']['position'].shape[1]} frames."
@@ -1398,22 +1598,41 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
         view = data.clone()
         agent = view['agent']
         source_agent = data['agent']
-        agent['token_idx'] = source_agent['token_idx'][:, token_start:token_end].clone()
-        agent['agent_valid_mask'] = source_agent['agent_valid_mask'][:, token_start:token_end].bool().clone()
-        if 'token_pos' in source_agent:
-            agent['token_pos'] = source_agent['token_pos'][:, token_start:token_end].clone()
-        if 'token_heading' in source_agent:
-            agent['token_heading'] = source_agent['token_heading'][:, token_start:token_end].clone()
-        for key in ('position', 'heading', 'valid_mask'):
-            if key in source_agent:
-                agent[key] = source_agent[key][:, frame_start:frame_end + 1].clone()
-        if 'shape' in source_agent and source_agent['shape'].dim() == 3:
-            agent['shape'] = source_agent['shape'][:, frame_start:frame_end + 1].clone()
+        if allow_incomplete_window:
+            self._copy_agent_token_window(
+                agent,
+                source_agent,
+                token_start,
+                total_tokens,
+            )
+            self._copy_agent_frame_window(
+                agent,
+                source_agent,
+                frame_start,
+                total_frames,
+            )
+        else:
+            token_end = anchor + self.ar_prediction_tokens
+            agent['token_idx'] = source_agent['token_idx'][:, token_start:token_end].clone()
+            agent['agent_valid_mask'] = source_agent['agent_valid_mask'][:, token_start:token_end].bool().clone()
+            if 'token_pos' in source_agent:
+                agent['token_pos'] = source_agent['token_pos'][:, token_start:token_end].clone()
+            if 'token_heading' in source_agent:
+                agent['token_heading'] = source_agent['token_heading'][:, token_start:token_end].clone()
+            for key in ('position', 'heading', 'valid_mask'):
+                if key in source_agent:
+                    agent[key] = source_agent[key][:, frame_start:frame_end + 1].clone()
+            if 'shape' in source_agent and source_agent['shape'].dim() == 3:
+                agent['shape'] = source_agent['shape'][:, frame_start:frame_end + 1].clone()
 
-        target_tokens = source_agent['token_idx'][:, anchor:token_end].long().clone()
-        target_valid = source_agent['agent_valid_mask'][:, anchor:token_end].bool().clone()
+        target_slice = slice(
+            self.ar_history_tokens,
+            self.ar_history_tokens + self.ar_prediction_tokens,
+        )
+        target_tokens = agent['token_idx'][:, target_slice].long().clone()
+        target_valid = agent['agent_valid_mask'][:, target_slice].bool().clone()
         do_perturb = bool(perturb) if perturb is not None else (
-            self.training
+            getattr(self, 'training', False)
             and self.ar_state_perturb_prob > 0.0
             and torch.rand((), device=target_tokens.device) < self.ar_state_perturb_prob
         )
@@ -1454,10 +1673,239 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
             )
         )
 
+    def _cadf_lite_anchor(self, data):
+        anchors = self._commitment_training_anchors(data)
+        if not anchors:
+            return None
+        return anchors[self._training_step_index() % len(anchors)]
+
+    def _cadf_lite_proposal_mode(self):
+        modes = tuple(getattr(self, 'cadf_lite_proposal_init_modes', ()))
+        if not modes:
+            return 'all_mask'
+        return modes[self._training_step_index() % len(modes)]
+
+    def _cadf_lite_training_proposal(self, data, anchor, mode):
+        mode = str(mode).lower()
+        source_agent = data['agent']
+        num_agents = int(source_agent['token_idx'].shape[0])
+        device = source_agent['token_idx'].device
+        proposal_ids = torch.zeros(
+            num_agents,
+            self.ar_prediction_tokens,
+            dtype=torch.long,
+            device=device,
+        )
+        proposal_confidence = torch.zeros(
+            num_agents,
+            self.ar_prediction_tokens,
+            dtype=torch.float,
+            device=device,
+        )
+
+        if mode == 'all_mask':
+            return proposal_ids, proposal_confidence
+
+        if mode == 'carry_over':
+            proposal_len = max(0, self.ar_prediction_tokens - self.ar_commit_tokens)
+            if proposal_len <= 0:
+                return proposal_ids, proposal_confidence
+            proposal_tokens, proposal_valid = self._source_token_window(
+                source_agent,
+                anchor,
+                proposal_len,
+            )
+            corrupted_ids, corrupted_confidence = self._corrupt_proposal_tokens(
+                proposal_tokens,
+                proposal_valid,
+                source_agent['type'],
+            )
+            proposal_ids[:, :proposal_len] = corrupted_ids
+            proposal_confidence[:, :proposal_len] = corrupted_confidence
+            return proposal_ids, proposal_confidence
+
+        if mode == 'partial_mask':
+            proposal_tokens, proposal_valid = self._source_token_window(
+                source_agent,
+                anchor,
+                self.ar_prediction_tokens,
+            )
+            corrupted_ids, corrupted_confidence = self._corrupt_proposal_tokens(
+                proposal_tokens,
+                proposal_valid,
+                source_agent['type'],
+            )
+            chunk_ids = torch.arange(
+                self.ar_prediction_tokens,
+                device=device,
+            ).unsqueeze(0)
+            keep_mask = (
+                (chunk_ids + int(anchor) + self._training_step_index()) % 2 == 0
+            ).expand_as(proposal_valid)
+            keep_mask = keep_mask & proposal_valid.bool()
+            missing_keep = proposal_valid.any(dim=1) & ~keep_mask.any(dim=1)
+            if missing_keep.any():
+                first_valid = proposal_valid.to(dtype=torch.long).argmax(dim=1)
+                keep_mask[missing_keep, first_valid[missing_keep]] = True
+            proposal_ids[keep_mask] = corrupted_ids[keep_mask]
+            proposal_confidence[keep_mask] = corrupted_confidence[keep_mask]
+            return proposal_ids, proposal_confidence
+
+        raise ValueError(f"Unsupported cadf_lite proposal init mode: {mode}")
+
     def _compute_dense_smart_ce_loss(self, data, ref_tensor):
         if not self._dense_smart_ce_active_for_step():
             return ref_tensor.new_zeros(())
         return self._compute_ntp_loss(self(data))
+
+    def _compute_cadf_lite_local_ntp_loss(
+        self,
+        view,
+        ctx,
+        target_tokens,
+        target_valid,
+        supervision_agents,
+        ref_tensor,
+    ):
+        if float(getattr(self, 'cadf_lite_local_ntp_loss_weight', 0.0)) <= 0.0:
+            return ref_tensor.new_zeros(())
+        if ctx is None or 'x_a_history' not in ctx:
+            return ref_tensor.new_zeros(())
+        history_states = ctx['x_a_history']
+        if history_states.shape[1] < self.ar_history_tokens:
+            return ref_tensor.new_zeros(())
+
+        prefix_state = history_states[:, self.ar_history_tokens - 1]
+        agent_store = view['agent']
+        if 'category' in agent_store:
+            agent_category = agent_store['category']
+        else:
+            agent_category = torch.zeros(
+                prefix_state.shape[0],
+                dtype=torch.long,
+                device=prefix_state.device,
+            )
+        agent_encoder = self.encoder.agent_encoder
+        if hasattr(agent_encoder, 'agent_predict_next'):
+            logits = agent_encoder.agent_predict_next(
+                view,
+                agent_category,
+                prefix_state,
+            )
+        elif hasattr(agent_encoder, 'token_predict_head'):
+            logits = agent_encoder.token_predict_head(prefix_state)
+        else:
+            return ref_tensor.new_zeros(())
+
+        target = target_tokens[:, 0].to(device=logits.device, dtype=torch.long)
+        eval_mask = target_valid[:, 0].to(device=logits.device, dtype=torch.bool)
+        if supervision_agents is not None:
+            eval_mask = eval_mask & supervision_agents.to(
+                device=logits.device,
+                dtype=torch.bool,
+            )
+        eval_mask = eval_mask & (target >= 0) & (target < logits.shape[-1])
+        if not eval_mask.any():
+            return logits.sum() * 0.0
+        return self.cls_loss(logits[eval_mask], target[eval_mask])
+
+    def _compute_cadf_lite_training_loss(self, data, ref_tensor):
+        anchor = self._cadf_lite_anchor(data)
+        if anchor is None:
+            zero = ref_tensor.new_zeros(())
+            return {
+                'diffusion_loss': zero,
+                'mask_acc': zero,
+                'local_ntp_loss': zero,
+                'window_count': 0,
+                'anchor': -1,
+                'proposal_mode': 'none',
+            }
+
+        view, target_tokens, target_valid, _anchor = self._build_ar_training_view(
+            data,
+            anchor_token=anchor,
+            perturb=None,
+            allow_incomplete_window=True,
+        )
+        built = self._build_diffusion_inputs(view, return_context=True)
+        if len(built) == 8:
+            (
+                packed,
+                summary,
+                _ft,
+                _fv,
+                _generation_agents,
+                supervision_agents,
+                _agent_batch,
+                ctx,
+            ) = built
+        else:
+            (
+                packed,
+                summary,
+                _ft,
+                _fv,
+                _generation_agents,
+                supervision_agents,
+                _agent_batch,
+            ) = built
+            ctx = None
+        if packed is None:
+            zero = ref_tensor.new_zeros(())
+            return {
+                'diffusion_loss': zero,
+                'mask_acc': zero,
+                'local_ntp_loss': zero,
+                'window_count': 0,
+                'anchor': int(anchor),
+                'proposal_mode': 'none',
+            }
+
+        proposal_mode = self._cadf_lite_proposal_mode()
+        proposal_ids, proposal_confidence = self._cadf_lite_training_proposal(
+            data,
+            anchor,
+            proposal_mode,
+        )
+        packed_proposal_ids = None
+        packed_proposal_confidence = None
+        if proposal_ids is not None and proposal_confidence is not None:
+            packed_proposal_ids = self._pack_agent_window_values(
+                proposal_ids,
+                packed,
+                fill_value=0,
+            )
+            packed_proposal_confidence = self._pack_agent_window_values(
+                proposal_confidence,
+                packed,
+                fill_value=0.0,
+            )
+
+        diffusion_loss, mask_acc = self._compute_diffusion_loss(
+            packed,
+            summary,
+            forced_mask=packed['valid_mask'],
+            initial_proposal_token_ids=packed_proposal_ids,
+            initial_proposal_confidence=packed_proposal_confidence,
+            loss_normalization='supervision_weight',
+        )
+        local_ntp_loss = self._compute_cadf_lite_local_ntp_loss(
+            view,
+            ctx,
+            target_tokens,
+            target_valid,
+            supervision_agents,
+            diffusion_loss,
+        )
+        return {
+            'diffusion_loss': diffusion_loss,
+            'mask_acc': mask_acc,
+            'local_ntp_loss': local_ntp_loss,
+            'window_count': 1,
+            'anchor': int(anchor),
+            'proposal_mode': proposal_mode,
+        }
 
     def _compute_proposal_carry_training_loss(self, data, ref_tensor):
         if not self._proposal_carry_active_for_step():
@@ -1561,6 +2009,190 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
                 result[seq_idx, start:end] = agent_values[agent_idx]
         return result
 
+    def _unpack_packed_window_values(self, packed_values, packed, num_agents, fill_value=0):
+        extra_shape = tuple(packed_values.shape[2:])
+        result_shape = (num_agents, self.ar_prediction_tokens) + extra_shape
+        if packed_values.dtype == torch.bool:
+            result = torch.full(
+                result_shape,
+                bool(fill_value),
+                dtype=packed_values.dtype,
+                device=packed_values.device,
+            )
+        else:
+            result = torch.full(
+                result_shape,
+                fill_value,
+                dtype=packed_values.dtype,
+                device=packed_values.device,
+            )
+        for _scene_idx, seq_idx, agent_indices in packed['agent_maps']:
+            seq = packed_values[seq_idx]
+            for local_idx, agent_idx in enumerate(agent_indices.tolist()):
+                start = local_idx * self.ar_prediction_tokens
+                end = start + self.ar_prediction_tokens
+                result[agent_idx] = seq[start:end]
+        return result
+
+    def _shifted_training_proposal(self, data, anchor):
+        if int(anchor) <= int(self.ar_history_tokens):
+            return None, None
+        tail_len = self.ar_prediction_tokens - self.ar_commit_tokens
+        if tail_len <= 0:
+            return None, None
+        source_agent = data['agent']
+        proposal_tokens, proposal_valid = self._source_token_window(
+            source_agent,
+            anchor,
+            tail_len,
+        )
+        corrupted_ids, corrupted_confidence = self._corrupt_proposal_tokens(
+            proposal_tokens,
+            proposal_valid,
+            source_agent['type'],
+        )
+        num_agents = int(source_agent['token_idx'].shape[0])
+        proposal_ids = torch.zeros(
+            num_agents,
+            self.ar_prediction_tokens,
+            dtype=torch.long,
+            device=proposal_tokens.device,
+        )
+        proposal_confidence = torch.zeros(
+            num_agents,
+            self.ar_prediction_tokens,
+            dtype=torch.float,
+            device=proposal_tokens.device,
+        )
+        proposal_ids[:, :tail_len] = corrupted_ids
+        proposal_confidence[:, :tail_len] = corrupted_confidence
+        return proposal_ids, proposal_confidence
+
+    def _proposal_shift_consistency_loss(
+        self,
+        previous_logits,
+        current_logits,
+        previous_mask,
+        current_mask,
+    ):
+        tail_len = self.ar_prediction_tokens - self.ar_commit_tokens
+        if tail_len <= 0:
+            return current_logits.sum() * 0.0
+        previous_tail = previous_logits[:, self.ar_commit_tokens:, :]
+        current_head = current_logits[:, :tail_len, :]
+        overlap_mask = (
+            previous_mask[:, self.ar_commit_tokens:].bool()
+            & current_mask[:, :tail_len].bool()
+        )
+        if not overlap_mask.any():
+            return current_logits.sum() * 0.0
+        previous_log_prob = F.log_softmax(previous_tail, dim=-1)
+        current_log_prob = F.log_softmax(current_head, dim=-1)
+        previous_prob = previous_log_prob.exp()
+        current_prob = current_log_prob.exp()
+        symmetric_kl = 0.5 * (
+            previous_prob * (previous_log_prob - current_log_prob)
+            + current_prob * (current_log_prob - previous_log_prob)
+        ).sum(dim=-1)
+        return symmetric_kl[overlap_mask].mean()
+
+    def _compute_commitment_aware_training_loss(self, data, ref_tensor):
+        anchors = self._commitment_training_anchors(data)
+        if not anchors:
+            zero = ref_tensor.new_zeros(())
+            return zero, zero, zero, 0
+
+        num_agents = int(data['agent']['token_idx'].shape[0])
+        losses = []
+        accuracies = []
+        consistency_losses = []
+        previous_logits = None
+        previous_loss_mask = None
+
+        for anchor in anchors:
+            view, _target_tokens, _target_valid, _anchor = self._build_ar_training_view(
+                data,
+                anchor_token=anchor,
+                perturb=None,
+                allow_incomplete_window=True,
+            )
+            (
+                packed,
+                summary,
+                _ft,
+                _fv,
+                _generation_agents,
+                _supervision_agents,
+                _agent_batch,
+            ) = self._build_diffusion_inputs(view)
+            if packed is None:
+                continue
+
+            proposal_ids, proposal_confidence = self._shifted_training_proposal(
+                data,
+                anchor,
+            )
+            packed_proposal_ids = None
+            packed_proposal_confidence = None
+            if proposal_ids is not None and proposal_confidence is not None:
+                packed_proposal_ids = self._pack_agent_window_values(
+                    proposal_ids,
+                    packed,
+                    fill_value=0,
+                )
+                packed_proposal_confidence = self._pack_agent_window_values(
+                    proposal_confidence,
+                    packed,
+                    fill_value=0.0,
+                )
+
+            loss, acc, details = self._compute_diffusion_loss(
+                packed,
+                summary,
+                forced_mask=packed['valid_mask'],
+                initial_proposal_token_ids=packed_proposal_ids,
+                initial_proposal_confidence=packed_proposal_confidence,
+                return_details=True,
+                loss_normalization='supervision_weight',
+            )
+            losses.append(loss)
+            accuracies.append(acc)
+
+            current_logits = self._unpack_packed_window_values(
+                details['logits'],
+                packed,
+                num_agents,
+                fill_value=0.0,
+            )
+            current_loss_mask = self._unpack_packed_window_values(
+                details.get('loss_mask', packed['loss_mask_base']),
+                packed,
+                num_agents,
+                fill_value=False,
+            )
+            if previous_logits is not None and previous_loss_mask is not None:
+                consistency_losses.append(
+                    self._proposal_shift_consistency_loss(
+                        previous_logits,
+                        current_logits,
+                        previous_loss_mask,
+                        current_loss_mask,
+                    )
+                )
+            previous_logits = current_logits
+            previous_loss_mask = current_loss_mask
+
+        if not losses:
+            zero = ref_tensor.new_zeros(())
+            return zero, zero, zero, 0
+        diffusion_loss = torch.stack(losses).mean()
+        mask_acc = torch.stack(accuracies).mean()
+        if consistency_losses:
+            consistency_loss = torch.stack(consistency_losses).mean()
+        else:
+            consistency_loss = diffusion_loss.new_zeros(())
+        return diffusion_loss, mask_acc, consistency_loss, len(losses)
+
     def _next_tail_proposal(self, per_agent_tokens, per_agent_confidence, future_valid, generation_agents):
         tail_len = self.ar_prediction_tokens - self.ar_commit_tokens
         if tail_len <= 0:
@@ -1650,6 +2282,138 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
         del batch_idx
         data = self._prepare_batch(data)
         original_data = data
+        if (
+            getattr(self, 'ar_objective', 'maskgit') == 'maskgit'
+            and getattr(self, 'ar_training_mode', 'window') == 'cadf_lite'
+        ):
+            ref_tensor = data['agent']['token_idx'].new_zeros((), dtype=torch.float)
+            cadf = self._compute_cadf_lite_training_loss(original_data, ref_tensor)
+            if cadf['window_count'] <= 0:
+                zero_loss = self._zero_connected_loss()
+                self.log('train_empty_diffusion_batch', zero_loss.detach().new_ones(()),
+                         prog_bar=False, on_step=True, on_epoch=True, batch_size=1)
+                return zero_loss
+
+            diffusion_loss = cadf['diffusion_loss']
+            mask_acc = cadf['mask_acc']
+            local_ntp_loss = cadf['local_ntp_loss']
+            dense_smart_ce_active = self._dense_smart_ce_active_for_step()
+            dense_smart_ce_loss = self._compute_dense_smart_ce_loss(
+                original_data,
+                diffusion_loss,
+            )
+            proposal_carry_loss = diffusion_loss.new_zeros(())
+            proposal_carry_acc = diffusion_loss.new_zeros(())
+            proposal_carry_active = False
+            ntp_loss = local_ntp_loss
+            loss = (
+                self.diffusion_loss_weight * diffusion_loss
+                + float(getattr(self, 'cadf_lite_local_ntp_loss_weight', 1.0)) * local_ntp_loss
+                + float(getattr(self, 'dense_smart_ce_loss_weight', 0.0)) * dense_smart_ce_loss
+            )
+
+            self.log('train_empty_diffusion_batch', loss.new_zeros(()),
+                     prog_bar=False, on_step=True, on_epoch=True, batch_size=1)
+            self.log('train_loss', loss, prog_bar=True, on_step=True, on_epoch=True,
+                     batch_size=1)
+            self.log('diffusion_loss', diffusion_loss, prog_bar=True, on_step=True, on_epoch=True,
+                     batch_size=1)
+            self.log('ntp_loss', ntp_loss, prog_bar=True, on_step=True, on_epoch=True,
+                     batch_size=1)
+            self.log('cadf_lite_local_ntp_loss', local_ntp_loss, prog_bar=True,
+                     on_step=True, on_epoch=True, batch_size=1)
+            self.log('dense_smart_ce_loss', dense_smart_ce_loss, prog_bar=True,
+                     on_step=True, on_epoch=True, batch_size=1)
+            self.log('train_dense_smart_ce_active',
+                     loss.new_tensor(float(dense_smart_ce_active)),
+                     prog_bar=False, on_step=True, on_epoch=True, batch_size=1)
+            self.log('proposal_carry_loss', proposal_carry_loss, prog_bar=True,
+                     on_step=True, on_epoch=True, batch_size=1)
+            self.log('proposal_carry_acc', proposal_carry_acc, on_step=True,
+                     on_epoch=True, batch_size=1)
+            self.log('train_proposal_carry_active',
+                     loss.new_tensor(float(proposal_carry_active)),
+                     prog_bar=False, on_step=True, on_epoch=True, batch_size=1)
+            self.log('train_cadf_lite_active', loss.new_ones(()),
+                     prog_bar=False, on_step=True, on_epoch=True, batch_size=1)
+            self.log('train_cadf_lite_anchor',
+                     loss.new_tensor(float(cadf['anchor'])),
+                     prog_bar=False, on_step=True, on_epoch=True, batch_size=1)
+            for mode_name in ('all_mask', 'carry_over', 'partial_mask'):
+                self.log(
+                    f'train_cadf_lite_proposal_{mode_name}',
+                    loss.new_tensor(1.0 if cadf['proposal_mode'] == mode_name else 0.0),
+                    prog_bar=False,
+                    on_step=True,
+                    on_epoch=True,
+                    batch_size=1,
+                )
+            self.log('train_commitment_window_count',
+                     loss.new_tensor(float(cadf['window_count'])),
+                     prog_bar=False, on_step=True, on_epoch=True, batch_size=1)
+            self.log('train_mask_acc', mask_acc, on_step=True, on_epoch=True, batch_size=1)
+            return loss
+
+        if (
+            getattr(self, 'ar_objective', 'maskgit') == 'maskgit'
+            and getattr(self, 'ar_training_mode', 'window') == 'commitment_aware'
+            and bool(getattr(self, 'commitment_aware_training', False))
+        ):
+            ref_tensor = data['agent']['token_idx'].new_zeros((), dtype=torch.float)
+            diffusion_loss, mask_acc, shift_consistency_loss, window_count = (
+                self._compute_commitment_aware_training_loss(original_data, ref_tensor)
+            )
+            if window_count <= 0:
+                zero_loss = self._zero_connected_loss()
+                self.log('train_empty_diffusion_batch', zero_loss.detach().new_ones(()),
+                         prog_bar=False, on_step=True, on_epoch=True, batch_size=1)
+                return zero_loss
+
+            dense_smart_ce_active = self._dense_smart_ce_active_for_step()
+            dense_smart_ce_loss = self._compute_dense_smart_ce_loss(
+                original_data,
+                diffusion_loss,
+            )
+            proposal_carry_loss = diffusion_loss.new_zeros(())
+            proposal_carry_acc = diffusion_loss.new_zeros(())
+            proposal_carry_active = False
+            ntp_loss = self._compute_optional_ntp_loss(original_data, diffusion_loss)
+            loss = (
+                self.diffusion_loss_weight * diffusion_loss
+                + self.ntp_aux_loss_weight * ntp_loss
+                + float(getattr(self, 'dense_smart_ce_loss_weight', 0.0)) * dense_smart_ce_loss
+                + float(getattr(self, 'proposal_shift_consistency_loss_weight', 0.0))
+                * shift_consistency_loss
+            )
+
+            self.log('train_empty_diffusion_batch', loss.new_zeros(()),
+                     prog_bar=False, on_step=True, on_epoch=True, batch_size=1)
+            self.log('train_loss', loss, prog_bar=True, on_step=True, on_epoch=True,
+                     batch_size=1)
+            self.log('diffusion_loss', diffusion_loss, prog_bar=True, on_step=True, on_epoch=True,
+                     batch_size=1)
+            self.log('ntp_loss', ntp_loss, prog_bar=True, on_step=True, on_epoch=True,
+                     batch_size=1)
+            self.log('dense_smart_ce_loss', dense_smart_ce_loss, prog_bar=True,
+                     on_step=True, on_epoch=True, batch_size=1)
+            self.log('train_dense_smart_ce_active',
+                     loss.new_tensor(float(dense_smart_ce_active)),
+                     prog_bar=False, on_step=True, on_epoch=True, batch_size=1)
+            self.log('proposal_carry_loss', proposal_carry_loss, prog_bar=True,
+                     on_step=True, on_epoch=True, batch_size=1)
+            self.log('proposal_carry_acc', proposal_carry_acc, on_step=True,
+                     on_epoch=True, batch_size=1)
+            self.log('train_proposal_carry_active',
+                     loss.new_tensor(float(proposal_carry_active)),
+                     prog_bar=False, on_step=True, on_epoch=True, batch_size=1)
+            self.log('proposal_shift_consistency_loss', shift_consistency_loss,
+                     prog_bar=True, on_step=True, on_epoch=True, batch_size=1)
+            self.log('train_commitment_window_count',
+                     loss.new_tensor(float(window_count)),
+                     prog_bar=False, on_step=True, on_epoch=True, batch_size=1)
+            self.log('train_mask_acc', mask_acc, on_step=True, on_epoch=True, batch_size=1)
+            return loss
+
         retokenization = None
         state_mode = 'clean'
         rollout_depth = 0
