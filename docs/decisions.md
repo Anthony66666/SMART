@@ -1,5 +1,12 @@
 # Decisions
 
+## Decision: Throttle AR rerank auxiliary losses for faster training
+- Date: 2026-06-18
+- Context: AR rerank training step was doing three encoder passes by default: the main AR diffusion window, dense original-SMART CE on the full scene, and proposal-carry diffusion on the next window. The latter two are useful auxiliary signals, but running both every step made training much slower than the original SMART-style baseline.
+- Decision: Keep the auxiliary objectives, but make them explicitly scheduled. `dense_smart_ce_interval` and `proposal_carry_interval` gate their execution by global step, and `proposal_carry_detach_encoder` can build the proposal-carry encoder context under `no_grad` while still training the diffusion decoder on that loss. The active rerank train configs use dense CE every 4 steps, proposal carry every 2 steps, and detach the proposal-carry encoder path.
+- Why: This reduces repeated encoder forward/backward work without silently changing the default model semantics or pretending that different original/window/proposal views can share one encoder output.
+- Impact: New AR rerank speed/quality comparisons should report the auxiliary intervals. Default configs that omit these fields keep interval `1` and proposal detach disabled.
+
 ## Decision: Train AR rerank with dense SMART CE plus proposal-carry supervision
 - Date: 2026-06-17
 - Context: The AR rerank variant predicted four tokens but committed one; the three tail tokens only acted as inference-time proposals and were not represented as proposal inputs during training. Random single-window MaskGIT training also meant each scene contributed far less dense next-token supervision than original SMART.

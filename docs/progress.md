@@ -1,5 +1,12 @@
 # Progress
 
+## 2026-06-18 CST
+- Task: Added a fast auxiliary-loss schedule for AR rerank training.
+- Result: `SMARTAutoregressiveDiffusion` now supports `dense_smart_ce_interval`, `proposal_carry_interval`, and `proposal_carry_detach_encoder`. Dense original-SMART CE and proposal-carry diffusion can be skipped on non-interval steps, and proposal-carry input construction can run under `no_grad` while the diffusion decoder loss remains trainable. The AR rerank train configs use dense CE every 4 steps, proposal carry every 2 steps, and detached proposal-carry encoder context.
+- Files: `smart/model/smart_ar_diffusion.py`, AR rerank train configs, `tests/test_smart_ar_diffusion.py`, and durable docs.
+- Validation: Added red/green regressions for dense CE interval skipping, proposal-carry interval skipping, proposal-carry encoder detach, and fast rerank config fields. Focused tests passed after implementation.
+- Next: Run full AR diffusion regression tests and then retrain AR rerank with the fast schedule before judging speed/quality.
+
 ## 2026-06-17 CST
 - Task: Implemented dense SMART CE and proposal-carry training for AR rerank.
 - Result: `smart_ar_diffusion` MaskGIT training can now combine the sampled diffusion-window loss with dense original-SMART next-token CE over the prepared full scene and an auxiliary next-window proposal-carry diffusion loss. Proposal-carry training builds the post-commit window, corrupts the previous window's tail tokens as noisy proposals, injects them into proposal geometry/embedding conditioning, and supervises the whole next window with a forced mask. Causal loss weighting is now an explicit config gate so old AR baseline configs are not changed accidentally.

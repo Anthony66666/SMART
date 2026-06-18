@@ -120,10 +120,13 @@ Model:
     eps: 1.0e-3
     min_t: 1.0e-3
     dense_smart_ce_loss_weight: 1.0
+    dense_smart_ce_interval: 4
     diffusion_loss_weight: 0.25
     ntp_aux_loss_weight: 0
     proposal_carry_training_enabled: true
     proposal_carry_loss_weight: 0.5
+    proposal_carry_interval: 2
+    proposal_carry_detach_encoder: true
     proposal_dropout_prob: 0.3
     proposal_noise_topk: 5
     proposal_confidence: 0.5

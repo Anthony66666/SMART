@@ -28,8 +28,11 @@ def _ar_shell():
     model.diffusion_loss_weight = 1.0
     model.causal_loss_weighting_enabled = False
     model.dense_smart_ce_loss_weight = 0.0
+    model.dense_smart_ce_interval = 1
     model.proposal_carry_training_enabled = False
     model.proposal_carry_loss_weight = 0.0
+    model.proposal_carry_interval = 1
+    model.proposal_carry_detach_encoder = False
     model.proposal_dropout_prob = 0.0
     model.proposal_noise_topk = 5
     model.proposal_confidence = 0.5
@@ -745,6 +748,17 @@ class SMARTAutoregressiveDiffusionTest(unittest.TestCase):
         self.assertIn("map_token_noise:", text)
         self.assertIn("history_context_dropout:", text)
 
+    def test_ar_rerank_training_configs_use_fast_auxiliary_schedule(self):
+        for path in (
+            Path("configs/train/train_scalable_ar_diffusion_rerank.yaml"),
+            Path("configs/train/train_scalable_ar_diffusion_rerank_1000.yaml"),
+            Path("configs/train/train_scalable_ar_diffusion_rerank_local.yaml"),
+        ):
+            text = path.read_text()
+            self.assertIn("dense_smart_ce_interval: 4", text, str(path))
+            self.assertIn("proposal_carry_interval: 2", text, str(path))
+            self.assertIn("proposal_carry_detach_encoder: true", text, str(path))
+
     def test_ar_rerank_server_config_uses_full_server_training_paths(self):
         text = Path("configs/train/train_scalable_ar_diffusion_rerank.yaml").read_text()
 
@@ -1011,6 +1025,106 @@ class SMARTAutoregressiveDiffusionTest(unittest.TestCase):
         self.assertIn("dense_smart_ce_loss", logged)
         self.assertIn("proposal_carry_loss", logged)
         self.assertIn("train_proposal_carry_active", logged)
+
+    def test_dense_smart_ce_interval_skips_full_encoder_forward(self):
+        model = _ar_shell()
+        torch.nn.Module.__init__(model)
+        model.dense_smart_ce_loss_weight = 1.0
+        model.dense_smart_ce_interval = 4
+        model._manual_global_step = 1
+        calls = {"forward": 0}
+
+        def fake_forward(self, batch):
+            calls["forward"] += 1
+            return batch
+
+        model.forward = MethodType(fake_forward, model)
+        model._compute_ntp_loss = MethodType(lambda self, out: torch.tensor(9.0), model)
+
+        loss = model._compute_dense_smart_ce_loss(
+            _toy_sequence(num_agents=1),
+            torch.tensor(2.0),
+        )
+
+        self.assertEqual(float(loss), 0.0)
+        self.assertEqual(calls["forward"], 0)
+
+    def test_proposal_carry_interval_skips_auxiliary_view_build(self):
+        model = _ar_shell()
+        model.ar_objective = "maskgit"
+        model.proposal_carry_training_enabled = True
+        model.proposal_carry_loss_weight = 0.5
+        model.proposal_carry_interval = 2
+        model._manual_global_step = 1
+
+        def fail_build(self, batch):
+            raise AssertionError("proposal carry view should not be built on skipped steps")
+
+        model._build_proposal_carry_training_view = MethodType(fail_build, model)
+
+        loss, acc, active = model._compute_proposal_carry_training_loss(
+            _toy_sequence(num_agents=1),
+            torch.tensor(2.0),
+        )
+
+        self.assertEqual(float(loss), 0.0)
+        self.assertEqual(float(acc), 0.0)
+        self.assertFalse(active)
+
+    def test_proposal_carry_detach_encoder_keeps_decoder_loss_grad_enabled(self):
+        model = _ar_shell()
+        model.ar_objective = "maskgit"
+        model.proposal_carry_training_enabled = True
+        model.proposal_carry_loss_weight = 0.5
+        model.proposal_carry_interval = 1
+        model.proposal_carry_detach_encoder = True
+        data = _toy_sequence(num_agents=1, num_tokens=18, num_frames=91)
+        build_grad_modes = []
+        loss_grad_modes = []
+
+        def fake_build_view(self, batch):
+            return batch.clone(), torch.ones(1, 4, dtype=torch.long), torch.ones(1, 4), 2
+
+        def fake_build_inputs(self, batch):
+            build_grad_modes.append(torch.is_grad_enabled())
+            return (
+                {
+                    "token_ids": torch.zeros(1, 4, dtype=torch.long),
+                    "valid_mask": torch.ones(1, 4, dtype=torch.bool),
+                    "chunk_ids": torch.arange(4).unsqueeze(0),
+                },
+                torch.zeros(1, 1),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+
+        def fake_pack(self, values, packed, fill_value=0):
+            del packed, fill_value
+            return values
+
+        def fake_loss(self, packed, summary, **kwargs):
+            del packed, summary, kwargs
+            loss_grad_modes.append(torch.is_grad_enabled())
+            return torch.tensor(6.0, requires_grad=True), torch.tensor(0.75)
+
+        model._build_proposal_carry_training_view = MethodType(fake_build_view, model)
+        model._build_diffusion_inputs = MethodType(fake_build_inputs, model)
+        model._pack_agent_window_values = MethodType(fake_pack, model)
+        model._compute_diffusion_loss = MethodType(fake_loss, model)
+
+        loss, acc, active = model._compute_proposal_carry_training_loss(
+            data,
+            torch.tensor(2.0),
+        )
+
+        self.assertTrue(active)
+        self.assertEqual(float(loss), 6.0)
+        self.assertEqual(float(acc), 0.75)
+        self.assertEqual(build_grad_modes, [False])
+        self.assertEqual(loss_grad_modes, [True])
 
     def test_select_closed_loop_anchor_reserves_rollout_and_prediction_room(self):
         model = _ar_shell()

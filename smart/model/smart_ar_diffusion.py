@@ -41,12 +41,23 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
             0.0,
             float(getattr(diffusion_cfg, 'dense_smart_ce_loss_weight', 0.0)),
         )
+        self.dense_smart_ce_interval = max(
+            1,
+            int(getattr(diffusion_cfg, 'dense_smart_ce_interval', 1)),
+        )
         self.proposal_carry_training_enabled = bool(
             getattr(diffusion_cfg, 'proposal_carry_training_enabled', False)
         )
         self.proposal_carry_loss_weight = max(
             0.0,
             float(getattr(diffusion_cfg, 'proposal_carry_loss_weight', 0.0)),
+        )
+        self.proposal_carry_interval = max(
+            1,
+            int(getattr(diffusion_cfg, 'proposal_carry_interval', 1)),
+        )
+        self.proposal_carry_detach_encoder = bool(
+            getattr(diffusion_cfg, 'proposal_carry_detach_encoder', False)
         )
         self.proposal_dropout_prob = min(
             1.0,
@@ -1410,23 +1421,72 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
             self._perturb_ar_history_state(view)
         return view, target_tokens, target_valid, anchor
 
+    def _training_step_index(self) -> int:
+        manual_step = getattr(self, '_manual_global_step', None)
+        if manual_step is not None:
+            return max(0, int(manual_step))
+        try:
+            return max(0, int(getattr(self, 'global_step', 0)))
+        except Exception:
+            return 0
+
+    def _should_run_training_interval(self, interval) -> bool:
+        interval = max(1, int(interval))
+        if interval <= 1:
+            return True
+        return self._training_step_index() % interval == 0
+
+    def _dense_smart_ce_active_for_step(self) -> bool:
+        return (
+            float(getattr(self, 'dense_smart_ce_loss_weight', 0.0)) > 0.0
+            and self._should_run_training_interval(
+                getattr(self, 'dense_smart_ce_interval', 1)
+            )
+        )
+
+    def _proposal_carry_active_for_step(self) -> bool:
+        return (
+            getattr(self, 'ar_objective', 'maskgit') == 'maskgit'
+            and bool(getattr(self, 'proposal_carry_training_enabled', False))
+            and float(getattr(self, 'proposal_carry_loss_weight', 0.0)) > 0.0
+            and self._should_run_training_interval(
+                getattr(self, 'proposal_carry_interval', 1)
+            )
+        )
+
     def _compute_dense_smart_ce_loss(self, data, ref_tensor):
-        if float(getattr(self, 'dense_smart_ce_loss_weight', 0.0)) <= 0.0:
+        if not self._dense_smart_ce_active_for_step():
             return ref_tensor.new_zeros(())
         return self._compute_ntp_loss(self(data))
 
     def _compute_proposal_carry_training_loss(self, data, ref_tensor):
-        if (
-            getattr(self, 'ar_objective', 'maskgit') != 'maskgit'
-            or not bool(getattr(self, 'proposal_carry_training_enabled', False))
-            or float(getattr(self, 'proposal_carry_loss_weight', 0.0)) <= 0.0
-        ):
+        if not self._proposal_carry_active_for_step():
             return ref_tensor.new_zeros(()), ref_tensor.new_zeros(()), False
         built = self._build_proposal_carry_training_view(data)
         if built is None:
             return ref_tensor.new_zeros(()), ref_tensor.new_zeros(()), False
         view, proposal_ids, proposal_confidence, _anchor = built
-        packed, summary, _ft, _fv, _generation_agents, _supervision_agents, _agent_batch = self._build_diffusion_inputs(view)
+        if bool(getattr(self, 'proposal_carry_detach_encoder', False)):
+            with torch.no_grad():
+                (
+                    packed,
+                    summary,
+                    _ft,
+                    _fv,
+                    _generation_agents,
+                    _supervision_agents,
+                    _agent_batch,
+                ) = self._build_diffusion_inputs(view)
+        else:
+            (
+                packed,
+                summary,
+                _ft,
+                _fv,
+                _generation_agents,
+                _supervision_agents,
+                _agent_batch,
+            ) = self._build_diffusion_inputs(view)
         if packed is None:
             return ref_tensor.new_zeros(()), ref_tensor.new_zeros(()), False
         packed_proposal_ids = self._pack_agent_window_values(
@@ -1611,6 +1671,7 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
                 packed[key] = self._pack_agent_window_values(values, packed)
 
         diffusion_loss, mask_acc = self._compute_diffusion_loss(packed, summary)
+        dense_smart_ce_active = self._dense_smart_ce_active_for_step()
         dense_smart_ce_loss = self._compute_dense_smart_ce_loss(
             original_data,
             diffusion_loss,
@@ -1636,6 +1697,9 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
                  batch_size=1)
         self.log('dense_smart_ce_loss', dense_smart_ce_loss, prog_bar=True,
                  on_step=True, on_epoch=True, batch_size=1)
+        self.log('train_dense_smart_ce_active',
+                 loss.new_tensor(float(dense_smart_ce_active)),
+                 prog_bar=False, on_step=True, on_epoch=True, batch_size=1)
         self.log('proposal_carry_loss', proposal_carry_loss, prog_bar=True,
                  on_step=True, on_epoch=True, batch_size=1)
         self.log('proposal_carry_acc', proposal_carry_acc, on_step=True,
