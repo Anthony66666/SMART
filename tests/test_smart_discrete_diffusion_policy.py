@@ -23,7 +23,7 @@ def _policy_shell():
     model.ar_total_rollout_steps = 80
     model.diffusion_num_steps = 8
     model.diffusion_loss_weight = 0.25
-    model.ntp_aux_loss_weight = 1.0
+    model.ntp_aux_loss_weight = 0.0
     model.discrete_policy_overlap_loss_weight = 0.05
     model.discrete_policy_span_tokens = 3
     model.discrete_policy_chunk_loss_weights = (1.0, 0.3, 0.15, 0.075)
@@ -167,8 +167,11 @@ class SMARTDiscreteDiffusionPolicyTest(unittest.TestCase):
             test_case.assertTrue(kwargs["return_details"])
             test_case.assertIsNone(kwargs.get("initial_proposal_token_ids"))
             test_case.assertIsNone(kwargs.get("initial_proposal_confidence"))
+            logits = torch.full((1, self.ar_prediction_tokens, 8), -4.0)
+            for chunk_idx in range(self.ar_prediction_tokens):
+                logits[0, chunk_idx, int(packed["token_ids"][0, chunk_idx])] = 4.0
             details = {
-                "logits": torch.zeros(1, self.ar_prediction_tokens, 8),
+                "logits": logits,
                 "loss_mask": packed["loss_mask_base"].clone(),
             }
             return torch.tensor(2.0), torch.tensor(0.25), details
@@ -191,12 +194,24 @@ class SMARTDiscreteDiffusionPolicyTest(unittest.TestCase):
         self.assertEqual(result["window_count"], 3)
         self.assertAlmostEqual(float(result["chunk_loss"]), 2.0, places=5)
         self.assertAlmostEqual(float(result["overlap_loss"]), 0.4, places=5)
+        self.assertEqual(tuple(result["chunk_x0_losses"].shape), (4,))
+        self.assertEqual(tuple(result["chunk_acc"].shape), (4,))
+        self.assertTrue(torch.all(result["chunk_x0_losses"] < 0.01))
+        self.assertTrue(torch.allclose(result["chunk_acc"], torch.ones(4)))
+        self.assertEqual(int(result["supervised_tokens"].item()), 11)
+        self.assertEqual(int(result["valid_tokens"].item()), 11)
 
-    def test_training_step_combines_smart_ntp_chunk_and_overlap_losses(self):
+    def test_training_step_uses_only_diffusion_chunk_and_overlap_losses(self):
         model = _policy_shell()
         torch.nn.Module.__init__(model)
         model._prepare_batch = MethodType(lambda self, batch: batch, model)
-        model.log = MethodType(lambda self, *args, **kwargs: None, model)
+        logged = {}
+
+        def fake_log(self, name, value, **kwargs):
+            del kwargs
+            logged[name] = value
+
+        model.log = MethodType(fake_log, model)
 
         def fake_chunk(self, batch, ref_tensor):
             del batch, ref_tensor
@@ -204,19 +219,32 @@ class SMARTDiscreteDiffusionPolicyTest(unittest.TestCase):
                 "chunk_loss": torch.tensor(2.0),
                 "mask_acc": torch.tensor(0.5),
                 "overlap_loss": torch.tensor(3.0),
+                "chunk_x0_losses": torch.tensor([2.0, 3.0, 4.0, 5.0]),
+                "chunk_acc": torch.tensor([0.1, 0.2, 0.3, 0.4]),
+                "valid_tokens": torch.tensor(8.0),
+                "supervised_tokens": torch.tensor(8.0),
                 "window_count": 2,
             }
 
-        def fake_ntp(self, batch, ref_tensor):
-            del batch, ref_tensor
-            return torch.tensor(5.0)
+        def fail_ntp(*args, **kwargs):
+            del args, kwargs
+            raise AssertionError("SMART NTP CE must not run for pure diffusion policy")
 
         model._compute_discrete_policy_training_loss = MethodType(fake_chunk, model)
-        model._compute_discrete_policy_smart_ntp_loss = MethodType(fake_ntp, model)
+        model._compute_discrete_policy_smart_ntp_loss = MethodType(fail_ntp, model)
 
         loss = model.training_step(_toy_sequence(num_agents=1), 0)
 
-        self.assertAlmostEqual(float(loss), 5.65, places=5)
+        self.assertAlmostEqual(float(loss), 0.65, places=5)
+        self.assertIn("loss_x0_chunk0", logged)
+        self.assertIn("loss_x0_chunk1", logged)
+        self.assertIn("loss_x0_chunk2", logged)
+        self.assertIn("loss_x0_chunk3", logged)
+        self.assertIn("chunk0_acc", logged)
+        self.assertIn("chunk1_acc", logged)
+        self.assertIn("chunk2_acc", logged)
+        self.assertIn("chunk3_acc", logged)
+        self.assertNotIn("smart_ntp_loss", logged)
 
 
 class SMARTDiscreteDiffusionPolicyConfigTest(unittest.TestCase):
@@ -234,13 +262,26 @@ class SMARTDiscreteDiffusionPolicyConfigTest(unittest.TestCase):
         self.assertEqual(cfg.Model.hidden_dim, 64)
         self.assertEqual(cfg.Model.decoder.num_map_layers, 0)
         self.assertEqual(cfg.Model.decoder.num_agent_layers, 1)
-        self.assertEqual(cfg.Model.diffusion.discrete_policy_objective, "chunk_rerank_v1")
+        self.assertEqual(cfg.Model.diffusion.discrete_policy_objective, "pure_chunk_v1")
         self.assertEqual(cfg.Model.diffusion.num_layers, 1)
-        self.assertEqual(cfg.Model.diffusion.ntp_aux_loss_weight, 1.0)
+        self.assertEqual(cfg.Model.diffusion.ntp_aux_loss_weight, 0.0)
+        self.assertFalse(cfg.Model.diffusion.use_smart_ntp_head)
+        self.assertFalse(cfg.Model.diffusion.use_smart_prior_fusion)
+        self.assertFalse(cfg.Model.diffusion.proposal_memory.enabled)
+        self.assertFalse(cfg.Model.diffusion.temporal_ensemble.enabled)
+        self.assertFalse(cfg.Model.diffusion.sampling_guidance.enabled)
+        self.assertEqual(cfg.Model.diffusion.prediction_horizon, 4)
+        self.assertEqual(cfg.Model.diffusion.execution_horizon, 1)
         self.assertEqual(cfg.Model.diffusion.commit_tokens, 1)
         self.assertFalse(cfg.Model.diffusion.carry_tail_proposal)
+        self.assertEqual(cfg.Model.diffusion.discrete_policy_candidate_count, 1)
+        self.assertFalse(cfg.Model.diffusion.discrete_policy_candidate_score_enabled)
         self.assertFalse(cfg.Model.diffusion.use_map_context)
         self.assertFalse(cfg.Model.diffusion.use_agent_context)
+        self.assertEqual(
+            list(cfg.Model.diffusion.chunk_loss_weights),
+            [1.0, 0.3, 0.15, 0.075],
+        )
         self.assertEqual(
             list(cfg.Model.diffusion.causal_loss_weights),
             [1.0, 0.3, 0.15, 0.075],

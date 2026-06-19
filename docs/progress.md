@@ -1,6 +1,12 @@
 # Progress
 
 ## 2026-06-19 CST
+- Task: Converted `smart_discrete_diffusion_policy` from SMART-prior-plus-rerank training to a pure diffusion-policy chunk objective.
+- Result: Removed the dense SMART NTP CE second forward from `SMARTDiscreteDiffusionPolicy.training_step`, kept chunk-weighted forced full-window x0 CE and optional overlap KL, added per-horizon `loss_x0_chunk0..3`, `chunk0_acc..3`, `loss_overlap`, and supervision-coverage logs, and added shape/mask assertions so the denoiser supervises every valid target in each window.
+- Config: Updated train/smoke/validation configs to `discrete_policy_objective: pure_chunk_v1`, `ntp_aux_loss_weight: 0.0`, `use_smart_ntp_head: false`, `use_smart_prior_fusion: false`, `proposal_memory.enabled: false`, `temporal_ensemble.enabled: false`, `sampling_guidance.enabled: false`, `prediction_horizon: 4`, `execution_horizon: 1`, `chunk_loss_weights: [1.0, 0.3, 0.15, 0.075]`, `overlap_loss_weight: 0.05`, and single-sample/no-energy inference.
+- Validation: Added regressions that fail if training calls SMART NTP CE, if per-chunk metrics are missing, if terminal PAD windows count invalid targets, or if local discrete-policy config re-enables SMART prior/memory/guidance/rerank semantics.
+
+## 2026-06-19 CST
 - Task: Completed the local 2000-step smoke run for `smart_discrete_diffusion_policy`.
 - Result: Updated `configs/train/train_scalable_discrete_diffusion_policy_2000.yaml` into a tiny local smoke config using `data/valid_demo`, reduced model layers/context, global step-based validation, and the same discrete-policy training terms: dense SMART NTP, chunk-weighted four-token diffusion CE, and overlap KL.
 - Run: `python -u train.py --config configs/train/train_scalable_discrete_diffusion_policy_2000.yaml --save_ckpt_path checkpoints/discrete_diffusion_policy_2000` reached `max_steps=2000`, ran one validation batch, and wrote the current smoke checkpoint to `checkpoints/discrete_diffusion_policy_2000/last.ckpt` (`global_step=2000`, `epoch=181`, `hidden_dim=64`). A stale full-config checkpoint in the same directory was preserved as `last_full_config_2000.ckpt`.

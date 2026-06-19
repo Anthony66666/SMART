@@ -1,5 +1,12 @@
 # Decisions
 
+## Decision: Make discrete diffusion-policy a pure chunk denoising objective
+- Date: 2026-06-19
+- Context: The first discrete diffusion-policy branch still used dense original SMART next-token CE as an auxiliary prior and sampled/reranked multiple candidate windows. That restored SMART supervision but added an extra full SMART forward and made the ablation less clean.
+- Decision: Switch active `smart_discrete_diffusion_policy` configs to `discrete_policy_objective: pure_chunk_v1`. Training now uses only the diffusion denoiser's forced full-window x0 CE with horizon weights `[1.0, 0.3, 0.15, 0.075]` plus optional overlap KL. The original SMART NTP head/prior fusion, proposal memory, temporal ensembling, sampling guidance, and candidate energy rerank are all disabled by config and guarded in the model constructor.
+- Why: This isolates whether a conditional discrete diffusion denoiser can learn a useful four-token lookahead policy without paying for the second SMART NTP forward or depending on inference-time hand reranking.
+- Impact: The model logs `loss_x0_chunk0..3`, `chunk0_acc..3`, `loss_overlap`, and dense-supervision token coverage. Old checkpoints/configs with `ntp_aux_loss_weight > 0` are stale for this pure-objective comparison.
+
 ## Decision: Add discrete diffusion-policy as discard-tail candidate reranking
 - Date: 2026-06-19
 - Context: The ACT-style discrete branch uses overlapping tail proposals through temporal voting, while the continuous diffusion-policy branch moves the action representation out of SMART token space. The user wanted a discrete version closer to diffusion policy sampling: predict a four-token candidate action window, use the whole window for scoring, but execute only the first token.

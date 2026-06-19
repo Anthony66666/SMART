@@ -86,20 +86,30 @@ Model:
     pl2a_radius: 30
     time_span: 30
   diffusion:
-    discrete_policy_objective: chunk_rerank_v1
+    discrete_policy_objective: pure_chunk_v1
     ar_objective: maskgit
     causal_temporal_edges: true
     future_chunk_steps: 5
     history_tokens: 2
     prediction_tokens: 4
+    prediction_horizon: 4
     commit_tokens: 1
+    execution_horizon: 1
     carry_tail_proposal: false
+    use_smart_ntp_head: false
+    use_smart_prior_fusion: false
+    proposal_memory:
+      enabled: false
+    temporal_ensemble:
+      enabled: false
     ar_training_mode: discrete_policy
     discrete_policy_span_tokens: 2
+    chunk_loss_weights: [1.0, 0.3, 0.15, 0.075]
     discrete_policy_chunk_loss_weights: [1.0, 0.3, 0.15, 0.075]
+    overlap_loss_weight: 0.05
     discrete_policy_overlap_loss_weight: 0.05
-    discrete_policy_candidate_count: 4
-    discrete_policy_candidate_score_enabled: true
+    discrete_policy_candidate_count: 1
+    discrete_policy_candidate_score_enabled: false
     discrete_policy_candidate_energy_weight: 1.0
     discrete_policy_candidate_chunk_weights: [1.0, 0.3, 0.15, 0.075]
     causal_noise_schedule: false
@@ -142,7 +152,7 @@ Model:
     dense_smart_ce_loss_weight: 0.0
     dense_smart_ce_interval: 1
     diffusion_loss_weight: 0.25
-    ntp_aux_loss_weight: 1.0
+    ntp_aux_loss_weight: 0.0
     proposal_carry_training_enabled: false
     proposal_carry_loss_weight: 0.0
     proposal_carry_interval: 2

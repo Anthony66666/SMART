@@ -12,12 +12,12 @@ class SMARTDiscreteDiffusionPolicy(SMARTAutoregressiveDiffusion):
         super().__init__(model_config)
         diffusion_cfg = getattr(model_config, 'diffusion', None)
         objective = str(
-            getattr(diffusion_cfg, 'discrete_policy_objective', 'chunk_rerank_v1')
+            getattr(diffusion_cfg, 'discrete_policy_objective', 'pure_chunk_v1')
         ).lower()
-        if objective != 'chunk_rerank_v1':
+        if objective not in ('pure_chunk_v1', 'chunk_rerank_v1'):
             raise ValueError(
                 "SMARTDiscreteDiffusionPolicy supports only "
-                "diffusion.discrete_policy_objective: chunk_rerank_v1."
+                "diffusion.discrete_policy_objective: pure_chunk_v1."
             )
         if self.ar_commit_tokens != 1:
             raise ValueError(
@@ -28,10 +28,48 @@ class SMARTDiscreteDiffusionPolicy(SMARTAutoregressiveDiffusion):
                 "SMARTDiscreteDiffusionPolicy discards tail chunks at inference; "
                 "set diffusion.carry_tail_proposal: false."
             )
-        if self.ntp_aux_loss_weight <= 0.0:
+        prediction_horizon = int(
+            getattr(diffusion_cfg, 'prediction_horizon', self.ar_prediction_tokens)
+        )
+        execution_horizon = int(
+            getattr(diffusion_cfg, 'execution_horizon', self.ar_commit_tokens)
+        )
+        if prediction_horizon != self.ar_prediction_tokens:
             raise ValueError(
-                "SMARTDiscreteDiffusionPolicy requires ntp_aux_loss_weight > 0 "
-                "for the dense SMART next-token CE prior."
+                "diffusion.prediction_horizon must match diffusion.prediction_tokens "
+                "for SMARTDiscreteDiffusionPolicy."
+            )
+        if execution_horizon != self.ar_commit_tokens:
+            raise ValueError(
+                "diffusion.execution_horizon must match diffusion.commit_tokens "
+                "for SMARTDiscreteDiffusionPolicy."
+            )
+        if bool(getattr(diffusion_cfg, 'use_smart_ntp_head', False)):
+            raise ValueError(
+                "SMARTDiscreteDiffusionPolicy is a pure diffusion-policy objective; "
+                "set diffusion.use_smart_ntp_head: false."
+            )
+        if bool(getattr(diffusion_cfg, 'use_smart_prior_fusion', False)):
+            raise ValueError(
+                "SMARTDiscreteDiffusionPolicy does not fuse the original SMART "
+                "prior; set diffusion.use_smart_prior_fusion: false."
+            )
+        if self.ntp_aux_loss_weight > 0.0:
+            raise ValueError(
+                "SMARTDiscreteDiffusionPolicy no longer runs dense SMART NTP CE; "
+                "set diffusion.ntp_aux_loss_weight: 0.0."
+            )
+        proposal_memory_cfg = getattr(diffusion_cfg, 'proposal_memory', None)
+        if bool(getattr(proposal_memory_cfg, 'enabled', False)):
+            raise ValueError(
+                "SMARTDiscreteDiffusionPolicy discards tail chunks; set "
+                "diffusion.proposal_memory.enabled: false."
+            )
+        temporal_ensemble_cfg = getattr(diffusion_cfg, 'temporal_ensemble', None)
+        if bool(getattr(temporal_ensemble_cfg, 'enabled', False)):
+            raise ValueError(
+                "SMARTDiscreteDiffusionPolicy does not ensemble overlapping tails; "
+                "set diffusion.temporal_ensemble.enabled: false."
             )
 
         self.discrete_policy_span_tokens = int(
@@ -41,8 +79,12 @@ class SMARTDiscreteDiffusionPolicy(SMARTAutoregressiveDiffusion):
             float(value)
             for value in getattr(
                 diffusion_cfg,
-                'discrete_policy_chunk_loss_weights',
-                getattr(diffusion_cfg, 'causal_loss_weights', (1.0, 0.3, 0.15, 0.075)),
+                'chunk_loss_weights',
+                getattr(
+                    diffusion_cfg,
+                    'discrete_policy_chunk_loss_weights',
+                    getattr(diffusion_cfg, 'causal_loss_weights', (1.0, 0.3, 0.15, 0.075)),
+                ),
             )
         )
         if len(chunk_weights) != self.ar_prediction_tokens:
@@ -55,7 +97,13 @@ class SMARTDiscreteDiffusionPolicy(SMARTAutoregressiveDiffusion):
         self.causal_loss_weights = chunk_weights
         self.discrete_policy_overlap_loss_weight = max(
             0.0,
-            float(getattr(diffusion_cfg, 'discrete_policy_overlap_loss_weight', 0.05)),
+            float(
+                getattr(
+                    diffusion_cfg,
+                    'overlap_loss_weight',
+                    getattr(diffusion_cfg, 'discrete_policy_overlap_loss_weight', 0.05),
+                )
+            ),
         )
         self.discrete_policy_candidate_count = max(
             1,
@@ -99,11 +147,6 @@ class SMARTDiscreteDiffusionPolicy(SMARTAutoregressiveDiffusion):
         start = self._training_step_index() % start_limit
         return anchors[start:start + span]
 
-    def _compute_discrete_policy_smart_ntp_loss(self, data, ref_tensor):
-        if self.ntp_aux_loss_weight <= 0.0:
-            return ref_tensor.new_zeros(())
-        return self._compute_ntp_loss(self(data))
-
     def _discrete_policy_overlap_loss(
         self,
         source_logits,
@@ -134,20 +177,88 @@ class SMARTDiscreteDiffusionPolicy(SMARTAutoregressiveDiffusion):
         ).sum(dim=-1)
         return kl.mean()
 
+    def _discrete_policy_chunk_metrics(self, packed, details):
+        logits = details['logits']
+        target = packed['token_ids']
+        if logits.shape[:-1] != target.shape:
+            raise AssertionError(
+                "Discrete policy logits must have shape "
+                "[batch, sequence, vocab] matching packed token ids."
+            )
+        chunk_ids = packed['chunk_ids'].to(device=target.device, dtype=torch.long)
+        if chunk_ids.shape != target.shape:
+            raise AssertionError(
+                "Discrete policy chunk ids must match packed token id shape."
+            )
+        valid_mask = packed['valid_mask'].to(device=target.device, dtype=torch.bool)
+        loss_mask_base = packed.get('loss_mask_base', valid_mask).to(
+            device=target.device,
+            dtype=torch.bool,
+        ) & valid_mask
+        loss_mask = details.get('loss_mask', loss_mask_base).to(
+            device=target.device,
+            dtype=torch.bool,
+        )
+        expected_loss_mask = loss_mask_base
+        if not torch.equal(loss_mask, expected_loss_mask):
+            raise AssertionError(
+                "Discrete policy training must supervise every valid target in "
+                "the current window; expected forced full-window loss mask."
+            )
+
+        log_prob = F.log_softmax(logits, dim=-1)
+        nll = -log_prob.gather(-1, target.unsqueeze(-1)).squeeze(-1)
+        pred = logits.argmax(dim=-1)
+        chunk_losses = []
+        chunk_acc = []
+        chunk_valid_counts = []
+        chunk_supervised_counts = []
+        for chunk_idx in range(self.ar_prediction_tokens):
+            chunk_mask = chunk_ids == chunk_idx
+            valid = loss_mask & chunk_mask
+            valid_count = (valid_mask & chunk_mask).to(dtype=logits.dtype).sum()
+            supervised_count = valid.to(dtype=logits.dtype).sum()
+            chunk_valid_counts.append(valid_count)
+            chunk_supervised_counts.append(supervised_count)
+            if bool(valid.any()):
+                chunk_losses.append(nll[valid].mean())
+                chunk_acc.append((pred[valid] == target[valid]).float().mean())
+            else:
+                chunk_losses.append(logits.sum() * 0.0)
+                chunk_acc.append(logits.new_zeros(()))
+        return {
+            'chunk_x0_losses': torch.stack(chunk_losses),
+            'chunk_acc': torch.stack(chunk_acc),
+            'chunk_valid_counts': torch.stack(chunk_valid_counts),
+            'chunk_supervised_counts': torch.stack(chunk_supervised_counts),
+            'valid_tokens': torch.stack(chunk_valid_counts).sum(),
+            'supervised_tokens': torch.stack(chunk_supervised_counts).sum(),
+        }
+
     def _compute_discrete_policy_training_loss(self, data, ref_tensor):
         anchors = self._discrete_policy_training_anchors(data)
         if not anchors:
             zero = ref_tensor.new_zeros(())
+            zero_chunks = zero.repeat(int(getattr(self, 'ar_prediction_tokens', 4)))
             return {
                 'chunk_loss': zero,
                 'mask_acc': zero,
                 'overlap_loss': zero,
+                'chunk_x0_losses': zero_chunks,
+                'chunk_acc': zero_chunks,
+                'valid_tokens': zero,
+                'supervised_tokens': zero,
                 'window_count': 0,
             }
 
         num_agents = int(data['agent']['token_idx'].shape[0])
         losses = []
         accuracies = []
+        chunk_losses = []
+        chunk_accuracies = []
+        chunk_supervised_counts = []
+        valid_token_counts = []
+        supervised_token_counts = []
         window_records = {}
 
         for anchor in anchors:
@@ -178,6 +289,12 @@ class SMARTDiscreteDiffusionPolicy(SMARTAutoregressiveDiffusion):
             )
             losses.append(loss)
             accuracies.append(acc)
+            chunk_metrics = self._discrete_policy_chunk_metrics(packed, details)
+            chunk_losses.append(chunk_metrics['chunk_x0_losses'])
+            chunk_accuracies.append(chunk_metrics['chunk_acc'])
+            chunk_supervised_counts.append(chunk_metrics['chunk_supervised_counts'])
+            valid_token_counts.append(chunk_metrics['valid_tokens'])
+            supervised_token_counts.append(chunk_metrics['supervised_tokens'])
             window_records[int(anchor)] = {
                 'logits': self._unpack_packed_window_values(
                     details['logits'],
@@ -195,10 +312,15 @@ class SMARTDiscreteDiffusionPolicy(SMARTAutoregressiveDiffusion):
 
         if not losses:
             zero = ref_tensor.new_zeros(())
+            zero_chunks = zero.repeat(int(getattr(self, 'ar_prediction_tokens', 4)))
             return {
                 'chunk_loss': zero,
                 'mask_acc': zero,
                 'overlap_loss': zero,
+                'chunk_x0_losses': zero_chunks,
+                'chunk_acc': zero_chunks,
+                'valid_tokens': zero,
+                'supervised_tokens': zero,
                 'window_count': 0,
             }
 
@@ -227,10 +349,23 @@ class SMARTDiscreteDiffusionPolicy(SMARTAutoregressiveDiffusion):
             overlap_loss = torch.stack(overlap_losses).mean()
         else:
             overlap_loss = chunk_loss.new_zeros(())
+        chunk_loss_stack = torch.stack(chunk_losses, dim=0)
+        chunk_acc_stack = torch.stack(chunk_accuracies, dim=0)
+        chunk_count_stack = torch.stack(chunk_supervised_counts, dim=0)
+        chunk_count_sum = chunk_count_stack.sum(dim=0)
+        chunk_count_denominator = chunk_count_sum.clamp_min(1.0)
         return {
             'chunk_loss': chunk_loss,
             'mask_acc': mask_acc,
             'overlap_loss': overlap_loss,
+            'chunk_x0_losses': (
+                chunk_loss_stack * chunk_count_stack
+            ).sum(dim=0) / chunk_count_denominator,
+            'chunk_acc': (
+                chunk_acc_stack * chunk_count_stack
+            ).sum(dim=0) / chunk_count_denominator,
+            'valid_tokens': torch.stack(valid_token_counts).sum(),
+            'supervised_tokens': torch.stack(supervised_token_counts).sum(),
             'window_count': len(losses),
         }
 
@@ -251,13 +386,8 @@ class SMARTDiscreteDiffusionPolicy(SMARTAutoregressiveDiffusion):
             )
             return zero_loss
 
-        smart_ntp_loss = self._compute_discrete_policy_smart_ntp_loss(
-            data,
-            policy['chunk_loss'],
-        )
         loss = (
-            self.ntp_aux_loss_weight * smart_ntp_loss
-            + self.diffusion_loss_weight * policy['chunk_loss']
+            self.diffusion_loss_weight * policy['chunk_loss']
             + self.discrete_policy_overlap_loss_weight * policy['overlap_loss']
         )
 
@@ -265,16 +395,58 @@ class SMARTDiscreteDiffusionPolicy(SMARTAutoregressiveDiffusion):
                  prog_bar=False, on_step=True, on_epoch=True, batch_size=1)
         self.log('train_loss', loss, prog_bar=True, on_step=True, on_epoch=True,
                  batch_size=1)
-        self.log('smart_ntp_loss', smart_ntp_loss, prog_bar=True,
-                 on_step=True, on_epoch=True, batch_size=1)
         self.log('diffusion_loss', policy['chunk_loss'], prog_bar=True,
                  on_step=True, on_epoch=True, batch_size=1)
         self.log('discrete_policy_chunk_loss', policy['chunk_loss'],
                  prog_bar=True, on_step=True, on_epoch=True, batch_size=1)
         self.log('discrete_policy_overlap_loss', policy['overlap_loss'],
                  prog_bar=True, on_step=True, on_epoch=True, batch_size=1)
+        self.log('loss_overlap', policy['overlap_loss'],
+                 prog_bar=False, on_step=True, on_epoch=True, batch_size=1)
         self.log('train_mask_acc', policy['mask_acc'],
                  on_step=True, on_epoch=True, batch_size=1)
+        for chunk_idx in range(int(getattr(self, 'ar_prediction_tokens', 4))):
+            self.log(
+                f'loss_x0_chunk{chunk_idx}',
+                policy['chunk_x0_losses'][chunk_idx],
+                prog_bar=False,
+                on_step=True,
+                on_epoch=True,
+                batch_size=1,
+            )
+            self.log(
+                f'chunk{chunk_idx}_acc',
+                policy['chunk_acc'][chunk_idx],
+                prog_bar=False,
+                on_step=True,
+                on_epoch=True,
+                batch_size=1,
+            )
+        self.log(
+            'train_discrete_policy_valid_tokens',
+            policy['valid_tokens'],
+            prog_bar=False,
+            on_step=True,
+            on_epoch=True,
+            batch_size=1,
+        )
+        self.log(
+            'train_discrete_policy_supervised_tokens',
+            policy['supervised_tokens'],
+            prog_bar=False,
+            on_step=True,
+            on_epoch=True,
+            batch_size=1,
+        )
+        coverage = policy['supervised_tokens'] / policy['valid_tokens'].clamp_min(1.0)
+        self.log(
+            'train_discrete_policy_supervision_coverage',
+            coverage,
+            prog_bar=False,
+            on_step=True,
+            on_epoch=True,
+            batch_size=1,
+        )
         self.log(
             'train_discrete_policy_window_count',
             loss.new_tensor(float(policy['window_count'])),

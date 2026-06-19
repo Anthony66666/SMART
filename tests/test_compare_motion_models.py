@@ -68,7 +68,7 @@ class CompareMotionModelsTest(unittest.TestCase):
             ),
             "configs/train/train_scalable_discrete_diffusion_policy_2000.yaml": (
                 "smart_discrete_diffusion_policy",
-                "chunk_rerank_v1",
+                "pure_chunk_v1",
             ),
         }
         for path, (predictor, objective) in expected.items():
@@ -85,6 +85,16 @@ class CompareMotionModelsTest(unittest.TestCase):
                     self.assertEqual(cfg.Model.diffusion.num_layers, 1)
                     self.assertFalse(cfg.Model.diffusion.use_map_context)
                     self.assertFalse(cfg.Model.diffusion.use_agent_context)
+                    self.assertEqual(cfg.Model.diffusion.ntp_aux_loss_weight, 0.0)
+                    self.assertFalse(cfg.Model.diffusion.use_smart_ntp_head)
+                    self.assertFalse(cfg.Model.diffusion.use_smart_prior_fusion)
+                    self.assertFalse(cfg.Model.diffusion.proposal_memory.enabled)
+                    self.assertFalse(cfg.Model.diffusion.temporal_ensemble.enabled)
+                    self.assertFalse(cfg.Model.diffusion.sampling_guidance.enabled)
+                    self.assertEqual(cfg.Model.diffusion.prediction_horizon, 4)
+                    self.assertEqual(cfg.Model.diffusion.execution_horizon, 1)
+                    self.assertEqual(cfg.Model.diffusion.discrete_policy_candidate_count, 1)
+                    self.assertFalse(cfg.Model.diffusion.discrete_policy_candidate_score_enabled)
                 else:
                     self.assertEqual(cfg.Dataset.train_raw_dir, [TRAIN_DIR])
                     self.assertEqual(cfg.Dataset.val_raw_dir, [VAL_DIR])
