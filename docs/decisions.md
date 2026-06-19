@@ -363,3 +363,10 @@
 - Decision: Keep speed-reference state local to the sampling/packed guidance path rather than mutating `data`. During physical retokenization, advance heading only when the decoded token has a non-zero final displacement, mirroring the non-physical path's norm guard.
 - Why: Validation/inference callers should be able to reuse input batches without hidden new keys. Retokenization should not accumulate arbitrary heading changes from stationary token boxes.
 - Impact: AR rerank checkpoints remain loadable, but future retokenized training views can differ for zero-displacement tokens. Retrain before judging late-horizon map adherence against older runs.
+
+## Decision: Add ACT-style action-chunk temporal ensembling as a separate AR ablation
+- Date: 2026-06-19
+- Context: The AR rerank path predicts a four-token window but either commits only chunk 0 or uses tail chunks as proposal conditioning. That does not directly test the ACT/ALOHA idea where overlapping action chunks all vote on the action executed at the current step.
+- Decision: Add `smart_action_chunk_diffusion` as an additive subclass of `SMARTAutoregressiveDiffusion`. Training reuses the cadf_lite AR window objective, but the 1000-step config disables tail proposal carry/conditioning, disables dense full-sequence SMART CE replay for speed, and supervises all four chunk slots equally. Inference keeps an overlapping chunk memory and commits a discrete token by confidence-weighted temporal voting over `P_t[0]`, `P_{t-1}[1]`, `P_{t-2}[2]`, and `P_{t-3}[3]`.
+- Why: This isolates temporal ensemble from proposal conditioning and sampling-time safe-speed rerank, making the ablation closer to ACT-style receding action chunks while preserving SMART token interfaces.
+- Impact: Use `configs/train/train_scalable_ar_action_chunk_1000.yaml` for the local 1000-step run and `configs/validation/validation_scalable_ar_action_chunk.yaml` for checkpoint validation.

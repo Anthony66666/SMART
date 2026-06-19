@@ -30,6 +30,7 @@ from smart.model import (
     SMARTDiffusion,
     SMARTEmbeddedLanguageFlow,
     SMARTHybridDiffusion,
+    SMARTActionChunkDiffusion,
 )
 from smart.transforms import WaymoTargetBuilder
 from smart.utils.config import load_config_act
@@ -45,6 +46,7 @@ PREDICTORS = {
     "smart_causal_flow_matching": SMARTCausalFlowMatching,
     "smart_elf": SMARTEmbeddedLanguageFlow,
     "smart_hybrid_diffusion": SMARTHybridDiffusion,
+    "smart_action_chunk_diffusion": SMARTActionChunkDiffusion,
 }
 
 

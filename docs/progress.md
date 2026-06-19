@@ -1,5 +1,13 @@
 # Progress
 
+## 2026-06-19 CST
+- Task: Added an ACT/ALOHA-style action-chunk AR diffusion ablation.
+- Result: Added `smart_action_chunk_diffusion`, which reuses `SMARTAutoregressiveDiffusion` training and sampling but overrides commit selection with temporal ensembling across overlapping four-token windows. The new 1000-step config disables tail proposal carry/conditioning and dense full-sequence SMART CE replay, supervises all chunk slots equally, keeps cadf_lite single-window training with local NTP, and writes validation/step visualizations under `outputs/val_ar_action_chunk_1000` and `outputs/step_ar_action_chunk_1000`.
+- Files: `smart/model/smart_action_chunk_diffusion.py`, `smart/model/smart_ar_diffusion.py`, predictor registries, action-chunk train/validation configs, `tests/test_smart_action_chunk_diffusion.py`, `tests/test_compare_motion_models.py`, and durable docs.
+- Validation: Added regressions for overlapping tail-token temporal voting and config invariants. Focused action-chunk tests, 1000-step config tests, AR diffusion regressions, py_compile, and config construction smoke passed locally. The local 1000-step run completed under `checkpoints/ar_action_chunk_1000/last.ckpt`; TensorBoard `version_90` recorded `val_minADE=3.2032`, `val_minFDE=11.4179`, `val_ar_window_loss=1.3118`, and `val_ar_window_mask_acc=0.1866`.
+- Outputs: Generated 4 validation PNGs under `outputs/val_ar_action_chunk_1000/smart_action_chunk_diffusion/epoch_001/` and 4 step PNGs under `outputs/step_ar_action_chunk_1000/smart_action_chunk_diffusion/step_001000/`; all opened as 1440x1440 RGBA images.
+- Next: Inspect the eight PNGs and compare the checkpoint against AR baseline/rerank, causal diffusion, flow matching, ELF, and hybrid on a larger fixed validation slice.
+
 ## 2026-06-18 CST
 - Task: Replaced active AR rerank all-anchor training with a single-forward cadf_lite path.
 - Result: `SMARTAutoregressiveDiffusion` now supports `ar_training_mode: cadf_lite`: each non-replay step selects one deterministic future anchor, uses a terminal-safe PAD window, force-masks valid chunks with commit-primary weights, computes local chunk0 NTP CE from the same encoder context, and cycles all-mask/carry-over proposal initialization. Active rerank train configs disable explicit shift KL and replay full-sequence SMART CE every 8 steps.

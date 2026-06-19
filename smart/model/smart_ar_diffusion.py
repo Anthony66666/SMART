@@ -2669,6 +2669,21 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
                     confidence[agent_idx] = seq_conf[start:end]
         return tokens, confidence
 
+    def _select_ar_committed_tokens(
+        self,
+        per_agent_tokens,
+        per_agent_confidence,
+        window_valid,
+        generation_agents,
+        round_idx,
+        rounds,
+    ):
+        del window_valid, generation_agents, round_idx, rounds
+        return (
+            per_agent_tokens[:, :self.ar_commit_tokens],
+            per_agent_confidence[:, :self.ar_commit_tokens],
+        )
+
     def _decode_token_sequence(self, token_ids, token_valid, agent_types, start_pos, start_heading):
         num_agents, num_tokens = token_ids.shape
         device = token_ids.device
@@ -2898,8 +2913,14 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
                 packed,
                 num_agents,
             )
-            committed_tokens = per_agent_tokens[:, :self.ar_commit_tokens]
-            committed_confidence = per_agent_confidence[:, :self.ar_commit_tokens]
+            committed_tokens, committed_confidence = self._select_ar_committed_tokens(
+                per_agent_tokens,
+                per_agent_confidence,
+                fv,
+                generation_agents,
+                round_idx,
+                rounds,
+            )
             committed_valid = fv[:, :self.ar_commit_tokens].bool() & generation_agents[:, None]
             commit_traj, commit_head, commit_valid_frames, commit_token_pos, commit_token_heading, current_pos, current_heading = self._decode_token_sequence(
                 committed_tokens,
