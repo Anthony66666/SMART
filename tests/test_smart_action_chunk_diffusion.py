@@ -14,6 +14,7 @@ def _action_chunk_shell():
     model.action_chunk_temporal_ensemble_enabled = True
     model.action_chunk_temporal_ensemble_decay = 0.8
     model.action_chunk_temporal_ensemble_confidence_floor = 1.0e-4
+    model.action_chunk_shift_consistency_temperature = 1.0
     model._reset_action_chunk_ensemble()
     return model
 
@@ -52,6 +53,76 @@ class SMARTActionChunkDiffusionTemporalEnsembleTest(unittest.TestCase):
         self.assertTrue(torch.equal(committed1, torch.tensor([[42]])))
         self.assertGreater(float(confidence1[0, 0]), float(round1_confidence[0, 0]))
 
+    def test_shift_consistency_penalizes_mismatched_overlap_distributions(self):
+        model = _action_chunk_shell()
+        current_logits = torch.zeros(2, 4, 5)
+        next_logits = torch.zeros(2, 4, 5)
+        current_valid = torch.ones(2, 4, dtype=torch.bool)
+        next_valid = torch.ones(2, 4, dtype=torch.bool)
+        current_agent_ids = torch.tensor([3, 7])
+        next_agent_ids = torch.tensor([7, 3])
+
+        current_logits[0, 1, 1] = 8.0
+        next_logits[1, 0, 1] = 8.0
+        current_logits[1, 1, 2] = 8.0
+        next_logits[0, 0, 4] = 8.0
+
+        loss = model._action_chunk_shift_consistency_loss_from_logits(
+            current_logits,
+            current_valid,
+            current_agent_ids,
+            next_logits,
+            next_valid,
+            next_agent_ids,
+        )
+
+        self.assertGreater(float(loss), 0.5)
+
+        next_logits[0, 0] = current_logits[1, 1]
+        matched_loss = model._action_chunk_shift_consistency_loss_from_logits(
+            current_logits,
+            current_valid,
+            current_agent_ids,
+            next_logits,
+            next_valid,
+            next_agent_ids,
+        )
+
+        self.assertLess(float(matched_loss), float(loss))
+
+    def test_shift_consistency_aligns_packed_rows_by_scene_id(self):
+        model = _action_chunk_shell()
+        current_logits = torch.zeros(2, 2, 5)
+        next_logits = torch.zeros(2, 2, 5)
+        current_valid = torch.ones(2, 2, dtype=torch.bool)
+        next_valid = torch.ones(2, 2, dtype=torch.bool)
+        current_agent_ids = torch.tensor([[1, 1], [9, 9]])
+        next_agent_ids = torch.tensor([[9, 9], [1, 1]])
+        current_chunk_ids = torch.tensor([[0, 1], [0, 1]])
+        next_chunk_ids = torch.tensor([[0, 1], [0, 1]])
+        current_scene_ids = torch.tensor([10, 20])
+        next_scene_ids = torch.tensor([20, 10])
+
+        current_logits[0, 1, 3] = 8.0
+        next_logits[1, 0, 3] = 8.0
+        current_logits[1, 1, 2] = 8.0
+        next_logits[0, 0, 2] = 8.0
+
+        loss = model._action_chunk_shift_consistency_loss_from_logits(
+            current_logits,
+            current_valid,
+            current_agent_ids,
+            next_logits,
+            next_valid,
+            next_agent_ids,
+            current_chunk_ids,
+            next_chunk_ids,
+            current_scene_ids,
+            next_scene_ids,
+        )
+
+        self.assertLess(float(loss), 1.0e-3)
+
 
 class SMARTActionChunkDiffusionConfigTest(unittest.TestCase):
     def test_1000_step_config_selects_action_chunk_predictor(self):
@@ -67,7 +138,11 @@ class SMARTActionChunkDiffusionConfigTest(unittest.TestCase):
         self.assertEqual(config.Model.diffusion.temporal_ensemble_decay, 0.8)
         self.assertFalse(config.Model.diffusion.carry_tail_proposal)
         self.assertFalse(config.Model.diffusion.proposal_conditioning_enabled)
-        self.assertEqual(config.Model.diffusion.dense_smart_ce_loss_weight, 0.0)
+        self.assertEqual(config.Model.diffusion.dense_smart_ce_loss_weight, 1.0)
+        self.assertEqual(
+            config.Model.diffusion.action_chunk_shift_consistency_loss_weight,
+            0.1,
+        )
         self.assertEqual(config.Model.diffusion.causal_loss_weights, [1.0, 1.0, 1.0, 1.0])
         self.assertEqual(
             config.Visualization.output_dir,
@@ -76,6 +151,28 @@ class SMARTActionChunkDiffusionConfigTest(unittest.TestCase):
         self.assertEqual(
             config.Visualization.step_viz.output_dir,
             "./outputs/step_ar_action_chunk_1000",
+        )
+
+    def test_server_config_enables_action_chunk_quality_priors(self):
+        config = load_config_act(
+            "configs/train/train_scalable_ar_action_chunk.yaml"
+        )
+
+        self.assertEqual(config.Model.predictor, "smart_action_chunk_diffusion")
+        self.assertEqual(config.Trainer.devices, 14)
+        self.assertEqual(config.Dataset.train_raw_dir, ["/raid/haoq_lab/wangshijie/data/waymo/training"])
+        self.assertTrue(config.Model.diffusion.temporal_ensemble_enabled)
+        self.assertFalse(config.Model.diffusion.carry_tail_proposal)
+        self.assertFalse(config.Model.diffusion.proposal_conditioning_enabled)
+        self.assertEqual(config.Model.diffusion.dense_smart_ce_loss_weight, 1.0)
+        self.assertEqual(config.Model.diffusion.dense_smart_ce_interval, 8)
+        self.assertEqual(
+            config.Model.diffusion.action_chunk_shift_consistency_loss_weight,
+            0.1,
+        )
+        self.assertEqual(
+            config.Model.diffusion.action_chunk_shift_consistency_interval,
+            2,
         )
 
 

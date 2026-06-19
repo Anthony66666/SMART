@@ -1,8 +1,15 @@
 # Progress
 
 ## 2026-06-19 CST
+- Task: Stabilized action-chunk AR diffusion after weak server-training quality.
+- Result: Restored interval dense SMART CE replay in action-chunk training, added an action-chunk-only adjacent-window shift-consistency auxiliary loss, aligned consistency comparisons by scene id / agent id / shifted chunk id, and added a full server training config at `configs/train/train_scalable_ar_action_chunk.yaml`.
+- Files: `smart/model/smart_action_chunk_diffusion.py`, `smart/model/smart_ar_diffusion.py`, action-chunk train configs, `tests/test_smart_action_chunk_diffusion.py`, and durable docs.
+- Validation: Added red/green regressions for overlap KL behavior, packed scene-row alignment, local/server config invariants, and action-chunk temporal voting. Focused action-chunk tests passed locally.
+- Next: Retrain action-chunk from scratch before comparing quality; previous `checkpoints/ar_action_chunk_1000/last.ckpt` predates these training changes.
+
+## 2026-06-19 CST
 - Task: Added an ACT/ALOHA-style action-chunk AR diffusion ablation.
-- Result: Added `smart_action_chunk_diffusion`, which reuses `SMARTAutoregressiveDiffusion` training and sampling but overrides commit selection with temporal ensembling across overlapping four-token windows. The new 1000-step config disables tail proposal carry/conditioning and dense full-sequence SMART CE replay, supervises all chunk slots equally, keeps cadf_lite single-window training with local NTP, and writes validation/step visualizations under `outputs/val_ar_action_chunk_1000` and `outputs/step_ar_action_chunk_1000`.
+- Result: Added `smart_action_chunk_diffusion`, which reuses `SMARTAutoregressiveDiffusion` training and sampling but overrides commit selection with temporal ensembling across overlapping four-token windows. The initial 1000-step config disabled tail proposal carry/conditioning and dense full-sequence SMART CE replay, supervised all chunk slots equally, kept cadf_lite single-window training with local NTP, and wrote validation/step visualizations under `outputs/val_ar_action_chunk_1000` and `outputs/step_ar_action_chunk_1000`.
 - Files: `smart/model/smart_action_chunk_diffusion.py`, `smart/model/smart_ar_diffusion.py`, predictor registries, action-chunk train/validation configs, `tests/test_smart_action_chunk_diffusion.py`, `tests/test_compare_motion_models.py`, and durable docs.
 - Validation: Added regressions for overlapping tail-token temporal voting and config invariants. Focused action-chunk tests, 1000-step config tests, AR diffusion regressions, py_compile, and config construction smoke passed locally. The local 1000-step run completed under `checkpoints/ar_action_chunk_1000/last.ckpt`; TensorBoard `version_90` recorded `val_minADE=3.2032`, `val_minFDE=11.4179`, `val_ar_window_loss=1.3118`, and `val_ar_window_mask_acc=0.1866`.
 - Outputs: Generated 4 validation PNGs under `outputs/val_ar_action_chunk_1000/smart_action_chunk_diffusion/epoch_001/` and 4 step PNGs under `outputs/step_ar_action_chunk_1000/smart_action_chunk_diffusion/step_001000/`; all opened as 1440x1440 RGBA images.

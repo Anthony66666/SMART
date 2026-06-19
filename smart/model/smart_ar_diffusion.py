@@ -1809,6 +1809,23 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
             return logits.sum() * 0.0
         return self.cls_loss(logits[eval_mask], target[eval_mask])
 
+    def _cadf_lite_auxiliary_requires_details(self):
+        return False
+
+    def _compute_cadf_lite_auxiliary_loss(
+        self,
+        data,
+        anchor,
+        packed,
+        summary,
+        diffusion_details,
+        ref_tensor,
+    ):
+        del data, anchor, packed, summary, diffusion_details
+        return {
+            'auxiliary_loss': ref_tensor.new_zeros(()),
+        }
+
     def _compute_cadf_lite_training_loss(self, data, ref_tensor):
         anchor = self._cadf_lite_anchor(data)
         if anchor is None:
@@ -1817,6 +1834,7 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
                 'diffusion_loss': zero,
                 'mask_acc': zero,
                 'local_ntp_loss': zero,
+                'auxiliary_loss': zero,
                 'window_count': 0,
                 'anchor': -1,
                 'proposal_mode': 'none',
@@ -1857,6 +1875,7 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
                 'diffusion_loss': zero,
                 'mask_acc': zero,
                 'local_ntp_loss': zero,
+                'auxiliary_loss': zero,
                 'window_count': 0,
                 'anchor': int(anchor),
                 'proposal_mode': 'none',
@@ -1882,14 +1901,21 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
                 fill_value=0.0,
             )
 
-        diffusion_loss, mask_acc = self._compute_diffusion_loss(
+        return_details = bool(self._cadf_lite_auxiliary_requires_details())
+        diffusion_result = self._compute_diffusion_loss(
             packed,
             summary,
             forced_mask=packed['valid_mask'],
             initial_proposal_token_ids=packed_proposal_ids,
             initial_proposal_confidence=packed_proposal_confidence,
+            return_details=return_details,
             loss_normalization='supervision_weight',
         )
+        if return_details:
+            diffusion_loss, mask_acc, diffusion_details = diffusion_result
+        else:
+            diffusion_loss, mask_acc = diffusion_result
+            diffusion_details = None
         local_ntp_loss = self._compute_cadf_lite_local_ntp_loss(
             view,
             ctx,
@@ -1898,13 +1924,27 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
             supervision_agents,
             diffusion_loss,
         )
+        auxiliary = self._compute_cadf_lite_auxiliary_loss(
+            data,
+            anchor,
+            packed,
+            summary,
+            diffusion_details,
+            diffusion_loss,
+        )
+        auxiliary_loss = auxiliary.pop(
+            'auxiliary_loss',
+            diffusion_loss.new_zeros(()),
+        )
         return {
             'diffusion_loss': diffusion_loss,
             'mask_acc': mask_acc,
             'local_ntp_loss': local_ntp_loss,
+            'auxiliary_loss': auxiliary_loss,
             'window_count': 1,
             'anchor': int(anchor),
             'proposal_mode': proposal_mode,
+            **auxiliary,
         }
 
     def _compute_proposal_carry_training_loss(self, data, ref_tensor):
@@ -2297,6 +2337,10 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
             diffusion_loss = cadf['diffusion_loss']
             mask_acc = cadf['mask_acc']
             local_ntp_loss = cadf['local_ntp_loss']
+            auxiliary_loss = cadf.get(
+                'auxiliary_loss',
+                diffusion_loss.new_zeros(()),
+            )
             dense_smart_ce_active = self._dense_smart_ce_active_for_step()
             dense_smart_ce_loss = self._compute_dense_smart_ce_loss(
                 original_data,
@@ -2310,6 +2354,7 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
                 self.diffusion_loss_weight * diffusion_loss
                 + float(getattr(self, 'cadf_lite_local_ntp_loss_weight', 1.0)) * local_ntp_loss
                 + float(getattr(self, 'dense_smart_ce_loss_weight', 0.0)) * dense_smart_ce_loss
+                + auxiliary_loss
             )
 
             self.log('train_empty_diffusion_batch', loss.new_zeros(()),
@@ -2324,9 +2369,30 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
                      on_step=True, on_epoch=True, batch_size=1)
             self.log('dense_smart_ce_loss', dense_smart_ce_loss, prog_bar=True,
                      on_step=True, on_epoch=True, batch_size=1)
+            self.log('cadf_lite_auxiliary_loss', auxiliary_loss, prog_bar=True,
+                     on_step=True, on_epoch=True, batch_size=1)
             self.log('train_dense_smart_ce_active',
                      loss.new_tensor(float(dense_smart_ce_active)),
                      prog_bar=False, on_step=True, on_epoch=True, batch_size=1)
+            if 'action_chunk_shift_consistency_loss' in cadf:
+                self.log(
+                    'action_chunk_shift_consistency_loss',
+                    cadf['action_chunk_shift_consistency_loss'],
+                    prog_bar=True,
+                    on_step=True,
+                    on_epoch=True,
+                    batch_size=1,
+                )
+                self.log(
+                    'train_action_chunk_shift_consistency_active',
+                    loss.new_tensor(
+                        float(cadf.get('action_chunk_shift_consistency_active', False))
+                    ),
+                    prog_bar=False,
+                    on_step=True,
+                    on_epoch=True,
+                    batch_size=1,
+                )
             self.log('proposal_carry_loss', proposal_carry_loss, prog_bar=True,
                      on_step=True, on_epoch=True, batch_size=1)
             self.log('proposal_carry_acc', proposal_carry_acc, on_step=True,
