@@ -529,6 +529,19 @@ class SMARTDiscreteDiffusionPolicyTest(unittest.TestCase):
 
 
 class SMARTDiscreteDiffusionPolicyConfigTest(unittest.TestCase):
+    def test_server_config_uses_v100_mixed_precision_discrete_policy(self):
+        cfg = load_config_act(
+            "configs/train/train_scalable_discrete_diffusion_policy.yaml"
+        )
+
+        self.assertEqual(cfg.Model.predictor, "smart_discrete_diffusion_policy")
+        self.assertEqual(cfg.Trainer.devices, 14)
+        self.assertEqual(cfg.Trainer.strategy, "ddp_find_unused_parameters_true")
+        self.assertEqual(cfg.Trainer.precision, "16-mixed")
+        self.assertEqual(cfg.Dataset.train_batch_size, 4)
+        self.assertEqual(cfg.Model.diffusion.discrete_policy_objective, "pure_chunk_v1")
+        self.assertTrue(cfg.Model.diffusion.discrete_policy_batched_multi_anchor)
+
     def test_2000_step_config_selects_discrete_policy_predictor(self):
         cfg = load_config_act(
             "configs/train/train_scalable_discrete_diffusion_policy_2000.yaml"

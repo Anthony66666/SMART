@@ -33,7 +33,7 @@ Trainer:
   num_nodes: 1
   mode:
   ckpt_path:
-  precision: 32
+  precision: "16-mixed"
   accumulate_grad_batches: 1
   limit_val_batches: 8
   check_val_every_n_epoch: 1

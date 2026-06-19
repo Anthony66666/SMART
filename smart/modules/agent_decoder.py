@@ -143,13 +143,17 @@ class SMARTAgentDecoder(nn.Module):
         self.agent_token_emb_cyc = self.token_emb_cyc(trajectory_token_cyc.view(trajectory_token_cyc.shape[0], -1))
 
         if inference:
-            agent_token_traj_all = torch.zeros((num_agent, self.token_size, self.shift + 1, 4, 2), device=pos_a.device)
             trajectory_token_all_veh = torch.from_numpy(self.trajectory_token_all['veh']).clone().to(pos_a.device).to(
                 torch.float)
             trajectory_token_all_ped = torch.from_numpy(self.trajectory_token_all['ped']).clone().to(pos_a.device).to(
                 torch.float)
             trajectory_token_all_cyc = torch.from_numpy(self.trajectory_token_all['cyc']).clone().to(pos_a.device).to(
                 torch.float)
+            agent_token_traj_all = torch.zeros(
+                (num_agent, self.token_size, self.shift + 1, 4, 2),
+                device=pos_a.device,
+                dtype=trajectory_token_all_veh.dtype,
+            )
             agent_token_traj_all[veh_mask] = torch.cat(
                 [trajectory_token_all_veh[:, :self.shift], trajectory_token_veh[:, None, ...]], dim=1)
             agent_token_traj_all[ped_mask] = torch.cat(
@@ -157,12 +161,16 @@ class SMARTAgentDecoder(nn.Module):
             agent_token_traj_all[cyc_mask] = torch.cat(
                 [trajectory_token_all_cyc[:, :self.shift], trajectory_token_cyc[:, None, ...]], dim=1)
 
-        agent_token_emb = torch.zeros((num_agent, num_step, self.hidden_dim), device=pos_a.device)
+        agent_token_emb = self.agent_token_emb_veh.new_zeros((num_agent, num_step, self.hidden_dim))
         agent_token_emb[veh_mask] = self.agent_token_emb_veh[agent_token_index[veh_mask]]
         agent_token_emb[ped_mask] = self.agent_token_emb_ped[agent_token_index[ped_mask]]
         agent_token_emb[cyc_mask] = self.agent_token_emb_cyc[agent_token_index[cyc_mask]]
 
-        agent_token_traj = torch.zeros((num_agent, num_step, self.token_size, 4, 2), device=pos_a.device)
+        agent_token_traj = torch.zeros(
+            (num_agent, num_step, self.token_size, 4, 2),
+            device=pos_a.device,
+            dtype=trajectory_token_veh.dtype,
+        )
         agent_token_traj[veh_mask] = trajectory_token_veh
         agent_token_traj[ped_mask] = trajectory_token_ped
         agent_token_traj[cyc_mask] = trajectory_token_cyc

@@ -1,6 +1,13 @@
 # Progress
 
 ## 2026-06-20 CST
+- Task: Fixed the SMART agent token embedding crash under `16-mixed` / AMP training.
+- Result: `SMARTAgentDecoder.agent_token_embedding()` now allocates the packed token-embedding buffer from the token embedding output dtype instead of default FP32, so autocast FP16 token embeddings can be indexed back into the agent-token tensor without dtype mismatch. Inference trajectory-token buffers also allocate with their source trajectory-token dtype. The full server discrete diffusion-policy config now uses `Trainer.precision: "16-mixed"` while keeping `train_batch_size: 4`.
+- Files: `smart/modules/agent_decoder.py`, `configs/train/train_scalable_discrete_diffusion_policy.yaml`, `tests/test_agent_decoder_history_context.py`, `tests/test_smart_discrete_diffusion_policy.py`, `docs/progress.md`, `docs/next.md`
+- Validation: Added a regression that forces token embeddings to FP16 and calls the real `agent_token_embedding()` inference path; it failed on the previous FP32 buffer and now passes. Added a server-config regression that failed while precision was `32` and now requires `16-mixed`. Related agent-decoder, discrete-policy, compare-model tests and py_compile passed locally.
+- Next: Retry the server `16-mixed` discrete diffusion-policy run. If another AMP error appears, inspect the next scratch tensor created with default `torch.zeros(...)` in that stack.
+
+## 2026-06-20 CST
 - Task: Added batched multi-anchor training for `smart_discrete_diffusion_policy`.
 - Result: Replaced the default per-anchor training loop with a batched anchor-view path: selected anchors are converted into `(scene, anchor)` graph samples, packed into one PyG batch, and passed through one diffusion input/loss call. Each anchor keeps its own teacher-forced history context; the implementation does not reuse a stale single `h_t` across anchors.
 - Config: Enabled `discrete_policy_batched_multi_anchor: true` and set `self_condition_prob: 0.0` in discrete-policy train/smoke/validation configs so span supervision does not trigger repeated no-grad denoiser self-conditioning.
