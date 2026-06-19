@@ -688,3 +688,10 @@
 - Files: `smart/model/smart_discrete_diffusion_policy.py`, `tests/test_smart_discrete_diffusion_policy.py`, `docs/progress.md`, `docs/next.md`
 - Validation: Real `data/valid_demo` training smoke ran `training_step` plus `backward` with loss `4.662879943847656`; `tests.test_smart_discrete_diffusion_policy` and `tests.test_compare_motion_models` passed; `py_compile` and `git diff --check` passed.
 - Next: Retry the local or server discrete diffusion-policy run after this anchor-view batching fix.
+
+## 2026-06-20 CST
+- Task: Reduced discrete diffusion-policy batched multi-anchor training overhead.
+- Result: Batched `training_step()` no longer prepares the original batch before anchor batching; only the merged anchor batch is map-token prepared. Batched overlap KL now uses tensor key matching with `torch.searchsorted` instead of Python dict/list loops while preserving the shifted `p_t^k -> p_{t+k}^0` target semantics.
+- Files: `smart/model/smart_discrete_diffusion_policy.py`, `tests/test_smart_discrete_diffusion_policy.py`, `docs/progress.md`, `docs/next.md`
+- Validation: Real `data/valid_demo` training smoke ran `training_step` plus `backward` with loss `4.834183216094971`; `tests.test_smart_discrete_diffusion_policy` and `tests.test_compare_motion_models` passed; `py_compile` and `git diff --check` passed.
+- Next: Retrain or rerun a short server throughput smoke with this optimized discrete-policy path before comparing wall-clock speed.

@@ -1,7 +1,9 @@
 import unittest
 from types import MethodType, SimpleNamespace
+from unittest.mock import patch
 
 import torch
+import torch.nn.functional as F
 from torch_geometric.data import Batch, HeteroData
 
 from smart.model.smart_discrete_diffusion_policy import SMARTDiscreteDiffusionPolicy
@@ -405,6 +407,125 @@ class SMARTDiscreteDiffusionPolicyTest(unittest.TestCase):
         self.assertIn("chunk2_acc", logged)
         self.assertIn("chunk3_acc", logged)
         self.assertNotIn("smart_ntp_loss", logged)
+
+    def test_batched_training_step_skips_initial_batch_prepare(self):
+        model = _policy_shell()
+        torch.nn.Module.__init__(model)
+        data = _toy_sequence(num_agents=1)
+        logged = {}
+        test_case = self
+
+        def fail_prepare(self, batch):
+            del self, batch
+            raise AssertionError("batched discrete policy should prepare only the merged anchor batch")
+
+        def fake_log(self, name, value, **kwargs):
+            del kwargs
+            logged[name] = value
+
+        def fake_chunk(self, batch, ref_tensor):
+            test_case.assertIs(batch, data)
+            test_case.assertEqual(ref_tensor.dtype, torch.float)
+            return {
+                "chunk_loss": torch.tensor(2.0),
+                "mask_acc": torch.tensor(0.5),
+                "overlap_loss": torch.tensor(3.0),
+                "chunk_x0_losses": torch.tensor([2.0, 3.0, 4.0, 5.0]),
+                "chunk_acc": torch.tensor([0.1, 0.2, 0.3, 0.4]),
+                "valid_tokens": torch.tensor(8.0),
+                "supervised_tokens": torch.tensor(8.0),
+                "window_count": 2,
+            }
+
+        model._prepare_batch = MethodType(fail_prepare, model)
+        model.log = MethodType(fake_log, model)
+        model._compute_discrete_policy_training_loss = MethodType(fake_chunk, model)
+
+        loss = model.training_step(data, 0)
+
+        self.assertAlmostEqual(float(loss), 0.65, places=5)
+        self.assertIn("train_discrete_policy_window_count", logged)
+
+    def test_non_batched_training_step_still_prepares_input_batch(self):
+        model = _policy_shell()
+        torch.nn.Module.__init__(model)
+        model.discrete_policy_batched_multi_anchor = False
+        data = _toy_sequence(num_agents=1)
+        prepare_calls = []
+        test_case = self
+
+        def fake_prepare(self, batch):
+            prepare_calls.append(batch)
+            batch["agent"]["prepared_marker"] = torch.ones(1, dtype=torch.bool)
+            return batch
+
+        def fake_log(self, name, value, **kwargs):
+            del self, name, value, kwargs
+
+        def fake_chunk(self, batch, ref_tensor):
+            test_case.assertIn("prepared_marker", batch["agent"])
+            return {
+                "chunk_loss": ref_tensor.new_tensor(2.0),
+                "mask_acc": ref_tensor.new_tensor(0.5),
+                "overlap_loss": ref_tensor.new_tensor(3.0),
+                "chunk_x0_losses": ref_tensor.new_tensor([2.0, 3.0, 4.0, 5.0]),
+                "chunk_acc": ref_tensor.new_tensor([0.1, 0.2, 0.3, 0.4]),
+                "valid_tokens": ref_tensor.new_tensor(8.0),
+                "supervised_tokens": ref_tensor.new_tensor(8.0),
+                "window_count": 2,
+            }
+
+        model._prepare_batch = MethodType(fake_prepare, model)
+        model.log = MethodType(fake_log, model)
+        model._compute_discrete_policy_training_loss = MethodType(fake_chunk, model)
+
+        loss = model.training_step(data, 0)
+
+        self.assertEqual(prepare_calls, [data])
+        self.assertAlmostEqual(float(loss), 0.65, places=5)
+
+    def test_batched_overlap_loss_matches_shifted_chunk_targets_without_tensor_tolist(self):
+        model = _policy_shell()
+        logits = torch.randn(4, 4, 7)
+        chunk_ids = torch.arange(4).unsqueeze(0).expand(4, -1)
+        scene_ids = torch.zeros(4, 4, dtype=torch.long)
+        agent_ids = torch.tensor([0, 0, 0, 1]).view(-1, 1).expand(-1, 4)
+        anchor_tokens = torch.tensor([2, 3, 4, 2]).view(-1, 1).expand(-1, 4)
+        valid_mask = torch.ones(4, 4, dtype=torch.bool)
+        valid_mask[2, 2:] = False
+        packed = {
+            "valid_mask": valid_mask,
+            "loss_mask_base": valid_mask.clone(),
+            "chunk_ids": chunk_ids,
+            "source_scene_ids": scene_ids,
+            "source_agent_ids": agent_ids,
+            "anchor_tokens": anchor_tokens,
+        }
+        details = {
+            "logits": logits,
+            "loss_mask": valid_mask.clone(),
+        }
+
+        source_indices = torch.tensor([1, 2, 5])
+        target_indices = torch.tensor([4, 8, 8])
+        teacher_prob = F.log_softmax(
+            logits.reshape(-1, logits.shape[-1])[source_indices],
+            dim=-1,
+        ).exp()
+        student_log_prob = F.log_softmax(
+            logits.reshape(-1, logits.shape[-1])[target_indices],
+            dim=-1,
+        )
+        expected = F.kl_div(
+            student_log_prob,
+            teacher_prob.detach(),
+            reduction="none",
+        ).sum(dim=-1).mean()
+
+        with patch.object(torch.Tensor, "tolist", side_effect=AssertionError("tolist is not vectorized")):
+            actual = model._discrete_policy_batched_overlap_loss(packed, details)
+
+        self.assertTrue(torch.allclose(actual, expected, atol=1.0e-6))
 
 
 class SMARTDiscreteDiffusionPolicyConfigTest(unittest.TestCase):

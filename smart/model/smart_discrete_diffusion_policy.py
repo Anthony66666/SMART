@@ -355,7 +355,6 @@ class SMARTDiscreteDiffusionPolicy(SMARTAutoregressiveDiffusion):
         flat_anchor = anchor_tokens.reshape(-1)
         flat_chunk = chunk_ids.reshape(-1)
 
-        target_map = {}
         target_mask = (
             flat_valid
             & (flat_chunk == 0)
@@ -364,40 +363,51 @@ class SMARTDiscreteDiffusionPolicy(SMARTAutoregressiveDiffusion):
             & (flat_anchor >= 0)
         )
         target_indices = torch.nonzero(target_mask, as_tuple=False).squeeze(-1)
-        for index in target_indices.tolist():
-            key = (
-                int(flat_scene[index].item()),
-                int(flat_agent[index].item()),
-                int(flat_anchor[index].item()),
-            )
-            target_map[key] = int(index)
+        source_mask = (
+            flat_valid
+            & (flat_chunk > 0)
+            & (flat_scene >= 0)
+            & (flat_agent >= 0)
+            & (flat_anchor >= 0)
+        )
+        source_indices = torch.nonzero(source_mask, as_tuple=False).squeeze(-1)
 
-        source_indices = []
-        matched_target_indices = []
-        for source_chunk in range(1, self.ar_prediction_tokens):
-            source_mask = (
-                flat_valid
-                & (flat_chunk == source_chunk)
-                & (flat_scene >= 0)
-                & (flat_agent >= 0)
-                & (flat_anchor >= 0)
-            )
-            for index in torch.nonzero(source_mask, as_tuple=False).squeeze(-1).tolist():
-                key = (
-                    int(flat_scene[index].item()),
-                    int(flat_agent[index].item()),
-                    int(flat_anchor[index].item()) + int(source_chunk),
-                )
-                target_index = target_map.get(key)
-                if target_index is None:
-                    continue
-                source_indices.append(int(index))
-                matched_target_indices.append(target_index)
-
-        if not source_indices:
+        if int(source_indices.numel()) == 0 or int(target_indices.numel()) == 0:
             return logits.sum() * 0.0
-        source = torch.tensor(source_indices, dtype=torch.long, device=logits.device)
-        target = torch.tensor(matched_target_indices, dtype=torch.long, device=logits.device)
+
+        target_anchor = flat_anchor[target_indices]
+        source_anchor = flat_anchor[source_indices] + flat_chunk[source_indices]
+        agent_stride = torch.cat([
+            flat_agent[target_indices],
+            flat_agent[source_indices],
+        ]).max() + 1
+        anchor_stride = torch.cat([
+            target_anchor,
+            source_anchor,
+        ]).max() + 1
+
+        target_keys = (
+            (flat_scene[target_indices] * agent_stride + flat_agent[target_indices])
+            * anchor_stride
+            + target_anchor
+        )
+        source_keys = (
+            (flat_scene[source_indices] * agent_stride + flat_agent[source_indices])
+            * anchor_stride
+            + source_anchor
+        )
+        sorted_target_keys, target_order = torch.sort(target_keys)
+        positions = torch.searchsorted(sorted_target_keys, source_keys)
+        safe_positions = positions.clamp(max=int(sorted_target_keys.numel()) - 1)
+        matched = (
+            (positions < int(sorted_target_keys.numel()))
+            & (sorted_target_keys[safe_positions] == source_keys)
+        )
+        if not bool(matched.any()):
+            return logits.sum() * 0.0
+
+        source = source_indices[matched]
+        target = target_indices[target_order[safe_positions[matched]]]
         teacher_log_prob = F.log_softmax(flat_logits[source], dim=-1)
         student_log_prob = F.log_softmax(flat_logits[target], dim=-1)
         teacher_prob = teacher_log_prob.exp().detach()
@@ -566,7 +576,8 @@ class SMARTDiscreteDiffusionPolicy(SMARTAutoregressiveDiffusion):
 
     def training_step(self, data, batch_idx):
         del batch_idx
-        data = self._prepare_batch(data)
+        if not bool(getattr(self, 'discrete_policy_batched_multi_anchor', True)):
+            data = self._prepare_batch(data)
         ref_tensor = data['agent']['token_idx'].new_zeros((), dtype=torch.float)
         policy = self._compute_discrete_policy_training_loss(data, ref_tensor)
         if int(policy['window_count']) <= 0:
