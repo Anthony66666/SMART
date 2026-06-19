@@ -65,6 +65,10 @@ class CompareMotionModelsTest(unittest.TestCase):
                 "smart_continuous_action_diffusion",
                 "diffusion_policy_v1",
             ),
+            "configs/train/train_scalable_discrete_diffusion_policy_2000.yaml": (
+                "smart_discrete_diffusion_policy",
+                "chunk_rerank_v1",
+            ),
         }
         for path, (predictor, objective) in expected.items():
             with self.subTest(path=path):
@@ -72,9 +76,10 @@ class CompareMotionModelsTest(unittest.TestCase):
                 cfg = load_config_act(path)
                 self.assertEqual(cfg.Dataset.train_raw_dir, [TRAIN_DIR])
                 self.assertEqual(cfg.Dataset.val_raw_dir, [VAL_DIR])
-                self.assertEqual(cfg.Trainer.max_steps, 1000)
-                self.assertEqual(cfg.Trainer.val_check_interval, 1000)
-                self.assertEqual(cfg.Trainer.checkpoint_every_n_train_steps, 1000)
+                expected_steps = 2000 if predictor == "smart_discrete_diffusion_policy" else 1000
+                self.assertEqual(cfg.Trainer.max_steps, expected_steps)
+                self.assertEqual(cfg.Trainer.val_check_interval, expected_steps)
+                self.assertEqual(cfg.Trainer.checkpoint_every_n_train_steps, expected_steps)
                 self.assertTrue(cfg.Trainer.save_last_checkpoint)
                 self.assertEqual(cfg.Trainer.devices, 1)
                 self.assertEqual(cfg.Trainer.strategy, "auto")
@@ -83,6 +88,8 @@ class CompareMotionModelsTest(unittest.TestCase):
                     self.assertEqual(cfg.Model.diffusion.ar_objective, objective)
                 elif predictor == "smart_continuous_action_diffusion":
                     self.assertEqual(cfg.Model.diffusion.continuous_action_objective, objective)
+                elif predictor == "smart_discrete_diffusion_policy":
+                    self.assertEqual(cfg.Model.diffusion.discrete_policy_objective, objective)
                 elif predictor == "smart_elf":
                     self.assertEqual(cfg.Model.diffusion.elf_objective, objective)
                 elif predictor == "smart_hybrid_diffusion":

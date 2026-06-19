@@ -1,6 +1,14 @@
 # Progress
 
 ## 2026-06-19 CST
+- Task: Added a discrete diffusion-policy branch that commits one token from reranked four-token candidates.
+- Result: Added `smart_discrete_diffusion_policy`, a SMART-token diffusion-policy ablation that keeps the AR receding-horizon shell, predicts four-token windows, commits only chunk 0, discards the tail chunks, and scores multiple sampled candidate windows with decayed chunk energy weights before commit.
+- Training objective: Combines dense original SMART next-token CE (`ntp_aux_loss_weight: 1.0`), chunk-weighted full-window diffusion CE with weights `[1.0, 0.3, 0.15, 0.075]`, terminal-safe incomplete windows, deterministic contiguous anchor spans, and overlap KL from source tail logits to the corresponding future chunk-0 logits.
+- Files: `smart/model/smart_discrete_diffusion_policy.py`, predictor registries, local/server/validation discrete-policy configs, `tests/test_smart_discrete_diffusion_policy.py`, `tests/test_compare_motion_models.py`, and durable docs.
+- Validation: Focused unit tests cover one-token commit without temporal voting, decayed candidate-window scoring, contiguous anchor-window training, overlap KL wiring, total loss composition, and config invariants. Run the local 2000-step smoke config before using it for quality comparisons.
+- Next: Train `configs/train/train_scalable_discrete_diffusion_policy.yaml` on the server and compare against AR rerank, discrete action-chunk, continuous action diffusion, causal flow matching, and original SMART on a fixed validation slice.
+
+## 2026-06-19 CST
 - Task: Added a diffusion-policy continuous action-chunk branch.
 - Result: Added `smart_continuous_action_diffusion`, which reuses SMART map/history context and AR receding-horizon rollout, but trains a continuous denoising head over four-token / twenty-frame local action chunks. Inference samples continuous action chunks, ensembles overlapping predictions in world trajectory space, commits chunk 0, and retokenizes the committed chunk only to keep SMART history/interface compatibility.
 - Files: `smart/model/smart_continuous_action_diffusion.py`, predictor registries, continuous-action train/validation configs, `tests/test_smart_continuous_action_diffusion.py`, `tests/test_compare_motion_models.py`, and durable docs.

@@ -1,5 +1,12 @@
 # Decisions
 
+## Decision: Add discrete diffusion-policy as discard-tail candidate reranking
+- Date: 2026-06-19
+- Context: The ACT-style discrete branch uses overlapping tail proposals through temporal voting, while the continuous diffusion-policy branch moves the action representation out of SMART token space. The user wanted a discrete version closer to diffusion policy sampling: predict a four-token candidate action window, use the whole window for scoring, but execute only the first token.
+- Decision: Add `smart_discrete_diffusion_policy` as an additive predictor over `SMARTAutoregressiveDiffusion`. It requires `commit_tokens: 1`, disables tail proposal carry, restores dense SMART next-token CE as an always-on prior, trains the diffusion window with commit-primary chunk weights `[1.0, 0.3, 0.15, 0.075]`, and adds overlap KL between a window tail distribution and the matching future chunk-0 distribution inside the selected contiguous span.
+- Why: This isolates the value of discrete multi-token candidate scoring from ACT-style temporal ensembling and from continuous trajectory denoising. The tail chunks are useful as lookahead for candidate evaluation, not as hidden state that is carried into the next rollout step.
+- Impact: Inference samples several four-token windows, scores each by base token confidence minus decayed lane/dynamics/collision energy, commits chunk 0 of the best window, and discards chunks 1-3. The server config uses a span-4 objective; the local 2000-step smoke config uses a smaller span for runtime and should not be treated as final quality evidence.
+
 ## Decision: Use single-forward cadf_lite for active AR rerank training
 - Date: 2026-06-18
 - Context: Commitment-aware all-anchor AR rerank training aligned the loss with one-token commits, but each batch ran a diffusion-window encoder pass for every future anchor plus periodic dense SMART CE. This made local and server training too slow for iteration.

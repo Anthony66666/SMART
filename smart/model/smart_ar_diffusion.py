@@ -69,7 +69,12 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
                 'commitment_aware' if commitment_aware_training else 'window',
             )
         ).lower()
-        if self.ar_training_mode not in ('window', 'commitment_aware', 'cadf_lite'):
+        if self.ar_training_mode not in (
+            'window',
+            'commitment_aware',
+            'cadf_lite',
+            'discrete_policy',
+        ):
             raise ValueError(
                 f"Unsupported diffusion.ar_training_mode: {self.ar_training_mode}"
             )
