@@ -2,7 +2,7 @@ import unittest
 from types import MethodType, SimpleNamespace
 
 import torch
-from torch_geometric.data import HeteroData
+from torch_geometric.data import Batch, HeteroData
 
 from smart.model.smart_discrete_diffusion_policy import SMARTDiscreteDiffusionPolicy
 from smart.model.smart_ar_diffusion import SMARTAutoregressiveDiffusion
@@ -325,6 +325,41 @@ class SMARTDiscreteDiffusionPolicyTest(unittest.TestCase):
             batched["agent"]["token_idx"][:, :2],
             torch.tensor([[1, 2], [1, 2], [2, 3], [2, 3]]),
         ))
+
+    def test_batched_anchor_view_prepares_merged_anchor_batch(self):
+        model = _policy_shell()
+        scenes = [_toy_sequence(num_agents=1, num_tokens=8, num_frames=41) for _ in range(2)]
+        for scene in scenes:
+            scene["pt_token"]["num_nodes"] = 2
+            scene["pt_token"]["type"] = torch.zeros(2, dtype=torch.long)
+        batch = Batch.from_data_list(scenes)
+        prepare_calls = []
+        training_view_calls = []
+
+        def fake_prepare(self, scene):
+            prepare_calls.append(int(scene["agent"]["num_nodes"]))
+            scene["pt_token"]["pt_valid_mask"] = torch.ones(
+                int(scene["pt_token"]["num_nodes"]),
+                dtype=torch.bool,
+            )
+            return scene
+
+        def fake_training_view(self, scene, anchor_token=None, perturb=None, allow_incomplete_window=False):
+            del perturb, allow_incomplete_window
+            if "pt_valid_mask" in scene["pt_token"]:
+                raise AssertionError("split scene should be merged before map-token preparation")
+            training_view_calls.append(int(anchor_token))
+            return scene, torch.zeros(1, 4, dtype=torch.long), torch.ones(1, 4, dtype=torch.bool), anchor_token
+
+        model._prepare_batch = MethodType(fake_prepare, model)
+        model._build_ar_training_view = MethodType(fake_training_view, model)
+
+        batched, window_count = model._build_discrete_policy_batched_anchor_view(batch, [3])
+
+        self.assertEqual(window_count, 2)
+        self.assertEqual(prepare_calls, [2])
+        self.assertEqual(training_view_calls, [3, 3])
+        self.assertIn("pt_valid_mask", batched["pt_token"])
 
     def test_training_step_uses_only_diffusion_chunk_and_overlap_losses(self):
         model = _policy_shell()

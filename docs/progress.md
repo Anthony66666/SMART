@@ -681,3 +681,10 @@
 - Files: `smart/model/smart_ar_diffusion.py`, `tests/test_smart_ar_diffusion.py`, `docs/next.md`, `docs/decisions.md`, `docs/progress.md`
 - Validation: `python -m unittest tests.test_smart_ar_diffusion tests.test_smart_causal_diffusion tests.test_smart_diffusion_smart_parity -v` passed 94 tests with 1 expected Waymo-dependency skip; `python -m py_compile smart/model/smart_ar_diffusion.py tests/test_smart_ar_diffusion.py` passed.
 - Next: Treat older AR rerank diagnostics as stale for side-effect and stationary-heading checks; retrain before final map-adherence comparison.
+
+## 2026-06-20 CST
+- Task: Fixed the local training crash in discrete diffusion-policy batched multi-anchor mode.
+- Result: Batched anchor construction now splits any PyG batch through `to_data_list()`, builds raw per-anchor views, merges them once, and runs map-token preparation on the merged anchor batch. This preserves one diffusion forward for multi-anchor training while avoiding stale/missing `pt_valid_mask` fields and malformed `pt_token -> map_polygon` dynamic edge batching.
+- Files: `smart/model/smart_discrete_diffusion_policy.py`, `tests/test_smart_discrete_diffusion_policy.py`, `docs/progress.md`, `docs/next.md`
+- Validation: Real `data/valid_demo` training smoke ran `training_step` plus `backward` with loss `4.662879943847656`; `tests.test_smart_discrete_diffusion_policy` and `tests.test_compare_motion_models` passed; `py_compile` and `git diff --check` passed.
+- Next: Retry the local or server discrete diffusion-policy run after this anchor-view batching fix.

@@ -254,9 +254,19 @@ class SMARTDiscreteDiffusionPolicy(SMARTAutoregressiveDiffusion):
         }
 
     def _split_anchor_source_scenes(self, data):
-        if isinstance(data, Batch):
-            return data.to_data_list()
+        to_data_list = getattr(data, 'to_data_list', None)
+        if callable(to_data_list):
+            return to_data_list()
         return [data]
+
+    def _has_pt_token_store(self, data):
+        return 'pt_token' in getattr(data, 'node_types', ())
+
+    def _prepare_discrete_policy_anchor_view(self, data):
+        if not self._has_pt_token_store(data):
+            return data
+        setattr(data, '_smart_diffusion_prepared', False)
+        return self._prepare_batch(data)
 
     def _build_discrete_policy_batched_anchor_view(self, data, anchors):
         scenes = self._split_anchor_source_scenes(data)
@@ -298,8 +308,9 @@ class SMARTDiscreteDiffusionPolicy(SMARTAutoregressiveDiffusion):
         if not views:
             return None, 0
         if len(views) == 1:
-            return views[0], 1
-        return Batch.from_data_list(views), len(views)
+            return self._prepare_discrete_policy_anchor_view(views[0]), 1
+        batched_view = Batch.from_data_list(views)
+        return self._prepare_discrete_policy_anchor_view(batched_view), len(views)
 
     def _attach_discrete_policy_packed_metadata(self, packed, batched_view):
         if packed is None:
