@@ -61,6 +61,10 @@ class CompareMotionModelsTest(unittest.TestCase):
                 "smart_action_chunk_diffusion",
                 "maskgit",
             ),
+            "configs/train/train_scalable_continuous_action_diffusion_1000.yaml": (
+                "smart_continuous_action_diffusion",
+                "diffusion_policy_v1",
+            ),
         }
         for path, (predictor, objective) in expected.items():
             with self.subTest(path=path):
@@ -77,6 +81,8 @@ class CompareMotionModelsTest(unittest.TestCase):
                 self.assertEqual(cfg.Model.predictor, predictor)
                 if predictor in ("smart_ar_diffusion", "smart_action_chunk_diffusion"):
                     self.assertEqual(cfg.Model.diffusion.ar_objective, objective)
+                elif predictor == "smart_continuous_action_diffusion":
+                    self.assertEqual(cfg.Model.diffusion.continuous_action_objective, objective)
                 elif predictor == "smart_elf":
                     self.assertEqual(cfg.Model.diffusion.elf_objective, objective)
                 elif predictor == "smart_hybrid_diffusion":

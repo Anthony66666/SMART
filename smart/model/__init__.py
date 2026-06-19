@@ -6,3 +6,4 @@ from smart.model.smart_causal_flow_matching import SMARTCausalFlowMatching
 from smart.model.smart_elf import SMARTEmbeddedLanguageFlow
 from smart.model.smart_hybrid_diffusion import SMARTHybridDiffusion
 from smart.model.smart_action_chunk_diffusion import SMARTActionChunkDiffusion
+from smart.model.smart_continuous_action_diffusion import SMARTContinuousActionDiffusion

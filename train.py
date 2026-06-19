@@ -16,6 +16,7 @@ from smart.model import SMARTCausalFlowMatching
 from smart.model import SMARTEmbeddedLanguageFlow
 from smart.model import SMARTHybridDiffusion
 from smart.model import SMARTActionChunkDiffusion
+from smart.model import SMARTContinuousActionDiffusion
 from smart.utils.log import Logging
 from smart.utils.torch_compat import register_checkpoint_safe_globals
 
@@ -69,6 +70,7 @@ if __name__ == '__main__':
         "smart_elf": SMARTEmbeddedLanguageFlow,
         "smart_hybrid_diffusion": SMARTHybridDiffusion,
         "smart_action_chunk_diffusion": SMARTActionChunkDiffusion,
+        "smart_continuous_action_diffusion": SMARTContinuousActionDiffusion,
     }
     parser.add_argument('--config', type=str, default='configs/train/train_scalable.yaml')
     parser.add_argument('--pretrain_ckpt', type=str, default="")

@@ -1,6 +1,13 @@
 # Progress
 
 ## 2026-06-19 CST
+- Task: Added a diffusion-policy continuous action-chunk branch.
+- Result: Added `smart_continuous_action_diffusion`, which reuses SMART map/history context and AR receding-horizon rollout, but trains a continuous denoising head over four-token / twenty-frame local action chunks. Inference samples continuous action chunks, ensembles overlapping predictions in world trajectory space, commits chunk 0, and retokenizes the committed chunk only to keep SMART history/interface compatibility.
+- Files: `smart/model/smart_continuous_action_diffusion.py`, predictor registries, continuous-action train/validation configs, `tests/test_smart_continuous_action_diffusion.py`, `tests/test_compare_motion_models.py`, and durable docs.
+- Validation: Added regressions for local/world action transforms, continuous temporal ensembling, final-step clean denoising, local/server config invariants, and compare-script config coverage. `python -m unittest tests.test_smart_continuous_action_diffusion tests.test_compare_motion_models tests.test_smart_ar_diffusion -v` passed 56 tests; `py_compile`, model construction smoke, and `git diff --check` passed locally.
+- Next: Train `configs/train/train_scalable_continuous_action_diffusion.yaml` on the server and compare against the discrete ACT-style branch, AR rerank, causal flow matching, and original SMART on the same fixed validation slice.
+
+## 2026-06-19 CST
 - Task: Stabilized action-chunk AR diffusion after weak server-training quality.
 - Result: Restored interval dense SMART CE replay in action-chunk training, added an action-chunk-only adjacent-window shift-consistency auxiliary loss, aligned consistency comparisons by scene id / agent id / shifted chunk id, and added a full server training config at `configs/train/train_scalable_ar_action_chunk.yaml`.
 - Files: `smart/model/smart_action_chunk_diffusion.py`, `smart/model/smart_ar_diffusion.py`, action-chunk train configs, `tests/test_smart_action_chunk_diffusion.py`, and durable docs.

@@ -12,6 +12,7 @@ from smart.model import SMARTCausalFlowMatching
 from smart.model import SMARTEmbeddedLanguageFlow
 from smart.model import SMARTHybridDiffusion
 from smart.model import SMARTActionChunkDiffusion
+from smart.model import SMARTContinuousActionDiffusion
 from smart.transforms import WaymoTargetBuilder
 from smart.utils.config import load_config_act
 from smart.utils.log import Logging
@@ -49,6 +50,7 @@ if __name__ == '__main__':
         "smart_elf": SMARTEmbeddedLanguageFlow,
         "smart_hybrid_diffusion": SMARTHybridDiffusion,
         "smart_action_chunk_diffusion": SMARTActionChunkDiffusion,
+        "smart_continuous_action_diffusion": SMARTContinuousActionDiffusion,
     }
 
     data_config = config.Dataset
