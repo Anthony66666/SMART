@@ -1,5 +1,12 @@
 # Decisions
 
+## Decision: Batch discrete-policy training anchors in one forward
+- Date: 2026-06-20
+- Context: After removing dense SMART NTP CE, discrete-policy training was still slow because each selected anchor rebuilt an AR view, re-ran history/map encoding, and ran diffusion loss separately. Server configs selected four anchors per batch.
+- Decision: Make `discrete_policy_batched_multi_anchor: true` the active default. The model now creates `(scene, anchor)` graph samples, batches them once, and computes diffusion loss once while keeping anchor-specific teacher-forced history context. Configs also set `self_condition_prob: 0.0` to avoid an extra no-grad denoiser pass per window.
+- Why: This keeps the correct per-anchor conditioning while removing the Python per-anchor training loop and repeated self-conditioning decode.
+- Impact: Training should use fewer forward launches for the same dense anchor supervision, at the cost of a larger batched graph and higher peak memory. The old per-anchor loop remains available with `discrete_policy_batched_multi_anchor: false` for debugging.
+
 ## Decision: Make discrete diffusion-policy a pure chunk denoising objective
 - Date: 2026-06-19
 - Context: The first discrete diffusion-policy branch still used dense original SMART next-token CE as an auxiliary prior and sampled/reranked multiple candidate windows. That restored SMART supervision but added an extra full SMART forward and made the ablation less clean.

@@ -104,6 +104,7 @@ Model:
       enabled: false
     ar_training_mode: discrete_policy
     discrete_policy_span_tokens: 2
+    discrete_policy_batched_multi_anchor: true
     chunk_loss_weights: [1.0, 0.3, 0.15, 0.075]
     discrete_policy_chunk_loss_weights: [1.0, 0.3, 0.15, 0.075]
     overlap_loss_weight: 0.05
@@ -181,7 +182,7 @@ Model:
     use_proposal_geometry: true
     proposal_conditioning_enabled: false
     geometry_confidence_source_threshold: 0.35
-    self_condition_prob: 1.0
+    self_condition_prob: 0.0
     self_condition_mode: "argmax"
     debug_validation_logging: false
     freeze_encoder: false

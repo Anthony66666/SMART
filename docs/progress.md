@@ -1,5 +1,11 @@
 # Progress
 
+## 2026-06-20 CST
+- Task: Added batched multi-anchor training for `smart_discrete_diffusion_policy`.
+- Result: Replaced the default per-anchor training loop with a batched anchor-view path: selected anchors are converted into `(scene, anchor)` graph samples, packed into one PyG batch, and passed through one diffusion input/loss call. Each anchor keeps its own teacher-forced history context; the implementation does not reuse a stale single `h_t` across anchors.
+- Config: Enabled `discrete_policy_batched_multi_anchor: true` and set `self_condition_prob: 0.0` in discrete-policy train/smoke/validation configs so span supervision does not trigger repeated no-grad denoiser self-conditioning.
+- Validation: Added regressions that fail if the batched path calls per-anchor `_build_ar_training_view`, if anchor/source metadata is lost, or if config disables batched multi-anchor / re-enables self-conditioning.
+
 ## 2026-06-19 CST
 - Task: Converted `smart_discrete_diffusion_policy` from SMART-prior-plus-rerank training to a pure diffusion-policy chunk objective.
 - Result: Removed the dense SMART NTP CE second forward from `SMARTDiscreteDiffusionPolicy.training_step`, kept chunk-weighted forced full-window x0 CE and optional overlap KL, added per-horizon `loss_x0_chunk0..3`, `chunk0_acc..3`, `loss_overlap`, and supervision-coverage logs, and added shape/mask assertions so the denoiser supervises every valid target in each window.

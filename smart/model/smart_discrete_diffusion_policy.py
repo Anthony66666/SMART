@@ -1,5 +1,6 @@
 import torch
 import torch.nn.functional as F
+from torch_geometric.data import Batch
 
 from smart.model.smart_ar_diffusion import SMARTAutoregressiveDiffusion
 from smart.modules.trajectory_energy import TrajectoryEnergy
@@ -74,6 +75,9 @@ class SMARTDiscreteDiffusionPolicy(SMARTAutoregressiveDiffusion):
 
         self.discrete_policy_span_tokens = int(
             getattr(diffusion_cfg, 'discrete_policy_span_tokens', 4)
+        )
+        self.discrete_policy_batched_multi_anchor = bool(
+            getattr(diffusion_cfg, 'discrete_policy_batched_multi_anchor', True)
         )
         chunk_weights = tuple(
             float(value)
@@ -177,6 +181,20 @@ class SMARTDiscreteDiffusionPolicy(SMARTAutoregressiveDiffusion):
         ).sum(dim=-1)
         return kl.mean()
 
+    def _empty_discrete_policy_training_result(self, ref_tensor):
+        zero = ref_tensor.new_zeros(())
+        zero_chunks = zero.repeat(int(getattr(self, 'ar_prediction_tokens', 4)))
+        return {
+            'chunk_loss': zero,
+            'mask_acc': zero,
+            'overlap_loss': zero,
+            'chunk_x0_losses': zero_chunks,
+            'chunk_acc': zero_chunks,
+            'valid_tokens': zero,
+            'supervised_tokens': zero,
+            'window_count': 0,
+        }
+
     def _discrete_policy_chunk_metrics(self, packed, details):
         logits = details['logits']
         target = packed['token_ids']
@@ -235,21 +253,198 @@ class SMARTDiscreteDiffusionPolicy(SMARTAutoregressiveDiffusion):
             'supervised_tokens': torch.stack(chunk_supervised_counts).sum(),
         }
 
+    def _split_anchor_source_scenes(self, data):
+        if isinstance(data, Batch):
+            return data.to_data_list()
+        return [data]
+
+    def _build_discrete_policy_batched_anchor_view(self, data, anchors):
+        scenes = self._split_anchor_source_scenes(data)
+        views = []
+        for anchor in anchors:
+            perturb = (
+                getattr(self, 'training', False)
+                and self.ar_state_perturb_prob > 0.0
+                and torch.rand((), device=data['agent']['token_idx'].device) < self.ar_state_perturb_prob
+            )
+            perturb = bool(perturb)
+            for scene_idx, scene in enumerate(scenes):
+                view, _target_tokens, _target_valid, _anchor = self._build_ar_training_view(
+                    scene,
+                    anchor_token=int(anchor),
+                    perturb=perturb,
+                    allow_incomplete_window=True,
+                )
+                num_agents = int(view['agent']['token_idx'].shape[0])
+                device = view['agent']['token_idx'].device
+                view['agent']['source_scene_id'] = torch.full(
+                    (num_agents,),
+                    int(scene_idx),
+                    dtype=torch.long,
+                    device=device,
+                )
+                view['agent']['source_agent_id'] = torch.arange(
+                    num_agents,
+                    dtype=torch.long,
+                    device=device,
+                )
+                view['agent']['source_anchor_token'] = torch.full(
+                    (num_agents,),
+                    int(anchor),
+                    dtype=torch.long,
+                    device=device,
+                )
+                views.append(view)
+        if not views:
+            return None, 0
+        if len(views) == 1:
+            return views[0], 1
+        return Batch.from_data_list(views), len(views)
+
+    def _attach_discrete_policy_packed_metadata(self, packed, batched_view):
+        if packed is None:
+            return
+        agent_ids = packed['token_agent_ids'].to(dtype=torch.long)
+        valid_agent = agent_ids >= 0
+        safe_agent_ids = agent_ids.clamp_min(0)
+        for source_key, packed_key in (
+            ('source_scene_id', 'source_scene_ids'),
+            ('source_agent_id', 'source_agent_ids'),
+            ('source_anchor_token', 'anchor_tokens'),
+        ):
+            if source_key not in batched_view['agent']:
+                continue
+            source_values = batched_view['agent'][source_key].to(
+                device=agent_ids.device,
+                dtype=torch.long,
+            )
+            packed_values = torch.full_like(agent_ids, -1)
+            if bool(valid_agent.any()):
+                packed_values[valid_agent] = source_values[safe_agent_ids[valid_agent]]
+            packed[packed_key] = packed_values
+
+    def _discrete_policy_batched_overlap_loss(self, packed, details):
+        logits = details['logits']
+        required = ('source_scene_ids', 'source_agent_ids', 'anchor_tokens')
+        if any(key not in packed for key in required):
+            return logits.sum() * 0.0
+        loss_mask = details.get('loss_mask', packed['loss_mask_base']).to(
+            device=logits.device,
+            dtype=torch.bool,
+        )
+        valid = loss_mask & packed['valid_mask'].to(device=logits.device, dtype=torch.bool)
+        scene_ids = packed['source_scene_ids'].to(device=logits.device, dtype=torch.long)
+        agent_ids = packed['source_agent_ids'].to(device=logits.device, dtype=torch.long)
+        anchor_tokens = packed['anchor_tokens'].to(device=logits.device, dtype=torch.long)
+        chunk_ids = packed['chunk_ids'].to(device=logits.device, dtype=torch.long)
+        flat_logits = logits.reshape(-1, logits.shape[-1])
+        flat_valid = valid.reshape(-1)
+        flat_scene = scene_ids.reshape(-1)
+        flat_agent = agent_ids.reshape(-1)
+        flat_anchor = anchor_tokens.reshape(-1)
+        flat_chunk = chunk_ids.reshape(-1)
+
+        target_map = {}
+        target_mask = (
+            flat_valid
+            & (flat_chunk == 0)
+            & (flat_scene >= 0)
+            & (flat_agent >= 0)
+            & (flat_anchor >= 0)
+        )
+        target_indices = torch.nonzero(target_mask, as_tuple=False).squeeze(-1)
+        for index in target_indices.tolist():
+            key = (
+                int(flat_scene[index].item()),
+                int(flat_agent[index].item()),
+                int(flat_anchor[index].item()),
+            )
+            target_map[key] = int(index)
+
+        source_indices = []
+        matched_target_indices = []
+        for source_chunk in range(1, self.ar_prediction_tokens):
+            source_mask = (
+                flat_valid
+                & (flat_chunk == source_chunk)
+                & (flat_scene >= 0)
+                & (flat_agent >= 0)
+                & (flat_anchor >= 0)
+            )
+            for index in torch.nonzero(source_mask, as_tuple=False).squeeze(-1).tolist():
+                key = (
+                    int(flat_scene[index].item()),
+                    int(flat_agent[index].item()),
+                    int(flat_anchor[index].item()) + int(source_chunk),
+                )
+                target_index = target_map.get(key)
+                if target_index is None:
+                    continue
+                source_indices.append(int(index))
+                matched_target_indices.append(target_index)
+
+        if not source_indices:
+            return logits.sum() * 0.0
+        source = torch.tensor(source_indices, dtype=torch.long, device=logits.device)
+        target = torch.tensor(matched_target_indices, dtype=torch.long, device=logits.device)
+        teacher_log_prob = F.log_softmax(flat_logits[source], dim=-1)
+        student_log_prob = F.log_softmax(flat_logits[target], dim=-1)
+        teacher_prob = teacher_log_prob.exp().detach()
+        kl = F.kl_div(
+            student_log_prob,
+            teacher_prob,
+            reduction='none',
+        ).sum(dim=-1)
+        return kl.mean()
+
+    def _compute_discrete_policy_batched_training_loss(self, data, anchors, ref_tensor):
+        batched_view, window_count = self._build_discrete_policy_batched_anchor_view(
+            data,
+            anchors,
+        )
+        if batched_view is None or int(window_count) <= 0:
+            return self._empty_discrete_policy_training_result(ref_tensor)
+        (
+            packed,
+            summary,
+            _ft,
+            _fv,
+            _generation_agents,
+            _supervision_agents,
+            _agent_batch,
+        ) = self._build_diffusion_inputs(batched_view)
+        if packed is None:
+            return self._empty_discrete_policy_training_result(ref_tensor)
+        self._attach_discrete_policy_packed_metadata(packed, batched_view)
+        loss, acc, details = self._compute_diffusion_loss(
+            packed,
+            summary,
+            forced_mask=packed['valid_mask'],
+            return_details=True,
+            loss_normalization='supervision_weight',
+        )
+        chunk_metrics = self._discrete_policy_chunk_metrics(packed, details)
+        return {
+            'chunk_loss': loss,
+            'mask_acc': acc,
+            'overlap_loss': self._discrete_policy_batched_overlap_loss(packed, details),
+            'chunk_x0_losses': chunk_metrics['chunk_x0_losses'],
+            'chunk_acc': chunk_metrics['chunk_acc'],
+            'valid_tokens': chunk_metrics['valid_tokens'],
+            'supervised_tokens': chunk_metrics['supervised_tokens'],
+            'window_count': int(window_count),
+        }
+
     def _compute_discrete_policy_training_loss(self, data, ref_tensor):
         anchors = self._discrete_policy_training_anchors(data)
         if not anchors:
-            zero = ref_tensor.new_zeros(())
-            zero_chunks = zero.repeat(int(getattr(self, 'ar_prediction_tokens', 4)))
-            return {
-                'chunk_loss': zero,
-                'mask_acc': zero,
-                'overlap_loss': zero,
-                'chunk_x0_losses': zero_chunks,
-                'chunk_acc': zero_chunks,
-                'valid_tokens': zero,
-                'supervised_tokens': zero,
-                'window_count': 0,
-            }
+            return self._empty_discrete_policy_training_result(ref_tensor)
+        if bool(getattr(self, 'discrete_policy_batched_multi_anchor', True)):
+            return self._compute_discrete_policy_batched_training_loss(
+                data,
+                anchors,
+                ref_tensor,
+            )
 
         num_agents = int(data['agent']['token_idx'].shape[0])
         losses = []
@@ -311,18 +506,7 @@ class SMARTDiscreteDiffusionPolicy(SMARTAutoregressiveDiffusion):
             }
 
         if not losses:
-            zero = ref_tensor.new_zeros(())
-            zero_chunks = zero.repeat(int(getattr(self, 'ar_prediction_tokens', 4)))
-            return {
-                'chunk_loss': zero,
-                'mask_acc': zero,
-                'overlap_loss': zero,
-                'chunk_x0_losses': zero_chunks,
-                'chunk_acc': zero_chunks,
-                'valid_tokens': zero,
-                'supervised_tokens': zero,
-                'window_count': 0,
-            }
+            return self._empty_discrete_policy_training_result(ref_tensor)
 
         overlap_losses = []
         for anchor in anchors:

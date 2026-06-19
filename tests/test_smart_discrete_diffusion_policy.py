@@ -31,6 +31,7 @@ def _policy_shell():
     model.discrete_policy_candidate_energy_weight = 2.0
     model.discrete_policy_candidate_chunk_weights = (1.0, 0.3, 0.15, 0.075)
     model.discrete_policy_candidate_score_enabled = True
+    model.discrete_policy_batched_multi_anchor = True
     model.causal_loss_weighting_enabled = True
     model.causal_loss_weights = model.discrete_policy_chunk_loss_weights
     model.debug_validation_logging = False
@@ -120,6 +121,7 @@ class SMARTDiscreteDiffusionPolicyTest(unittest.TestCase):
 
     def test_dense_span_training_enumerates_contiguous_anchors_without_proposals(self):
         model = _policy_shell()
+        model.discrete_policy_batched_multi_anchor = False
         model._manual_global_step = 1
         data = _toy_sequence(num_agents=1, num_tokens=8, num_frames=41)
         captured_anchors = []
@@ -201,6 +203,129 @@ class SMARTDiscreteDiffusionPolicyTest(unittest.TestCase):
         self.assertEqual(int(result["supervised_tokens"].item()), 11)
         self.assertEqual(int(result["valid_tokens"].item()), 11)
 
+    def test_batched_multi_anchor_uses_one_diffusion_forward_for_span(self):
+        model = _policy_shell()
+        model._manual_global_step = 1
+        data = _toy_sequence(num_agents=1, num_tokens=8, num_frames=41)
+        batched_calls = []
+        build_inputs_calls = []
+        loss_calls = []
+        overlap_calls = []
+        test_case = self
+
+        def fail_training_view(self, *args, **kwargs):
+            del self, args, kwargs
+            raise AssertionError("batched multi-anchor must not build per-anchor views")
+
+        def fake_batched_view(self, batch, anchors):
+            del batch
+            batched_calls.append(list(anchors))
+            return data, 3
+
+        def fake_build_inputs(self, batch, rollout_valid=False, return_context=False):
+            del batch, rollout_valid, return_context
+            build_inputs_calls.append(True)
+            token_ids = torch.tensor(
+                [
+                    [3, 4, 5, 6],
+                    [4, 5, 6, 0],
+                    [5, 6, 0, 0],
+                ],
+                dtype=torch.long,
+            )
+            valid = torch.tensor(
+                [
+                    [True, True, True, True],
+                    [True, True, True, False],
+                    [True, True, False, False],
+                ]
+            )
+            packed = {
+                "token_ids": token_ids,
+                "valid_mask": valid,
+                "loss_mask_base": valid.clone(),
+                "chunk_ids": torch.arange(self.ar_prediction_tokens).unsqueeze(0).expand(3, -1),
+                "token_agent_ids": torch.zeros_like(token_ids),
+                "agent_maps": [
+                    (0, 0, torch.tensor([0])),
+                    (1, 1, torch.tensor([0])),
+                    (2, 2, torch.tensor([0])),
+                ],
+            }
+            return (
+                packed,
+                torch.zeros(3, 1),
+                token_ids,
+                valid,
+                torch.ones(1, dtype=torch.bool),
+                torch.ones(1, dtype=torch.bool),
+                torch.zeros(1, dtype=torch.long),
+            )
+
+        def fake_diffusion_loss(self, packed, summary, **kwargs):
+            del summary
+            loss_calls.append(kwargs)
+            test_case.assertTrue(torch.equal(kwargs["forced_mask"], packed["valid_mask"]))
+            test_case.assertEqual(kwargs["loss_normalization"], "supervision_weight")
+            test_case.assertTrue(kwargs["return_details"])
+            logits = torch.full((*packed["token_ids"].shape, 8), -4.0)
+            for row in range(logits.shape[0]):
+                for col in range(logits.shape[1]):
+                    logits[row, col, int(packed["token_ids"][row, col])] = 4.0
+            return torch.tensor(2.0), torch.tensor(0.5), {
+                "logits": logits,
+                "loss_mask": packed["loss_mask_base"].clone(),
+            }
+
+        def fake_overlap(self, packed, details):
+            del packed, details
+            overlap_calls.append(True)
+            return torch.tensor(0.4)
+
+        model._build_ar_training_view = MethodType(fail_training_view, model)
+        model._build_discrete_policy_batched_anchor_view = MethodType(fake_batched_view, model)
+        model._build_diffusion_inputs = MethodType(fake_build_inputs, model)
+        model._compute_diffusion_loss = MethodType(fake_diffusion_loss, model)
+        model._discrete_policy_batched_overlap_loss = MethodType(fake_overlap, model)
+
+        result = model._compute_discrete_policy_training_loss(data, torch.tensor(0.0))
+
+        self.assertEqual(batched_calls, [[3, 4, 5]])
+        self.assertEqual(len(build_inputs_calls), 1)
+        self.assertEqual(len(loss_calls), 1)
+        self.assertEqual(len(overlap_calls), 1)
+        self.assertEqual(result["window_count"], 3)
+        self.assertAlmostEqual(float(result["chunk_loss"]), 2.0, places=5)
+        self.assertAlmostEqual(float(result["overlap_loss"]), 0.4, places=5)
+
+    def test_batched_anchor_view_preserves_anchor_and_source_metadata(self):
+        model = _policy_shell()
+        data = _toy_sequence(num_agents=2, num_tokens=8, num_frames=41)
+
+        batched, window_count = model._build_discrete_policy_batched_anchor_view(
+            data,
+            [3, 4],
+        )
+
+        self.assertEqual(window_count, 2)
+        self.assertEqual(tuple(batched["agent"]["token_idx"].shape), (4, 6))
+        self.assertTrue(torch.equal(
+            batched["agent"]["source_scene_id"],
+            torch.tensor([0, 0, 0, 0]),
+        ))
+        self.assertTrue(torch.equal(
+            batched["agent"]["source_agent_id"],
+            torch.tensor([0, 1, 0, 1]),
+        ))
+        self.assertTrue(torch.equal(
+            batched["agent"]["source_anchor_token"],
+            torch.tensor([3, 3, 4, 4]),
+        ))
+        self.assertTrue(torch.equal(
+            batched["agent"]["token_idx"][:, :2],
+            torch.tensor([[1, 2], [1, 2], [2, 3], [2, 3]]),
+        ))
+
     def test_training_step_uses_only_diffusion_chunk_and_overlap_losses(self):
         model = _policy_shell()
         torch.nn.Module.__init__(model)
@@ -276,6 +401,7 @@ class SMARTDiscreteDiffusionPolicyConfigTest(unittest.TestCase):
         self.assertFalse(cfg.Model.diffusion.carry_tail_proposal)
         self.assertEqual(cfg.Model.diffusion.discrete_policy_candidate_count, 1)
         self.assertFalse(cfg.Model.diffusion.discrete_policy_candidate_score_enabled)
+        self.assertTrue(cfg.Model.diffusion.discrete_policy_batched_multi_anchor)
         self.assertFalse(cfg.Model.diffusion.use_map_context)
         self.assertFalse(cfg.Model.diffusion.use_agent_context)
         self.assertEqual(
@@ -290,6 +416,7 @@ class SMARTDiscreteDiffusionPolicyConfigTest(unittest.TestCase):
             list(cfg.Model.diffusion.discrete_policy_candidate_chunk_weights),
             [1.0, 0.3, 0.15, 0.075],
         )
+        self.assertEqual(cfg.Model.diffusion.self_condition_prob, 0.0)
 
 
 if __name__ == "__main__":

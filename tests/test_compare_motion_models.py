@@ -95,6 +95,8 @@ class CompareMotionModelsTest(unittest.TestCase):
                     self.assertEqual(cfg.Model.diffusion.execution_horizon, 1)
                     self.assertEqual(cfg.Model.diffusion.discrete_policy_candidate_count, 1)
                     self.assertFalse(cfg.Model.diffusion.discrete_policy_candidate_score_enabled)
+                    self.assertTrue(cfg.Model.diffusion.discrete_policy_batched_multi_anchor)
+                    self.assertEqual(cfg.Model.diffusion.self_condition_prob, 0.0)
                 else:
                     self.assertEqual(cfg.Dataset.train_raw_dir, [TRAIN_DIR])
                     self.assertEqual(cfg.Dataset.val_raw_dir, [VAL_DIR])
