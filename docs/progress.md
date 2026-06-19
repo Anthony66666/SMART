@@ -1,6 +1,13 @@
 # Progress
 
 ## 2026-06-20 CST
+- Task: Fixed a second AMP `16-mixed` dtype crash in SMARTDiffusion physical token embeddings.
+- Result: `SMARTDiffusion._physical_token_embeddings()` now initializes its output buffer from the actual token embedding table dtype instead of the FP32 type-embedding parameter dtype. This handles autocast FP16 outputs from `token_emb_veh/ped/cyc` during diffusion denoising and proposal embedding.
+- Files: `smart/model/smart_diffusion.py`, `tests/test_smart_diffusion_smart_parity.py`, `docs/progress.md`, `docs/next.md`
+- Validation: Added a regression that forces the physical token tables to FP16 and calls the real `_physical_token_embeddings()` path; it failed with the same Float destination / Half source error before the fix and now passes. Related SMARTDiffusion parity, agent decoder AMP, discrete-policy, compare-model tests, py_compile, and `git diff --check` passed locally.
+- Next: Retry the server `16-mixed` discrete diffusion-policy run. If a later AMP error appears, inspect the next indexed assignment into a scratch tensor allocated from FP32 parameters.
+
+## 2026-06-20 CST
 - Task: Fixed the SMART agent token embedding crash under `16-mixed` / AMP training.
 - Result: `SMARTAgentDecoder.agent_token_embedding()` now allocates the packed token-embedding buffer from the token embedding output dtype instead of default FP32, so autocast FP16 token embeddings can be indexed back into the agent-token tensor without dtype mismatch. Inference trajectory-token buffers also allocate with their source trajectory-token dtype. The full server discrete diffusion-policy config now uses `Trainer.precision: "16-mixed"` while keeping `train_batch_size: 4`.
 - Files: `smart/modules/agent_decoder.py`, `configs/train/train_scalable_discrete_diffusion_policy.yaml`, `tests/test_agent_decoder_history_context.py`, `tests/test_smart_discrete_diffusion_policy.py`, `docs/progress.md`, `docs/next.md`

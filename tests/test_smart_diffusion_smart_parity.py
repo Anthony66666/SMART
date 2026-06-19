@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import torch
 from torch_geometric.data import HeteroData
 
@@ -28,6 +29,14 @@ def _diffusion_shell():
     model.supervision_mode = 'smart_category3'
     model.metric_mode = 'smart_val_compatible'
     return model
+
+
+class _HalfTokenTable:
+    def __init__(self, hidden_dim):
+        self.hidden_dim = hidden_dim
+
+    def __call__(self, x):
+        return x.new_zeros(x.shape[0], self.hidden_dim, dtype=torch.float16)
 
 
 def _real_token_diffusion_shell():
@@ -191,6 +200,33 @@ def _refresh_real_token_geometry(model, type_id, token_seq, start_pos, start_hea
 
 
 class SMARTDiffusionSMARTParityTest(unittest.TestCase):
+    def test_physical_token_embeddings_accept_half_precision_token_tables(self):
+        model = _diffusion_shell()
+        model.hidden_dim = 4
+        model.model_config.decoder.token_size = 3
+        model.diffusion_decoder.mask_token_id = 3
+        token = np.zeros((model.token_size, 4, 2), dtype=np.float32)
+        token_embedder = _HalfTokenTable(model.hidden_dim)
+        agent_encoder = SimpleNamespace(
+            type_a_emb=SimpleNamespace(weight=torch.empty(1, dtype=torch.float32)),
+            trajectory_token={"veh": token, "ped": token, "cyc": token},
+            token_emb_veh=token_embedder,
+            token_emb_ped=token_embedder,
+            token_emb_cyc=token_embedder,
+        )
+        model.encoder = SimpleNamespace(agent_encoder=agent_encoder)
+        token_ids = torch.tensor([[0, 1, model.mask_token_id], [2, 0, 1]])
+        agent_type_ids = torch.tensor([[0, 1, 0], [2, 2, 1]])
+
+        try:
+            embeddings = model._physical_token_embeddings(token_ids, agent_type_ids)
+        except RuntimeError as exc:
+            self.fail(f"_physical_token_embeddings should accept half precision token tables: {exc}")
+
+        self.assertEqual(embeddings.dtype, torch.float16)
+        self.assertEqual(tuple(embeddings.shape), (2, 3, model.hidden_dim))
+        self.assertTrue(torch.equal(embeddings[0, 2], torch.zeros(model.hidden_dim, dtype=torch.float16)))
+
     def test_agent_masks_match_original_smart_roles(self):
         model = _diffusion_shell()
         data = _agent_data()

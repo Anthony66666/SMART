@@ -258,10 +258,7 @@ class SMARTDiffusion(SMART):
         device = token_ids.device
         non_mask = token_ids != self.mask_token_id
         token_ids = token_ids.clamp(min=0, max=self.token_size - 1)
-        embeddings = agent_encoder.type_a_emb.weight.new_zeros(
-            (*token_ids.shape, self.hidden_dim),
-            device=device,
-        )
+        embeddings = None
 
         token_specs = [
             ('veh', 0, agent_encoder.token_emb_veh),
@@ -277,7 +274,16 @@ class SMARTDiffusion(SMART):
                 dtype=torch.float,
             )
             token_table = token_embedder(token_template.reshape(token_template.shape[0], -1))
+            if embeddings is None:
+                embeddings = token_table.new_zeros((*token_ids.shape, self.hidden_dim))
+            elif token_table.dtype != embeddings.dtype:
+                token_table = token_table.to(dtype=embeddings.dtype)
             embeddings[type_mask] = token_table[token_ids[type_mask]]
+        if embeddings is None:
+            embeddings = agent_encoder.type_a_emb.weight.new_zeros(
+                (*token_ids.shape, self.hidden_dim),
+                device=device,
+            )
         return embeddings
 
     def _zero_connected_loss(self):
