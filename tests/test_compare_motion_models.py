@@ -10,6 +10,7 @@ from scripts.compare_motion_models import parse_model_spec
 
 TRAIN_DIR = "/home/anthony/SimAgentJEPA/data/waymo/training_subset_10pct"
 VAL_DIR = "/home/anthony/SimAgentJEPA/data/waymo/validation"
+DEMO_DIR = "data/valid_demo"
 
 
 class CompareMotionModelsTest(unittest.TestCase):
@@ -74,9 +75,19 @@ class CompareMotionModelsTest(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertTrue(Path(path).exists())
                 cfg = load_config_act(path)
-                self.assertEqual(cfg.Dataset.train_raw_dir, [TRAIN_DIR])
-                self.assertEqual(cfg.Dataset.val_raw_dir, [VAL_DIR])
                 expected_steps = 2000 if predictor == "smart_discrete_diffusion_policy" else 1000
+                if predictor == "smart_discrete_diffusion_policy":
+                    self.assertEqual(cfg.Dataset.train_raw_dir, [DEMO_DIR])
+                    self.assertEqual(cfg.Dataset.val_raw_dir, [DEMO_DIR])
+                    self.assertIsNone(cfg.Trainer.check_val_every_n_epoch)
+                    self.assertEqual(cfg.Model.hidden_dim, 64)
+                    self.assertEqual(cfg.Model.decoder.num_agent_layers, 1)
+                    self.assertEqual(cfg.Model.diffusion.num_layers, 1)
+                    self.assertFalse(cfg.Model.diffusion.use_map_context)
+                    self.assertFalse(cfg.Model.diffusion.use_agent_context)
+                else:
+                    self.assertEqual(cfg.Dataset.train_raw_dir, [TRAIN_DIR])
+                    self.assertEqual(cfg.Dataset.val_raw_dir, [VAL_DIR])
                 self.assertEqual(cfg.Trainer.max_steps, expected_steps)
                 self.assertEqual(cfg.Trainer.val_check_interval, expected_steps)
                 self.assertEqual(cfg.Trainer.checkpoint_every_n_train_steps, expected_steps)

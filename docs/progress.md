@@ -1,11 +1,19 @@
 # Progress
 
 ## 2026-06-19 CST
+- Task: Completed the local 2000-step smoke run for `smart_discrete_diffusion_policy`.
+- Result: Updated `configs/train/train_scalable_discrete_diffusion_policy_2000.yaml` into a tiny local smoke config using `data/valid_demo`, reduced model layers/context, global step-based validation, and the same discrete-policy training terms: dense SMART NTP, chunk-weighted four-token diffusion CE, and overlap KL.
+- Run: `python -u train.py --config configs/train/train_scalable_discrete_diffusion_policy_2000.yaml --save_ckpt_path checkpoints/discrete_diffusion_policy_2000` reached `max_steps=2000`, ran one validation batch, and wrote the current smoke checkpoint to `checkpoints/discrete_diffusion_policy_2000/last.ckpt` (`global_step=2000`, `epoch=181`, `hidden_dim=64`). A stale full-config checkpoint in the same directory was preserved as `last_full_config_2000.ckpt`.
+- Metrics: TensorBoard `version_98` recorded final smoke metrics at step 1999: `val_minADE=4.3555`, `val_minFDE=10.0936`, `val_ar_window_loss=3.0050`, `val_ar_window_mask_acc=0.3556`, `train_loss_epoch=4.6166`, `smart_ntp_loss_epoch=2.2379`, `discrete_policy_chunk_loss_epoch=9.4120`, and `discrete_policy_overlap_loss_epoch=0.5158`.
+- Outputs: Step visualizations are under `outputs/step_discrete_diffusion_policy_2000/smart_discrete_diffusion_policy/step_002000/`; validation visualizations are under `outputs/val_discrete_diffusion_policy_2000/smart_discrete_diffusion_policy/epoch_182/`. PNGs were verified as nonblank 1440x1440 RGBA images.
+- Next: Use the smoke result only to verify the train/validation/visualization path. For quality claims, train the full server config `configs/train/train_scalable_discrete_diffusion_policy.yaml`.
+
+## 2026-06-19 CST
 - Task: Added a discrete diffusion-policy branch that commits one token from reranked four-token candidates.
 - Result: Added `smart_discrete_diffusion_policy`, a SMART-token diffusion-policy ablation that keeps the AR receding-horizon shell, predicts four-token windows, commits only chunk 0, discards the tail chunks, and scores multiple sampled candidate windows with decayed chunk energy weights before commit.
 - Training objective: Combines dense original SMART next-token CE (`ntp_aux_loss_weight: 1.0`), chunk-weighted full-window diffusion CE with weights `[1.0, 0.3, 0.15, 0.075]`, terminal-safe incomplete windows, deterministic contiguous anchor spans, and overlap KL from source tail logits to the corresponding future chunk-0 logits.
 - Files: `smart/model/smart_discrete_diffusion_policy.py`, predictor registries, local/server/validation discrete-policy configs, `tests/test_smart_discrete_diffusion_policy.py`, `tests/test_compare_motion_models.py`, and durable docs.
-- Validation: Focused unit tests cover one-token commit without temporal voting, decayed candidate-window scoring, contiguous anchor-window training, overlap KL wiring, total loss composition, and config invariants. Run the local 2000-step smoke config before using it for quality comparisons.
+- Validation: Focused unit tests cover one-token commit without temporal voting, decayed candidate-window scoring, contiguous anchor-window training, overlap KL wiring, total loss composition, and config invariants. The local 2000-step config is a tiny `data/valid_demo` functional smoke with reduced layers/context so it can finish locally; do not use it for quality comparisons.
 - Next: Train `configs/train/train_scalable_discrete_diffusion_policy.yaml` on the server and compare against AR rerank, discrete action-chunk, continuous action diffusion, causal flow matching, and original SMART on a fixed validation slice.
 
 ## 2026-06-19 CST

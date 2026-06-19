@@ -226,12 +226,21 @@ class SMARTDiscreteDiffusionPolicyConfigTest(unittest.TestCase):
         )
 
         self.assertEqual(cfg.Model.predictor, "smart_discrete_diffusion_policy")
+        self.assertEqual(cfg.Dataset.train_raw_dir, ["data/valid_demo"])
+        self.assertEqual(cfg.Dataset.val_raw_dir, ["data/valid_demo"])
         self.assertEqual(cfg.Trainer.max_steps, 2000)
         self.assertEqual(cfg.Trainer.val_check_interval, 2000)
+        self.assertIsNone(cfg.Trainer.check_val_every_n_epoch)
+        self.assertEqual(cfg.Model.hidden_dim, 64)
+        self.assertEqual(cfg.Model.decoder.num_map_layers, 0)
+        self.assertEqual(cfg.Model.decoder.num_agent_layers, 1)
         self.assertEqual(cfg.Model.diffusion.discrete_policy_objective, "chunk_rerank_v1")
+        self.assertEqual(cfg.Model.diffusion.num_layers, 1)
         self.assertEqual(cfg.Model.diffusion.ntp_aux_loss_weight, 1.0)
         self.assertEqual(cfg.Model.diffusion.commit_tokens, 1)
         self.assertFalse(cfg.Model.diffusion.carry_tail_proposal)
+        self.assertFalse(cfg.Model.diffusion.use_map_context)
+        self.assertFalse(cfg.Model.diffusion.use_agent_context)
         self.assertEqual(
             list(cfg.Model.diffusion.causal_loss_weights),
             [1.0, 0.3, 0.15, 0.075],
