@@ -429,8 +429,8 @@ class SMARTCausalDiffusion(SMARTAutoregressiveDiffusion):
             getattr(self, 'closed_loop_batch_ratio_max', 0.5)
         )
         if epoch <= 3:
-            return 0.0, maximum
-        return 0.25, maximum
+            return 0.1, maximum
+        return 0.1, maximum
 
     def _pool_agent_context(self, hist_tokens, hist_mask):
         """Pool ordered history with greater weight on the latest token."""
@@ -836,106 +836,14 @@ class SMARTCausalDiffusion(SMARTAutoregressiveDiffusion):
         token_center_vocabs=None,
     ):
         """Retokenize a world-frame continuation from an arbitrary anchor."""
-        if future_positions.dim() != 4:
-            raise ValueError("future_positions must have shape [agent, chunk, step, 2].")
-        num_agents, num_chunks, num_steps, _ = future_positions.shape
-        if num_steps != self.ar_token_steps:
-            raise ValueError(
-                f"Expected {self.ar_token_steps} frames per token, got {num_steps}."
-            )
-        use_physical_decode = token_center_vocabs is None
-        center_vocabs = (
-            self._token_center_vocabs()
-            if use_physical_decode
-            else token_center_vocabs
+        return super()._retokenize_future(
+            future_positions=future_positions,
+            future_valid=future_valid,
+            start_positions=start_positions,
+            start_headings=start_headings,
+            agent_types=agent_types,
+            token_center_vocabs=token_center_vocabs,
         )
-        device = future_positions.device
-        token_ids = torch.zeros(num_agents, num_chunks, dtype=torch.long, device=device)
-        errors = future_positions.new_full((num_agents, num_chunks), float('inf'))
-        target_valid = torch.zeros(
-            num_agents,
-            num_chunks,
-            dtype=torch.bool,
-            device=device,
-        )
-        local_endpoints = future_positions.new_zeros(num_agents, num_chunks, 2)
-        current_positions = start_positions.clone()
-        current_headings = start_headings.clone()
-        type_names = ('veh', 'ped', 'cyc')
-
-        for chunk_idx in range(num_chunks):
-            for agent_idx in range(num_agents):
-                agent_type = int(agent_types[agent_idx].item())
-                if agent_type < 0 or agent_type >= len(type_names):
-                    continue
-                frame_valid = future_valid[agent_idx, chunk_idx].bool()
-                if not frame_valid.any():
-                    continue
-                world_delta = (
-                    future_positions[agent_idx, chunk_idx]
-                    - current_positions[agent_idx]
-                )
-                heading = current_headings[agent_idx]
-                cos_heading = heading.cos()
-                sin_heading = heading.sin()
-                world_to_local = torch.stack([
-                    torch.stack([cos_heading, -sin_heading]),
-                    torch.stack([sin_heading, cos_heading]),
-                ])
-                target_local = world_delta @ world_to_local
-                valid_indices = torch.nonzero(frame_valid, as_tuple=False).squeeze(-1)
-                local_endpoints[agent_idx, chunk_idx] = target_local[valid_indices[-1]]
-
-                vocab = center_vocabs[type_names[agent_type]].to(
-                    device=device,
-                    dtype=future_positions.dtype,
-                )
-                distances = torch.norm(
-                    vocab[:, frame_valid] - target_local[frame_valid].unsqueeze(0),
-                    dim=-1,
-                ).mean(dim=-1)
-                best_error, best_token = distances.min(dim=0)
-                token_ids[agent_idx, chunk_idx] = best_token
-                errors[agent_idx, chunk_idx] = best_error
-                threshold = self.retokenization_error_thresholds[agent_type]
-                target_valid[agent_idx, chunk_idx] = best_error <= threshold
-
-                if use_physical_decode:
-                    world, world_heading = self._token_chunk_world(
-                        best_token.view(1),
-                        agent_types[agent_idx].view(1),
-                        current_positions[agent_idx].view(1, 2),
-                        current_headings[agent_idx].view(1),
-                    )
-                    current_positions[agent_idx] = world[0, valid_indices[-1]]
-                    current_headings[agent_idx] = world_heading[
-                        0,
-                        valid_indices[-1],
-                    ]
-                else:
-                    selected = vocab[best_token]
-                    endpoint_local = selected[valid_indices[-1]]
-                    local_to_world = torch.stack([
-                        torch.stack([cos_heading, sin_heading]),
-                        torch.stack([-sin_heading, cos_heading]),
-                    ])
-                    current_positions[agent_idx] = (
-                        endpoint_local @ local_to_world
-                        + current_positions[agent_idx]
-                    )
-                    if valid_indices.numel() >= 2:
-                        last_delta = (
-                            selected[valid_indices[-1]]
-                            - selected[valid_indices[-2]]
-                        )
-                    else:
-                        last_delta = selected[valid_indices[-1]]
-                    if torch.norm(last_delta) > 1e-6:
-                        current_headings[agent_idx] = (
-                            current_headings[agent_idx]
-                            + torch.atan2(last_delta[1], last_delta[0])
-                        )
-        return token_ids, errors, target_valid, local_endpoints
 
     def _continuous_recovery_loss(self, logits, packed, masked_supervision):
         retokenization_valid = packed.get('retokenization_valid')

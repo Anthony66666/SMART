@@ -79,6 +79,9 @@ Model:
     current_state_edges: true
     history_recency_decay: 0.5
     retokenization_error_thresholds: [0.7379697561264038, 0.8562850952148438, 1.2705252170562744]
+    retokenization_noise:
+      enabled: true
+      topk: 5
     continuous_recovery_loss_weight: 1.0
     frontier_loss_weight: 1.0
     encoder_lr_scale: 0.5

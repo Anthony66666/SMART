@@ -1428,6 +1428,7 @@ class CausalDiffusionConfigTest(unittest.TestCase):
 
         for config_path in config_paths:
             config = load_config_act(str(config_path))
+            local_config = config_path.name == 'train_scalable_causal_diffusion_local.yaml'
             self.assertEqual(config.Model.predictor, 'smart_causal_diffusion')
             self.assertEqual(config.Model.diffusion.prediction_tokens, 4)
             self.assertEqual(config.Model.diffusion.commit_tokens, 1)
@@ -1439,13 +1440,19 @@ class CausalDiffusionConfigTest(unittest.TestCase):
                 config.Model.diffusion.causal_objective,
                 'discrete_frontier_v2',
             )
-            self.assertTrue(config.Model.diffusion.carry_tail_proposal)
-            self.assertTrue(config.Model.diffusion.proposal_conditioning_enabled)
+            self.assertEqual(
+                bool(config.Model.diffusion.carry_tail_proposal),
+                not local_config,
+            )
+            self.assertEqual(
+                bool(config.Model.diffusion.proposal_conditioning_enabled),
+                not local_config,
+            )
             self.assertTrue(config.Model.diffusion.current_state_enabled)
             self.assertTrue(config.Model.diffusion.current_state_edges)
             self.assertEqual(
                 config.Model.diffusion.closed_loop_batch_ratio_max,
-                0.5,
+                0.0 if local_config else 0.5,
             )
             self.assertEqual(config.Model.diffusion.encoder_lr_scale, 0.5)
             expected_epochs = config.Trainer.max_epochs
@@ -1460,6 +1467,8 @@ class CausalDiffusionConfigTest(unittest.TestCase):
                     1.2705252170562744,
                 ],
             )
+            self.assertTrue(config.Model.diffusion.retokenization_noise.enabled)
+            self.assertEqual(config.Model.diffusion.retokenization_noise.topk, 5)
             self.assertIn(
                 config.Model.diffusion.guidance.mode,
                 ('none', 'safe', 'ego_stress', 'ego_edit'),
@@ -1471,6 +1480,20 @@ class CausalDiffusionConfigTest(unittest.TestCase):
                 config.Model.diffusion.guidance.target_spec,
                 'ego_risk',
             )
+
+    def test_causal_training_configs_enable_smart_style_retokenization_noise(self):
+        root = Path(__file__).resolve().parents[1]
+        config_paths = [
+            root / 'configs/train/train_scalable_causal_diffusion.yaml',
+            root / 'configs/train/train_scalable_causal_diffusion_local.yaml',
+            root / 'configs/train/train_scalable_causal_diffusion_1000.yaml',
+            root / 'configs/validation/validation_scalable_causal_diffusion.yaml',
+        ]
+
+        for config_path in config_paths:
+            config = load_config_act(str(config_path))
+            self.assertTrue(config.Model.diffusion.retokenization_noise.enabled)
+            self.assertEqual(config.Model.diffusion.retokenization_noise.topk, 5)
 
     def test_horizon_metrics_slice_requested_rollout_prefix(self):
         model = _causal_shell()

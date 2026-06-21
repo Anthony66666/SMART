@@ -1528,6 +1528,47 @@ class SMARTAutoregressiveDiffusionTest(unittest.TestCase):
         self.assertTrue(torch.equal(metadata["retokenization_valid"], retokenization_valid))
         self.assertTrue(torch.equal(metadata["recovery_target_local_endpoint"], local_endpoints))
 
+    def test_retokenize_future_can_roll_from_noised_topk_token(self):
+        model = _ar_shell()
+        model.ar_token_steps = 1
+        model.retokenization_error_thresholds = (100.0, 100.0, 100.0)
+        model.retokenization_noise_enabled = True
+        model.retokenization_noise_topk = 2
+        model.training = True
+        token_center_vocabs = {
+            "veh": torch.tensor([
+                [[1.0, 0.0]],
+                [[0.0, 1.0]],
+            ]),
+            "ped": torch.tensor([
+                [[1.0, 0.0]],
+                [[0.0, 1.0]],
+            ]),
+            "cyc": torch.tensor([
+                [[1.0, 0.0]],
+                [[0.0, 1.0]],
+            ]),
+        }
+        future_positions = torch.tensor([[
+            [[1.0, 0.0]],
+            [[2.0, 0.0]],
+            [[1.0, 2.0]],
+        ]])
+        future_valid = torch.ones(1, 3, 1, dtype=torch.bool)
+
+        torch.manual_seed(7)
+        token_ids, _errors, valid, _local_endpoints = model._retokenize_future(
+            future_positions=future_positions,
+            future_valid=future_valid,
+            start_positions=torch.zeros(1, 2),
+            start_headings=torch.zeros(1),
+            agent_types=torch.tensor([0]),
+            token_center_vocabs=token_center_vocabs,
+        )
+
+        self.assertTrue(torch.equal(token_ids, torch.tensor([[0, 1, 0]])))
+        self.assertTrue(valid.all())
+
     def test_current_state_context_is_added_to_each_agent_chunk(self):
         model = _ar_shell()
         model.ar_prediction_tokens = 2

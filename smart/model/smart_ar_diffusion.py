@@ -138,6 +138,24 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
                 "diffusion.retokenization_error_thresholds must contain veh/ped/cyc values."
             )
         self.retokenization_error_thresholds = thresholds
+        retokenization_noise_cfg = getattr(diffusion_cfg, 'retokenization_noise', None)
+        self.retokenization_noise_enabled = bool(
+            getattr(
+                retokenization_noise_cfg,
+                'enabled',
+                getattr(diffusion_cfg, 'retokenization_noise_enabled', False),
+            )
+        )
+        self.retokenization_noise_topk = max(
+            1,
+            int(
+                getattr(
+                    retokenization_noise_cfg,
+                    'topk',
+                    getattr(diffusion_cfg, 'retokenization_noise_topk', 5),
+                )
+            ),
+        )
         self.ar_closed_loop_batch_ratio_max = min(
             1.0,
             max(
@@ -853,6 +871,32 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
             self._token_center_vocab_cache = center_vocabs
         return self._token_center_vocab_cache
 
+    def _retokenization_noise_active(self):
+        return (
+            bool(getattr(self, 'retokenization_noise_enabled', False))
+            and bool(getattr(self, 'training', False))
+        )
+
+    def _select_retokenization_token(self, distances, chunk_idx):
+        best_error, best_token = distances.min(dim=0)
+        if (
+            chunk_idx <= 0
+            or not self._retokenization_noise_active()
+            or distances.numel() <= 1
+        ):
+            return best_error, best_token
+
+        topk = min(
+            int(getattr(self, 'retokenization_noise_topk', 5)),
+            int(distances.shape[0]),
+        )
+        if topk <= 1:
+            return best_error, best_token
+        topk_errors, topk_tokens = distances.topk(topk, largest=False)
+        sample_slot = torch.randint(topk, (1,), device=distances.device)
+        sample_slot = sample_slot.squeeze(0)
+        return topk_errors[sample_slot], topk_tokens[sample_slot]
+
     def _retokenize_future(
         self,
         future_positions,
@@ -920,15 +964,18 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
                     vocab[:, frame_valid] - target_local[frame_valid].unsqueeze(0),
                     dim=-1,
                 ).mean(dim=-1)
-                best_error, best_token = distances.min(dim=0)
-                token_ids[agent_idx, chunk_idx] = best_token
-                errors[agent_idx, chunk_idx] = best_error
+                selected_error, selected_token = self._select_retokenization_token(
+                    distances,
+                    chunk_idx,
+                )
+                token_ids[agent_idx, chunk_idx] = selected_token
+                errors[agent_idx, chunk_idx] = selected_error
                 threshold = self.retokenization_error_thresholds[agent_type]
-                target_valid[agent_idx, chunk_idx] = best_error <= threshold
+                target_valid[agent_idx, chunk_idx] = selected_error <= threshold
 
                 if use_physical_decode:
                     world, world_heading = self._token_chunk_world(
-                        best_token.view(1),
+                        selected_token.view(1),
                         agent_types[agent_idx].view(1),
                         current_positions[agent_idx].view(1, 2),
                         current_headings[agent_idx].view(1),
@@ -948,7 +995,7 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
                             valid_indices[-1],
                         ]
                 else:
-                    selected = vocab[best_token]
+                    selected = vocab[selected_token]
                     endpoint_local = selected[valid_indices[-1]]
                     local_to_world = torch.stack([
                         torch.stack([cos_heading, sin_heading]),

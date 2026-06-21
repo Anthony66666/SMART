@@ -1,5 +1,11 @@
 # Progress
 
+## 2026-06-21 CST
+- Task: Added SMART-style noised rolling retokenization to causal diffusion training.
+- Result: `SMARTAutoregressiveDiffusion._retokenize_future()` can now, when enabled, keep chunk 0 matched to the nearest token and sample later chunks from the nearest top-k SMART motion tokens, then roll the retokenization state from the sampled token. `SMARTCausalDiffusion` now reuses the shared AR retokenization implementation instead of carrying a duplicate copy.
+- Config: Causal diffusion train/local/1000/validation configs now declare `retokenization_noise.enabled: true` and `topk: 5`. The noise is gated by `model.training`, so standalone validation remains deterministic.
+- Validation: Added a regression for rolling from a noised top-k token and config assertions for the causal retokenization-noise fields.
+
 ## 2026-06-20 CST
 - Task: Fixed a second AMP `16-mixed` dtype crash in SMARTDiffusion physical token embeddings.
 - Result: `SMARTDiffusion._physical_token_embeddings()` now initializes its output buffer from the actual token embedding table dtype instead of the FP32 type-embedding parameter dtype. This handles autocast FP16 outputs from `token_emb_veh/ped/cyc` during diffusion denoising and proposal embedding.
@@ -709,3 +715,15 @@
 - Files: `smart/model/smart_discrete_diffusion_policy.py`, `tests/test_smart_discrete_diffusion_policy.py`, `docs/progress.md`, `docs/next.md`
 - Validation: Real `data/valid_demo` training smoke ran `training_step` plus `backward` with loss `4.834183216094971`; `tests.test_smart_discrete_diffusion_policy` and `tests.test_compare_motion_models` passed; `py_compile` and `git diff --check` passed.
 - Next: Retrain or rerun a short server throughput smoke with this optimized discrete-policy path before comparing wall-clock speed.
+
+## 2026-06-20 CST
+- Task: Documented all SMART model variants in the current checkout.
+- Result: Added `docs/model_variants.md`, a consolidated inventory of current train/validation predictors, config examples, rollout/loss differences, proposal/rerank/guidance behavior, and historical JEPA status.
+- Files: `docs/model_variants.md`, `docs/progress.md`, `docs/next.md`
+- Validation: `git diff --check` passed for the documentation update.
+
+## 2026-06-20 CST
+- Task: Converted the SMART model variant inventory to Chinese.
+- Result: Rewrote `docs/model_variants.md` in Chinese and localized the new `docs/next.md` pointer while preserving the full model coverage and comparison structure.
+- Files: `docs/model_variants.md`, `docs/progress.md`, `docs/next.md`
+- Validation: `git diff --check` passed for the Chinese documentation update.

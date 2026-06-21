@@ -1,5 +1,12 @@
 # Decisions
 
+## Decision: Use SMART-style top-k rolling retokenization noise for causal training
+- Date: 2026-06-21
+- Context: Original SMART reduces train/inference distribution mismatch by rolling tokenization from a slightly perturbed matched token, while causal diffusion retokenization previously always selected the nearest token and rolled from that clean token.
+- Decision: Add config-gated `retokenization_noise` to the shared AR retokenization path. When training and enabled, chunk 0 remains nearest-token matched, and chunk 1+ sample uniformly from the nearest `topk` motion tokens; the next chunk's local frame is updated from the sampled token.
+- Why: This mirrors the official SMART robustness mechanism without adding a model rollout forward to every retokenization step, and it keeps validation/eval deterministic because the noise is gated by `model.training`.
+- Impact: Active causal diffusion configs set `retokenization_noise.enabled: true` and `topk: 5`. Checkpoints trained before this change did not have noised rolling retokenization targets and should be treated as stale for distribution-shift ablations.
+
 ## Decision: Batch discrete-policy training anchors in one forward
 - Date: 2026-06-20
 - Context: After removing dense SMART NTP CE, discrete-policy training was still slow because each selected anchor rebuilt an AR view, re-ran history/map encoding, and ran diffusion loss separately. Server configs selected four anchors per batch.

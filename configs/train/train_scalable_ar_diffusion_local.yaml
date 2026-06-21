@@ -7,7 +7,7 @@ time_info: &time_info
 
 Dataset:
   root:
-  train_batch_size: 1
+  train_batch_size: 2
   val_batch_size: 1
   test_batch_size: 1
   shuffle: True
@@ -25,10 +25,10 @@ Dataset:
   <<: *time_info
 
 Trainer:
-  strategy: ddp_find_unused_parameters_false
+  strategy: ddp_find_unused_parameters_true
   accelerator: "gpu"
   devices: 1
-  max_epochs: 5
+  max_epochs: 3
   save_ckpt_path:
   num_nodes: 1
   mode:
@@ -44,13 +44,13 @@ Visualization:
   enabled: true
   interval_epochs: 1
   sample_indices: [0, 1, 2, 3]
-  output_dir: "./outputs/val_visualizations"
+  output_dir: "./outputs/val_visualizations_0620"
   max_agents: 0
   step_viz:
     enabled: true
     interval_steps: 2000
-    sample_indices: [0, 1, 2, 3]
-    output_dir: "./outputs/step_visualizations"
+    sample_indices: [110, 111, 112, 113]
+    output_dir: "./outputs/step_visualizations_0620"
 
 Model:
   mode: "train"
@@ -67,7 +67,7 @@ Model:
   num_freq_bands: 64
   lr: 0.0005
   warmup_steps: 0
-  total_steps: 60000
+  total_steps: 3
   inference_token: True
   rollout_num: 1
   decoder:
@@ -83,10 +83,10 @@ Model:
     history_tokens: 2
     prediction_tokens: 4
     commit_tokens: 1
-    carry_tail_proposal: true
+    carry_tail_proposal: false
     causal_noise_schedule: false
     causal_chunk_mask_multipliers: [0.70, 0.90, 1.10, 1.30]
-    causal_loss_weights: [1.0, 1.0, 0.75, 0.5]
+    causal_loss_weights: [1.0, 0.75, 0.75, 0.5]
     token_steps: 5
     total_rollout_steps: 80
     local_map_refresh: rescreen
