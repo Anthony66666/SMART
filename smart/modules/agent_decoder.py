@@ -5,10 +5,13 @@ import torch.nn as nn
 from smart.layers import MLPLayer
 from smart.layers.attention_layer import AttentionLayer
 from smart.layers.fourier_embedding import FourierEmbedding, MLPEmbedding
-from torch_cluster import radius, radius_graph
 from torch_geometric.data import Batch, HeteroData
-from torch_geometric.utils import dense_to_sparse, subgraph
-from smart.utils import angle_between_2d_vectors, weight_init, wrap_angle
+from smart.modules.smart_edge_builder import (
+    build_interaction_edges,
+    build_map2agent_edges,
+    build_temporal_edges,
+)
+from smart.utils import angle_between_2d_vectors, weight_init
 import math
 
 
@@ -140,13 +143,17 @@ class SMARTAgentDecoder(nn.Module):
         self.agent_token_emb_cyc = self.token_emb_cyc(trajectory_token_cyc.view(trajectory_token_cyc.shape[0], -1))
 
         if inference:
-            agent_token_traj_all = torch.zeros((num_agent, self.token_size, self.shift + 1, 4, 2), device=pos_a.device)
             trajectory_token_all_veh = torch.from_numpy(self.trajectory_token_all['veh']).clone().to(pos_a.device).to(
                 torch.float)
             trajectory_token_all_ped = torch.from_numpy(self.trajectory_token_all['ped']).clone().to(pos_a.device).to(
                 torch.float)
             trajectory_token_all_cyc = torch.from_numpy(self.trajectory_token_all['cyc']).clone().to(pos_a.device).to(
                 torch.float)
+            agent_token_traj_all = torch.zeros(
+                (num_agent, self.token_size, self.shift + 1, 4, 2),
+                device=pos_a.device,
+                dtype=trajectory_token_all_veh.dtype,
+            )
             agent_token_traj_all[veh_mask] = torch.cat(
                 [trajectory_token_all_veh[:, :self.shift], trajectory_token_veh[:, None, ...]], dim=1)
             agent_token_traj_all[ped_mask] = torch.cat(
@@ -154,12 +161,16 @@ class SMARTAgentDecoder(nn.Module):
             agent_token_traj_all[cyc_mask] = torch.cat(
                 [trajectory_token_all_cyc[:, :self.shift], trajectory_token_cyc[:, None, ...]], dim=1)
 
-        agent_token_emb = torch.zeros((num_agent, num_step, self.hidden_dim), device=pos_a.device)
+        agent_token_emb = self.agent_token_emb_veh.new_zeros((num_agent, num_step, self.hidden_dim))
         agent_token_emb[veh_mask] = self.agent_token_emb_veh[agent_token_index[veh_mask]]
         agent_token_emb[ped_mask] = self.agent_token_emb_ped[agent_token_index[ped_mask]]
         agent_token_emb[cyc_mask] = self.agent_token_emb_cyc[agent_token_index[cyc_mask]]
 
-        agent_token_traj = torch.zeros((num_agent, num_step, self.token_size, 4, 2), device=pos_a.device)
+        agent_token_traj = torch.zeros(
+            (num_agent, num_step, self.token_size, 4, 2),
+            device=pos_a.device,
+            dtype=trajectory_token_veh.dtype,
+        )
         agent_token_traj[veh_mask] = trajectory_token_veh
         agent_token_traj[ped_mask] = trajectory_token_ped
         agent_token_traj[cyc_mask] = trajectory_token_cyc
@@ -192,96 +203,144 @@ class SMARTAgentDecoder(nn.Module):
             return feat_a, agent_token_traj
 
     def agent_predict_next(self, data, agent_category, feat_a):
-        num_agent, num_step, traj_dim = data['agent']['token_pos'].shape
-        agent_type = data['agent']['type']
-        veh_mask = (agent_type == 0)  # * agent_category==3
-        cyc_mask = (agent_type == 2)  # * agent_category==3
-        ped_mask = (agent_type == 1)  # * agent_category==3
-        token_res = torch.zeros((num_agent, num_step, self.token_size), device=agent_category.device)
-        token_res[veh_mask] = self.token_predict_head(feat_a[veh_mask])
-        token_res[cyc_mask] = self.token_predict_cyc_head(feat_a[cyc_mask])
-        token_res[ped_mask] = self.token_predict_walker_head(feat_a[ped_mask])
-        return token_res
+        del data, agent_category
+        return self.token_predict_head(feat_a)
 
     def agent_predict_next_inf(self, data, agent_category, feat_a):
-        num_agent, traj_dim = feat_a.shape
-        agent_type = data['agent']['type']
+        del data, agent_category
+        return self.token_predict_head(feat_a)
 
-        veh_mask = (agent_type == 0)  # * agent_category==3
-        cyc_mask = (agent_type == 2)  # * agent_category==3
-        ped_mask = (agent_type == 1)  # * agent_category==3
-
-        token_res = torch.zeros((num_agent, self.token_size), device=agent_category.device)
-        token_res[veh_mask] = self.token_predict_head(feat_a[veh_mask])
-        token_res[cyc_mask] = self.token_predict_cyc_head(feat_a[cyc_mask])
-        token_res[ped_mask] = self.token_predict_walker_head(feat_a[ped_mask])
-
-        return token_res
-
-    def build_temporal_edge(self, pos_a, head_a, head_vector_a, num_agent, mask, inference_mask=None):
-        pos_t = pos_a.reshape(-1, self.input_dim)
-        head_t = head_a.reshape(-1)
-        head_vector_t = head_vector_a.reshape(-1, 2)
+    def build_temporal_edge(self, pos_a, head_a, head_vector_a, num_agent, mask, inference_mask=None,
+                            apply_random_hist_mask=True):
         hist_mask = mask.clone()
 
-        if self.hist_mask and self.training:
+        if self.hist_mask and self.training and apply_random_hist_mask:
             hist_mask[
                 torch.arange(mask.shape[0]).unsqueeze(1), torch.randint(0, mask.shape[1], (num_agent, 10))] = False
-            mask_t = hist_mask.unsqueeze(2) & hist_mask.unsqueeze(1)
-        elif inference_mask is not None:
-            mask_t = hist_mask.unsqueeze(2) & inference_mask.unsqueeze(1)
-        else:
-            mask_t = hist_mask.unsqueeze(2) & hist_mask.unsqueeze(1)
+        target_mask = hist_mask if inference_mask is None else inference_mask.bool()
 
-        edge_index_t = dense_to_sparse(mask_t)[0]
-        edge_index_t = edge_index_t[:, edge_index_t[1] > edge_index_t[0]]
-        edge_index_t = edge_index_t[:, edge_index_t[1] - edge_index_t[0] <= self.time_span / self.shift]
-        rel_pos_t = pos_t[edge_index_t[0]] - pos_t[edge_index_t[1]]
-        rel_head_t = wrap_angle(head_t[edge_index_t[0]] - head_t[edge_index_t[1]])
-        r_t = torch.stack(
-            [torch.norm(rel_pos_t[:, :2], p=2, dim=-1),
-             angle_between_2d_vectors(ctr_vector=head_vector_t[edge_index_t[1]], nbr_vector=rel_pos_t[:, :2]),
-             rel_head_t,
-             edge_index_t[0] - edge_index_t[1]], dim=-1)
+        edge_index_t, r_t = build_temporal_edges(
+            pos_a=pos_a,
+            head_a=head_a,
+            head_vector_a=head_vector_a,
+            mask=hist_mask,
+            max_step_delta=int(self.time_span / self.shift),
+            causal=True,
+            target_mask=target_mask,
+        )
         r_t = self.r_t_emb(continuous_inputs=r_t, categorical_embs=None)
         return edge_index_t, r_t
 
     def build_interaction_edge(self, pos_a, head_a, head_vector_a, batch_s, mask_s):
-        pos_s = pos_a.transpose(0, 1).reshape(-1, self.input_dim)
-        head_s = head_a.transpose(0, 1).reshape(-1)
-        head_vector_s = head_vector_a.transpose(0, 1).reshape(-1, 2)
-        edge_index_a2a = radius_graph(x=pos_s[:, :2], r=self.a2a_radius, batch=batch_s, loop=False,
-                                      max_num_neighbors=300)
-        edge_index_a2a = subgraph(subset=mask_s, edge_index=edge_index_a2a)[0]
-        rel_pos_a2a = pos_s[edge_index_a2a[0]] - pos_s[edge_index_a2a[1]]
-        rel_head_a2a = wrap_angle(head_s[edge_index_a2a[0]] - head_s[edge_index_a2a[1]])
-        r_a2a = torch.stack(
-            [torch.norm(rel_pos_a2a[:, :2], p=2, dim=-1),
-             angle_between_2d_vectors(ctr_vector=head_vector_s[edge_index_a2a[1]], nbr_vector=rel_pos_a2a[:, :2]),
-             rel_head_a2a], dim=-1)
+        edge_index_a2a, r_a2a = build_interaction_edges(
+            pos_a=pos_a,
+            head_a=head_a,
+            head_vector_a=head_vector_a,
+            batch_s=batch_s,
+            mask_s=mask_s,
+            radius_m=self.a2a_radius,
+        )
         r_a2a = self.r_a2a_emb(continuous_inputs=r_a2a, categorical_embs=None)
         return edge_index_a2a, r_a2a
 
+    def _build_temporal_batches(self, data, num_step, pos_a):
+        if isinstance(data, Batch):
+            batch_s = torch.cat([data['agent']['batch'] + data.num_graphs * t
+                                 for t in range(num_step)], dim=0)
+            batch_pl = torch.cat([data['pt_token']['batch'] + data.num_graphs * t
+                                  for t in range(num_step)], dim=0)
+            agent_batch = data['agent']['batch']
+        else:
+            batch_s = torch.arange(num_step,
+                                   device=pos_a.device).repeat_interleave(data['agent']['num_nodes'])
+            batch_pl = torch.arange(num_step,
+                                    device=pos_a.device).repeat_interleave(data['pt_token']['num_nodes'])
+            agent_batch = torch.zeros(data['agent']['num_nodes'], dtype=torch.long, device=pos_a.device)
+        return batch_s, batch_pl, agent_batch
+
+    def encode_history_context(self,
+                               data: HeteroData,
+                               map_enc: Mapping[str, torch.Tensor],
+                               agent_history_mask: Optional[torch.Tensor] = None,
+                               map_agent_mask: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+        pos_a = data['agent']['token_pos']
+        head_a = data['agent']['token_heading']
+        head_vector_a = torch.stack([head_a.cos(), head_a.sin()], dim=-1)
+        num_agent, num_step, _traj_dim = pos_a.shape
+        agent_category = data['agent']['category']
+        agent_token_index = data['agent']['token_idx']
+        feat_a, _ = self.agent_token_embedding(data, agent_category, agent_token_index, pos_a, head_vector_a)
+
+        history_token_steps = max(1, (self.num_historical_steps - 1) // self.shift)
+        history_mask = data['agent']['agent_valid_mask'].clone()
+        history_mask[:, history_token_steps:] = False
+        if agent_history_mask is not None:
+            history_mask = history_mask & agent_history_mask.bool()
+        temporal_mask = history_mask.clone()
+        edge_index_t, r_t = self.build_temporal_edge(
+            pos_a,
+            head_a,
+            head_vector_a,
+            num_agent,
+            temporal_mask,
+            apply_random_hist_mask=False,
+        )
+
+        batch_s, batch_pl, agent_batch = self._build_temporal_batches(data, num_step, pos_a)
+        mask_s = temporal_mask.transpose(0, 1).reshape(-1)
+        edge_index_a2a, r_a2a = self.build_interaction_edge(pos_a, head_a, head_vector_a, batch_s, mask_s)
+        map_mask = temporal_mask.clone()
+        if map_agent_mask is None:
+            map_mask[agent_category != 3] = False
+        else:
+            map_agent_mask = map_agent_mask.to(device=map_mask.device, dtype=torch.bool)
+            map_mask = map_mask & map_agent_mask[:, None]
+        edge_index_pl2a, r_pl2a = self.build_map2agent_edge(
+            data,
+            num_step,
+            agent_category,
+            pos_a,
+            head_a,
+            head_vector_a,
+            map_mask,
+            batch_s,
+            batch_pl,
+            map_token_visible_mask=map_enc.get('pt_visibility_mask'),
+        )
+
+        for i in range(self.num_layers):
+            feat_a = feat_a.reshape(-1, self.hidden_dim)
+            feat_a = self.t_attn_layers[i](feat_a, r_t, edge_index_t)
+            feat_a = feat_a.reshape(-1, num_step,
+                                    self.hidden_dim).transpose(0, 1).reshape(-1, self.hidden_dim)
+            feat_a = self.pt2a_attn_layers[i]((map_enc['x_pt'].repeat_interleave(
+                repeats=num_step, dim=0).reshape(-1, num_step, self.hidden_dim).transpose(0, 1).reshape(
+                    -1, self.hidden_dim), feat_a), r_pl2a, edge_index_pl2a)
+            feat_a = self.a2a_attn_layers[i](feat_a, r_a2a, edge_index_a2a)
+            feat_a = feat_a.reshape(num_step, -1, self.hidden_dim).transpose(0, 1)
+
+        return {
+            'x_a_history': feat_a,
+            'history_token_mask': history_mask,
+            'agent_batch': agent_batch,
+        }
+
     def build_map2agent_edge(self, data, num_step, agent_category, pos_a, head_a, head_vector_a, mask,
-                             batch_s, batch_pl):
-        mask_pl2a = mask.clone()
-        mask_pl2a = mask_pl2a.transpose(0, 1).reshape(-1)
-        pos_s = pos_a.transpose(0, 1).reshape(-1, self.input_dim)
-        head_s = head_a.transpose(0, 1).reshape(-1)
-        head_vector_s = head_vector_a.transpose(0, 1).reshape(-1, 2)
+                             batch_s, batch_pl, map_token_visible_mask=None):
         pos_pl = data['pt_token']['position'][:, :self.input_dim].contiguous()
         orient_pl = data['pt_token']['orientation'].contiguous()
-        pos_pl = pos_pl.repeat(num_step, 1)
-        orient_pl = orient_pl.repeat(num_step)
-        edge_index_pl2a = radius(x=pos_s[:, :2], y=pos_pl[:, :2], r=self.pl2a_radius,
-                                 batch_x=batch_s, batch_y=batch_pl, max_num_neighbors=300)
-        edge_index_pl2a = edge_index_pl2a[:, mask_pl2a[edge_index_pl2a[1]]]
-        rel_pos_pl2a = pos_pl[edge_index_pl2a[0]] - pos_s[edge_index_pl2a[1]]
-        rel_orient_pl2a = wrap_angle(orient_pl[edge_index_pl2a[0]] - head_s[edge_index_pl2a[1]])
-        r_pl2a = torch.stack(
-            [torch.norm(rel_pos_pl2a[:, :2], p=2, dim=-1),
-             angle_between_2d_vectors(ctr_vector=head_vector_s[edge_index_pl2a[1]], nbr_vector=rel_pos_pl2a[:, :2]),
-             rel_orient_pl2a], dim=-1)
+        edge_index_pl2a, r_pl2a = build_map2agent_edges(
+            pos_a=pos_a,
+            head_a=head_a,
+            head_vector_a=head_vector_a,
+            pos_pl=pos_pl,
+            orient_pl=orient_pl,
+            batch_s=batch_s,
+            batch_pl=batch_pl,
+            mask=mask,
+            radius_m=self.pl2a_radius,
+            map_token_visible_mask=map_token_visible_mask,
+        )
         r_pl2a = self.r_pt2a_emb(continuous_inputs=r_pl2a, categorical_embs=None)
         return edge_index_pl2a, r_pl2a
 
@@ -303,16 +362,7 @@ class SMARTAgentDecoder(nn.Module):
         mask = agent_valid_mask
         edge_index_t, r_t = self.build_temporal_edge(pos_a, head_a, head_vector_a, num_agent, mask)
 
-        if isinstance(data, Batch):
-            batch_s = torch.cat([data['agent']['batch'] + data.num_graphs * t
-                                 for t in range(num_step)], dim=0)
-            batch_pl = torch.cat([data['pt_token']['batch'] + data.num_graphs * t
-                                  for t in range(num_step)], dim=0)
-        else:
-            batch_s = torch.arange(num_step,
-                                   device=pos_a.device).repeat_interleave(data['agent']['num_nodes'])
-            batch_pl = torch.arange(num_step,
-                                    device=pos_a.device).repeat_interleave(data['pt_token']['num_nodes'])
+        batch_s, batch_pl, _agent_batch = self._build_temporal_batches(data, num_step, pos_a)
 
         mask_s = mask.transpose(0, 1).reshape(-1)
         edge_index_a2a, r_a2a = self.build_interaction_edge(pos_a, head_a, head_vector_a, batch_s, mask_s)

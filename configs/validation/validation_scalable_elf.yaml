@@ -1,0 +1,98 @@
+time_info: &time_info
+  num_historical_steps: 11
+  num_future_steps: 80
+  token_size: 2048
+
+Dataset:
+  root:
+  batch_size: 1
+  shuffle: False
+  num_workers: 4
+  pin_memory: True
+  persistent_workers: True
+  train_raw_dir:
+  val_raw_dir: ["/home/anthony/SimAgentJEPA/data/waymo/validation"]
+  test_raw_dir:
+  TargetBuilder: WaymoTargetBuilder
+  train_processed_dir:
+  val_processed_dir:
+  test_processed_dir:
+  dataset: "scalable"
+  <<: *time_info
+
+Trainer:
+  strategy: ddp_find_unused_parameters_false
+  accelerator: "gpu"
+  devices: 1
+  max_epochs: 32
+  save_ckpt_path:
+  num_nodes: 1
+  mode:
+  ckpt_path:
+  precision: 32
+  accumulate_grad_batches: 1
+
+Model:
+  mode: "validation"
+  predictor: "smart_elf"
+  dataset: "waymo"
+  input_dim: 2
+  hidden_dim: 128
+  output_dim: 2
+  output_head: False
+  num_heads: 8
+  <<: *time_info
+  head_dim: 16
+  dropout: 0.1
+  num_freq_bands: 64
+  lr: 0.0005
+  warmup_steps: 2
+  total_steps: 32
+  decoder:
+    <<: *time_info
+    num_map_layers: 3
+    num_agent_layers: 6
+    a2a_radius: 60
+    pl2pl_radius: 10
+    pl2a_radius: 30
+    time_span: 30
+  inference_token: True
+  rollout_num: 1
+  diffusion:
+    future_chunk_steps: 5
+    history_tokens: 2
+    elf_sequence_tokens: 16
+    elf_window_tokens: 4
+    elf_commit_tokens: 1
+    elf_receding_horizon: true
+    elf_objective: embedded_language_flow_v1
+    elf_loss_weight: 1.0
+    elf_tail_loss_weight: 0.25
+    elf_decoder_loss_weight: 0.1
+    elf_decoder_prob: 0.25
+    elf_map_commit_score_weight: 2.0
+    elf_map_commit_loss_weight: 0.5
+    elf_geometry_energy_weight: 0.05
+    elf_geometry_topk: 32
+    elf_map_score_temperature: 0.2
+    elf_map_score_normalize: true
+    elf_integration_steps: 4
+    elf_sampling_strategy: argmax
+    elf_noise_scale: 1.0
+    elf_detach_targets: true
+    elf_time_schedule: uniform
+    elf_num_layers: 6
+    elf_num_time_tokens: 4
+    elf_bottleneck_dim: 128
+    token_steps: 5
+    total_rollout_steps: 80
+    encoder_lr_scale: 0.5
+    eps: 1.0e-3
+    min_t: 1.0e-3
+    use_type_embedding: true
+    target_category_only: false
+    supervision_mode: all_agents
+    metric_mode: smart_val_compatible
+    remask_confidence_temperature: 1.0
+    debug_validation_logging: true
+    freeze_encoder: false

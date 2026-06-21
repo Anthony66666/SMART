@@ -7,19 +7,19 @@ time_info: &time_info
 
 Dataset:
   root:
-  train_batch_size: 1
-  val_batch_size: 1
+  train_batch_size: 4
+  val_batch_size: 4
   test_batch_size: 1
   shuffle: True
-  num_workers: 1
+  num_workers: 4
   pin_memory: True
   persistent_workers: True
-  train_raw_dir: ["data/valid_demo"]
-  val_raw_dir: ["data/valid_demo"]
+  train_raw_dir: ["/raid/haoq_lab/wangshijie/data/waymo/training"]
+  val_raw_dir: ["/raid/haoq_lab/wangshijie/data/waymo/validation"]
   test_raw_dir:
   transform: WaymoTargetBuilder
-  train_processed_dir:
-  val_processed_dir:
+  train_processed_dir: 
+  val_processed_dir: 
   test_processed_dir:
   dataset: "scalable"
   <<: *time_info
@@ -27,7 +27,7 @@ Dataset:
 Trainer:
   strategy: ddp_find_unused_parameters_false
   accelerator: "gpu"
-  devices: 1
+  devices: 14
   max_epochs: 32
   save_ckpt_path:
   num_nodes: 1
@@ -35,6 +35,15 @@ Trainer:
   ckpt_path:
   precision: 32
   accumulate_grad_batches: 1
+  monitor_metric: "val_cls_acc"
+  monitor_mode: "max"
+
+Visualization:
+  enabled: true
+  interval_epochs: 1
+  sample_indices: [0, 1, 2, 3]
+  output_dir: "./outputs/val_visualizations"
+  max_agents: 0
 
 Model:
   mode: "train"

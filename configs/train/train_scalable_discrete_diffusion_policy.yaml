@@ -1,0 +1,178 @@
+# SMART discrete diffusion-policy server training config.
+time_info: &time_info
+  num_historical_steps: 11
+  num_future_steps: 80
+  use_intention: True
+  token_size: 2048
+
+Dataset:
+  root:
+  train_batch_size: 4
+  val_batch_size: 1
+  test_batch_size: 1
+  shuffle: True
+  num_workers: 8
+  pin_memory: True
+  persistent_workers: True
+  train_raw_dir: ["/raid/haoq_lab/wangshijie/data/waymo/training"]
+  val_raw_dir: ["/raid/haoq_lab/wangshijie/data/waymo/validation"]
+  test_raw_dir:
+  transform: WaymoTargetBuilder
+  train_processed_dir:
+  val_processed_dir:
+  test_processed_dir:
+  dataset: "scalable"
+  <<: *time_info
+
+Trainer:
+  strategy: ddp_find_unused_parameters_true
+  accelerator: "gpu"
+  devices: 14
+  max_epochs: 32
+  save_ckpt_path:
+  num_nodes: 1
+  mode:
+  ckpt_path:
+  precision: "16-mixed"
+  accumulate_grad_batches: 1
+  limit_val_batches: 8
+  check_val_every_n_epoch: 1
+  monitor_metric: "val_minADE"
+  monitor_mode: "min"
+
+Visualization:
+  enabled: true
+  interval_epochs: 1
+  sample_indices: [0, 1, 2, 3]
+  output_dir: "./outputs/val_discrete_diffusion_policy"
+  max_agents: 0
+  step_viz:
+    enabled: true
+    interval_steps: 2000
+    sample_indices: [0, 1, 2, 3]
+    output_dir: "./outputs/step_discrete_diffusion_policy"
+
+Model:
+  mode: "train"
+  predictor: "smart_discrete_diffusion_policy"
+  dataset: "waymo"
+  input_dim: 2
+  hidden_dim: 128
+  output_dim: 2
+  output_head: False
+  num_heads: 8
+  <<: *time_info
+  head_dim: 16
+  dropout: 0.1
+  num_freq_bands: 64
+  lr: 0.0005
+  warmup_steps: 0
+  total_steps: 32
+  inference_token: True
+  rollout_num: 1
+  decoder:
+    <<: *time_info
+    num_map_layers: 3
+    num_agent_layers: 6
+    a2a_radius: 60
+    pl2pl_radius: 10
+    pl2a_radius: 30
+    time_span: 30
+  diffusion:
+    discrete_policy_objective: pure_chunk_v1
+    ar_objective: maskgit
+    causal_temporal_edges: true
+    future_chunk_steps: 5
+    history_tokens: 2
+    prediction_tokens: 4
+    prediction_horizon: 4
+    commit_tokens: 1
+    execution_horizon: 1
+    carry_tail_proposal: false
+    use_smart_ntp_head: false
+    use_smart_prior_fusion: false
+    proposal_memory:
+      enabled: false
+    temporal_ensemble:
+      enabled: false
+    ar_training_mode: discrete_policy
+    discrete_policy_span_tokens: 4
+    discrete_policy_batched_multi_anchor: true
+    chunk_loss_weights: [1.0, 0.3, 0.15, 0.075]
+    discrete_policy_chunk_loss_weights: [1.0, 0.3, 0.15, 0.075]
+    overlap_loss_weight: 0.05
+    discrete_policy_overlap_loss_weight: 0.05
+    discrete_policy_candidate_count: 1
+    discrete_policy_candidate_score_enabled: false
+    discrete_policy_candidate_energy_weight: 1.0
+    discrete_policy_candidate_chunk_weights: [1.0, 0.3, 0.15, 0.075]
+    causal_noise_schedule: false
+    causal_chunk_mask_multipliers: [0.70, 0.90, 1.10, 1.30]
+    causal_loss_weighting_enabled: true
+    causal_loss_weights: [1.0, 0.3, 0.15, 0.075]
+    commitment_aware_training: false
+    proposal_shift_consistency_loss_weight: 0.0
+    cadf_lite_local_ntp_loss_weight: 0.0
+    cadf_lite_proposal_init_modes: [all_mask]
+    token_steps: 5
+    total_rollout_steps: 80
+    local_map_refresh: rescreen
+    rolling_anchor_training: true
+    sampling_guidance:
+      enabled: false
+      mode: safe_speed
+      safe_topk: 16
+    lane_distance_energy_weight: 0.5
+    lane_heading_energy_weight: 0.25
+    dynamics_energy_weight: 0.1
+    collision_energy_weight: 0.5
+    commit_speed_energy_weight: 0.0
+    commit_min_speed_ratio: 0.75
+    commit_max_speed_ratio: 1.25
+    commit_speed_threshold: 1.0
+    commit_speed_reference_decay: 1.0
+    map_token_noise:
+      enabled: true
+    history_context_dropout:
+      enabled: true
+      prob: 0.15
+    num_steps: 8
+    num_layers: 6
+    eps: 1.0e-3
+    min_t: 1.0e-3
+    dense_smart_ce_loss_weight: 0.0
+    dense_smart_ce_interval: 1
+    diffusion_loss_weight: 0.25
+    ntp_aux_loss_weight: 0.0
+    proposal_carry_training_enabled: false
+    proposal_carry_loss_weight: 0.0
+    proposal_carry_interval: 2
+    proposal_carry_detach_encoder: true
+    proposal_dropout_prob: 0.0
+    proposal_noise_topk: 0
+    proposal_confidence: 0.0
+    use_agent_context: true
+    use_type_embedding: true
+    use_map_context: true
+    max_map_tokens: 0
+    geometry_dropout_prob: 0.25
+    visible_token_corruption_prob: 0.0
+    visible_token_corruption_topk: 5
+    target_category_only: true
+    agent_selection_mode: smart_inference
+    supervision_mode: smart_category3
+    metric_mode: smart_val_compatible
+    low_variance_masking: true
+    mask_count_mode: exact
+    antithetic_mask_ranking: true
+    remask_sampling: true
+    remask_confidence_temperature: 1.0
+    prefix_constrained_sampling: false
+    prefix_constrained_training: false
+    use_proposal_geometry: true
+    proposal_conditioning_enabled: false
+    geometry_confidence_source_threshold: 0.35
+    self_condition_prob: 0.0
+    self_condition_mode: "argmax"
+    debug_validation_logging: false
+    freeze_encoder: false

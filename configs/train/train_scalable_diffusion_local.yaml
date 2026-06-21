@@ -1,0 +1,106 @@
+# SMART-Diffusion — local single-GPU from-scratch training
+time_info: &time_info
+  num_historical_steps: 11
+  num_future_steps: 80
+  use_intention: True
+  token_size: 2048
+
+Dataset:
+  root:
+  train_batch_size: 1
+  val_batch_size: 1
+  test_batch_size: 1
+  shuffle: True
+  num_workers: 4
+  pin_memory: True
+  persistent_workers: True
+  train_raw_dir: ["/home/anthony/SimAgentJEPA/data/waymo/training_subset_10pct"]
+  val_raw_dir: ["/home/anthony/SimAgentJEPA/data/waymo/validation"]
+  test_raw_dir:
+  transform: WaymoTargetBuilder
+  train_processed_dir:
+  val_processed_dir:
+  test_processed_dir:
+  dataset: "scalable"
+  <<: *time_info
+
+Trainer:
+  strategy: ddp_find_unused_parameters_false
+  accelerator: "gpu"
+  devices: 1
+  max_epochs: 5
+  save_ckpt_path:
+  num_nodes: 1
+  mode:
+  ckpt_path:
+  precision: 32
+  accumulate_grad_batches: 1
+  monitor_metric: "val_loss"
+  monitor_mode: "min"
+
+Visualization:
+  enabled: true
+  interval_epochs: 1
+  sample_indices: [0, 1, 2, 3]
+  output_dir: "./outputs/val_visualizations"
+  max_agents: 0
+  step_viz:
+    enabled: true
+    interval_steps: 2000
+    sample_indices: [0, 1, 2, 3]
+    output_dir: "./outputs/step_visualizations"
+
+Model:
+  mode: "train"
+  predictor: "smart_diffusion"
+  dataset: "waymo"
+  input_dim: 2
+  hidden_dim: 128
+  output_dim: 2
+  output_head: False
+  num_heads: 8
+  <<: *time_info
+  head_dim: 16
+  dropout: 0.1
+  num_freq_bands: 64
+  lr: 0.0005
+  warmup_steps: 0
+  total_steps: 60000
+  inference_token: True
+  rollout_num: 1
+  decoder:
+    <<: *time_info
+    num_map_layers: 3
+    num_agent_layers: 6
+    a2a_radius: 60
+    pl2pl_radius: 10
+    pl2a_radius: 30
+    time_span: 30
+  diffusion:
+    future_chunk_steps: 5
+    num_steps: 32
+    num_layers: 6
+    eps: 1.0e-3
+    min_t: 1.0e-3
+    ntp_aux_loss_weight: 0
+    use_agent_context: true
+    use_type_embedding: true
+    use_map_context: true
+    max_map_tokens: 0  # 0 disables scene-level truncation and follows SMART radius map-agent selection.
+    geometry_dropout_prob: 0.25
+    target_category_only: true
+    agent_selection_mode: smart_inference
+    supervision_mode: smart_category3
+    metric_mode: smart_val_compatible
+    low_variance_masking: true
+    mask_count_mode: exact
+    antithetic_mask_ranking: true
+    remask_sampling: true
+    remask_confidence_temperature: 1.0
+    prefix_constrained_sampling: false
+    prefix_constrained_training: false
+    use_proposal_geometry: true
+    geometry_confidence_source_threshold: 0.35
+    self_condition_prob: 1.0
+    self_condition_mode: "argmax"
+    freeze_encoder: false

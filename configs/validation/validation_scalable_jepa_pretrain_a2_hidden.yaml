@@ -1,0 +1,82 @@
+# Config format schema number, the yaml support to valid case source from different dataset
+time_info: &time_info
+  num_historical_steps: 11
+  num_future_steps: 80
+  token_size: 2048
+
+Dataset:
+  root:
+  batch_size: 1
+  shuffle: True
+  num_workers: 1
+  pin_memory: True
+  persistent_workers: True
+  train_raw_dir:
+  val_raw_dir: ["data/valid_demo"]
+  test_raw_dir:
+  TargetBuilder: WaymoTargetBuilder
+  train_processed_dir:
+  val_processed_dir:
+  test_processed_dir:
+  dataset: "scalable"
+  <<: *time_info
+
+Trainer:
+  strategy: ddp_find_unused_parameters_false
+  accelerator: "gpu"
+  devices: 1
+  max_epochs: 32
+  save_ckpt_path:
+  num_nodes: 1
+  mode:
+  ckpt_path:
+  precision: 32
+  accumulate_grad_batches: 1
+
+Model:
+  mode: "validation"
+  predictor: "smart_jepa"
+  dataset: "waymo"
+  input_dim: 2
+  hidden_dim: 128
+  output_dim: 2
+  output_head: False
+  num_heads: 8
+  <<: *time_info
+  head_dim: 16
+  dropout: 0.1
+  num_freq_bands: 64
+  lr: 0.0005
+  warmup_steps: 0
+  total_steps: 32
+  inference_token: False
+  rollout_num: 1
+  decoder:
+    <<: *time_info
+    num_map_layers: 3
+    num_agent_layers: 6
+    a2a_radius: 60
+    pl2pl_radius: 10
+    pl2a_radius: 30
+    time_span: 30
+  jepa:
+    enabled: true
+    training_stage: "pretrain"
+    mask_strategy: "interaction_multiblock"
+    future_chunk_steps: 5
+    mask_ratio: 0.5
+    agent_mask_radius: 60
+    map_mask_radius: 30
+    num_masked_agent_regions_per_scene: 1
+    num_masked_time_windows: 1
+    map_block_unit: "polygon"
+    joint_predictor: true
+    predict_map_latent: true
+    agent_loss_weight: 0.5
+    map_loss_weight: 0.5
+    masked_agent_history_mode: "hidden"
+    masked_agent_history_dropout_ratio: 0.5
+    masked_agent_history_min_visible_tokens: 1
+    disable_map_mae_aux_when_jepa: true
+    ema_decay: 0.99
+    aux_loss_weight: 0.25

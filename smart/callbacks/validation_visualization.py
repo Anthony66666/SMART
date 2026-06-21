@@ -1,0 +1,368 @@
+from pathlib import Path
+import time
+from typing import Iterable, Optional
+
+import pytorch_lightning as pl
+import torch
+from torch_geometric.data import Batch
+
+
+class ValidationVisualizationCallback(pl.Callback):
+    def __init__(
+        self,
+        enabled: bool = False,
+        interval_epochs: int = 1,
+        sample_indices: Optional[Iterable[int]] = None,
+        output_dir: str = "outputs/val_visualizations",
+        max_agents: int = 0,
+    ) -> None:
+        super().__init__()
+        self.enabled = enabled
+        self.interval_epochs = max(1, int(interval_epochs))
+        self.sample_indices = [int(index) for index in (sample_indices or [0])]
+        self.output_dir = output_dir
+        self.max_agents = int(max_agents)
+
+    def on_validation_epoch_end(self, trainer, pl_module) -> None:
+        if not self.enabled or not trainer.is_global_zero:
+            return
+        epoch = trainer.current_epoch + 1
+        if epoch % self.interval_epochs != 0:
+            return
+        datamodule = trainer.datamodule
+        if datamodule is None or not hasattr(datamodule, "val_dataset"):
+            return
+        dataset = datamodule.val_dataset
+        debug_logging = bool(
+            getattr(getattr(pl_module.model_config, 'diffusion', None), 'debug_validation_logging', False)
+        )
+        output_root = Path(self.output_dir) / pl_module.model_config.predictor / f"epoch_{epoch:03d}"
+        output_root.mkdir(parents=True, exist_ok=True)
+        if debug_logging:
+            print(
+                f"[ValidationVisualization][rank=0 epoch={epoch}] start samples={self.sample_indices}",
+                flush=True,
+            )
+
+        was_training = pl_module.training
+        pl_module.eval()
+        try:
+            with torch.no_grad():
+                for sample_index in self.sample_indices:
+                    if sample_index < 0 or sample_index >= len(dataset):
+                        continue
+                    sample_start = time.perf_counter()
+                    if debug_logging:
+                        print(
+                            f"[ValidationVisualization][rank=0 epoch={epoch}] sample_start index={sample_index}",
+                            flush=True,
+                        )
+                    graph = dataset[sample_index]
+                    batch = Batch.from_data_list([graph]).to(pl_module.device)
+                    prepared = self._prepare_batch(pl_module, batch)
+                    prediction = pl_module.inference(prepared)
+                    if prediction is None:
+                        if debug_logging:
+                            print(
+                                f"[ValidationVisualization][rank=0 epoch={epoch}] sample_skip index={sample_index} prediction=None",
+                                flush=True,
+                            )
+                        continue
+                    scenario_id = self._scenario_id(graph)
+                    filename = f"idx_{sample_index:05d}_{scenario_id}.png"
+                    save_validation_visualization(
+                        data=prepared.cpu(),
+                        prediction={key: value.detach().cpu() if torch.is_tensor(value) else value for key, value in prediction.items()},
+                        output_path=output_root / filename,
+                        title=f"{pl_module.model_config.predictor} epoch={epoch} idx={sample_index} scenario={scenario_id}",
+                        max_agents=self.max_agents,
+                    )
+                    if debug_logging:
+                        print(
+                            f"[ValidationVisualization][rank=0 epoch={epoch}] sample_done index={sample_index} "
+                            f"elapsed={time.perf_counter() - sample_start:.2f}s output={output_root / filename}",
+                            flush=True,
+                        )
+        finally:
+            if was_training:
+                pl_module.train()
+
+    @staticmethod
+    def _prepare_batch(pl_module, batch: Batch) -> Batch:
+        if hasattr(pl_module, "_prepare_batch"):
+            return pl_module._prepare_batch(batch)
+        data = pl_module.match_token_map(batch)
+        data = pl_module.sample_pt_pred(data)
+        if isinstance(data, Batch):
+            data['agent']['av_index'] += data['agent']['ptr'][:-1]
+        return data
+
+    @staticmethod
+    def _scenario_id(graph) -> str:
+        scenario_id = getattr(graph, "scenario_id", None)
+        if scenario_id is None and hasattr(graph, "get"):
+            scenario_id = graph.get("scenario_id", None)
+        if scenario_id is None and hasattr(graph, "__contains__") and "scenario_id" in graph:
+            scenario_id = graph["scenario_id"]
+        if scenario_id is None and isinstance(graph, dict):
+            scenario_id = graph.get("scenario_id")
+        if scenario_id is None:
+            return "unknown"
+        return str(scenario_id).replace("/", "_")
+
+def save_validation_visualization(
+    data,
+    prediction,
+    output_path: Path,
+    title: str,
+    max_agents: int = 0,
+    view_mode: str = "official",
+) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+    from matplotlib.patches import Circle, Polygon
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    hist_steps = data["agent"]["valid_mask"].shape[1] - prediction["gt"].shape[1]
+    current_step = hist_steps - 1
+    valid_agents = _official_agent_mask(data, current_step)
+    future_agents = _visualized_agent_mask(data, prediction, current_step, view_mode)
+    if valid_agents.any():
+        agent_indices = torch.nonzero(valid_agents, as_tuple=False).squeeze(-1)
+    else:
+        agent_indices = torch.arange(data["agent"]["num_nodes"])
+
+    av_index = int(data["agent"]["av_index"])
+    if max_agents > 0 and agent_indices.numel() > max_agents:
+        anchor = data["agent"]["position"][av_index, current_step, :2]
+        distance = torch.norm(data["agent"]["position"][agent_indices, current_step, :2] - anchor, dim=-1)
+        keep = torch.argsort(distance)[:max_agents]
+        agent_indices = agent_indices[keep]
+        if av_index not in agent_indices.tolist():
+            agent_indices = torch.cat([torch.tensor([av_index]), agent_indices[:-1]])
+
+    fig, ax = plt.subplots(figsize=(9, 9))
+    ax.set_title(title)
+
+    _draw_map(ax, data)
+    _draw_agents(
+        ax,
+        data,
+        prediction,
+        agent_indices,
+        future_agents,
+        current_step,
+        hist_steps,
+        av_index,
+        Polygon,
+        Circle,
+    )
+
+    ax.set_aspect("equal", adjustable="box")
+    ax.grid(True, linestyle=":", alpha=0.25)
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    ax.legend(handles=_legend_handles(Line2D), loc="lower left", fontsize=8, framealpha=0.92)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=160)
+    plt.close(fig)
+
+
+def _draw_map(ax, data) -> None:
+    point_to_polygon = data[("map_point", "to", "map_polygon")]["edge_index"]
+    polygon_ids = point_to_polygon[1].long()
+    point_position = data["map_point"]["position"][:, :2]
+    for polygon_id in torch.unique(polygon_ids).tolist():
+        indices = point_to_polygon[0, polygon_ids == polygon_id]
+        if indices.numel() < 2:
+            continue
+        points = point_position.index_select(0, indices)
+        ax.plot(
+            points[:, 0],
+            points[:, 1],
+            color="#c7c7c7",
+            linewidth=1.0,
+            alpha=0.8,
+            zorder=1,
+        )
+
+
+def _draw_agents(
+    ax,
+    data,
+    prediction,
+    agent_indices,
+    future_agents,
+    current_step,
+    hist_steps,
+    av_index,
+    polygon_cls,
+    circle_cls,
+) -> None:
+    for agent_index in agent_indices.tolist():
+        is_ego = agent_index == av_index
+        show_future = bool(future_agents[agent_index].item()) if future_agents.numel() > agent_index else False
+        color = "#8f63d2" if is_ego else "#a9d2ff"
+        edge_color = "#8f63d2" if is_ego else "#000000"
+        linewidth = 2.4 if is_ego else 1.8
+
+        history_mask = data["agent"]["valid_mask"][agent_index, :hist_steps]
+        history = data["agent"]["position"][agent_index, :hist_steps, :2][history_mask]
+        gt_mask = _future_gt_valid_mask(data, prediction, hist_steps)[agent_index]
+        gt = prediction["gt"][agent_index][gt_mask] if show_future else prediction["gt"][agent_index][:0]
+        pred = prediction["pred_traj"][agent_index]
+        pred_valid = _prediction_valid_mask(data, prediction, agent_index, hist_steps)
+        pred_valid = pred_valid & show_future
+        pred = pred[pred_valid]
+        visible_gt = gt
+
+        if history.numel() > 0:
+            ax.plot(history[:, 0], history[:, 1], color=color, linestyle=":", linewidth=linewidth, alpha=0.95, zorder=3)
+        if visible_gt.numel() > 0:
+            ax.plot(visible_gt[:, 0], visible_gt[:, 1], color=color, linestyle="-", linewidth=linewidth, alpha=0.75, zorder=4)
+        if pred.numel() > 0:
+            ax.plot(pred[:, 0], pred[:, 1], color="#e15759", linestyle="-", linewidth=linewidth, alpha=0.95, zorder=6)
+
+        current_xy = data["agent"]["position"][agent_index, current_step, :2]
+        current_heading = float(data["agent"]["heading"][agent_index, current_step].item())
+        shape = data["agent"]["shape"][agent_index, current_step, :2]
+        agent_type = int(data["agent"]["type"][agent_index].item())
+        face_color = "#8f63d2" if is_ego else "#a9d2ff"
+        _draw_agent_shape(ax, current_xy, current_heading, shape, agent_type, face_color, edge_color, polygon_cls, circle_cls)
+
+
+def _draw_agent_shape(ax, center_xy, heading, shape, agent_type, face_color, edge_color, polygon_cls, circle_cls) -> None:
+    length = max(float(shape[0].item()), 0.6)
+    width = max(float(shape[1].item()), 0.4)
+
+    if agent_type == 1:
+        patch = circle_cls(
+            (center_xy[0].item(), center_xy[1].item()),
+            radius=0.3 * max(length, width),
+            facecolor=face_color,
+            edgecolor=edge_color,
+            linewidth=1.2,
+            alpha=0.28,
+            zorder=6,
+        )
+        ax.add_patch(patch)
+    else:
+        corners = _oriented_box(center_xy, heading, length, width)
+        patch = polygon_cls(
+            corners,
+            closed=True,
+            facecolor=face_color,
+            edgecolor=edge_color,
+            linewidth=1.2,
+            alpha=0.28,
+            zorder=6,
+        )
+        ax.add_patch(patch)
+
+    arrow = polygon_cls(
+        _heading_triangle(center_xy, heading, length, width),
+        closed=True,
+        facecolor="none",
+        edgecolor=edge_color,
+        linewidth=1.1,
+        alpha=0.95,
+        zorder=7,
+    )
+    ax.add_patch(arrow)
+
+
+def _oriented_box(center_xy, heading, length, width):
+    cos = torch.cos(torch.tensor(heading, dtype=torch.float32))
+    sin = torch.sin(torch.tensor(heading, dtype=torch.float32))
+    forward = torch.tensor([cos, sin]) * (length * 0.5)
+    lateral = torch.tensor([-sin, cos]) * (width * 0.5)
+    corners = [
+        center_xy + forward + lateral,
+        center_xy + forward - lateral,
+        center_xy - forward - lateral,
+        center_xy - forward + lateral,
+    ]
+    return [(float(point[0].item()), float(point[1].item())) for point in corners]
+
+
+def _official_agent_mask(data, current_step):
+    return data["agent"]["valid_mask"][:, current_step] & (data["agent"]["type"] != 3)
+
+
+def _target_agent_mask(data, prediction, current_step):
+    valid = _official_agent_mask(data, current_step)
+    if "category" in data["agent"]:
+        return valid & (data["agent"]["category"].long() == 3)
+    if "pred_valid_mask" in prediction:
+        return valid & prediction["pred_valid_mask"].any(dim=-1)
+    return valid
+
+
+def _visualized_agent_mask(data, prediction, current_step, view_mode="official"):
+    mode = str(view_mode).lower()
+    if mode in ("official", "smart_val_compatible", "smart_inference", "generation"):
+        return _official_agent_mask(data, current_step)
+    if mode in ("supervision", "target", "smart_category3", "category3"):
+        return _target_agent_mask(data, prediction, current_step)
+    raise ValueError(f"Unsupported validation visualization view_mode: {view_mode}")
+
+
+def _fit_bool_vector(mask, length):
+    mask = mask.bool()
+    if mask.numel() >= length:
+        return mask[:length]
+    pad = torch.zeros(length - mask.numel(), dtype=torch.bool, device=mask.device)
+    return torch.cat([mask, pad], dim=0)
+
+
+def _fit_bool_mask(mask, length):
+    mask = mask.bool()
+    if mask.shape[1] >= length:
+        return mask[:, :length]
+    pad = torch.zeros(mask.shape[0], length - mask.shape[1], dtype=torch.bool, device=mask.device)
+    return torch.cat([mask, pad], dim=1)
+
+
+def _future_gt_valid_mask(data, prediction, hist_steps):
+    gt_len = int(prediction["gt"].shape[1])
+    if "official_valid_mask" in prediction:
+        return _fit_bool_mask(prediction["official_valid_mask"], gt_len)
+    return _fit_bool_mask(data["agent"]["valid_mask"][:, hist_steps:hist_steps + gt_len], gt_len)
+
+
+def _prediction_valid_mask(data, prediction, agent_index, hist_steps):
+    pred_len = int(prediction["pred_traj"][agent_index].shape[0])
+    if "pred_valid_mask" in prediction:
+        return _fit_bool_vector(prediction["pred_valid_mask"][agent_index], pred_len)
+    if "official_valid_mask" in prediction:
+        return _fit_bool_vector(prediction["official_valid_mask"][agent_index], pred_len)
+    return _fit_bool_vector(data["agent"]["valid_mask"][agent_index, hist_steps:hist_steps + pred_len], pred_len)
+
+
+def _heading_triangle(center_xy, heading, length, width):
+    direction = torch.tensor(
+        [torch.cos(torch.tensor(heading, dtype=torch.float32)), torch.sin(torch.tensor(heading, dtype=torch.float32))]
+    )
+    lateral = torch.tensor([-direction[1], direction[0]])
+    triangle_length = 0.5 * length
+    tip = center_xy + direction * (0.5 * triangle_length)
+    base_center = center_xy - direction * (0.5 * triangle_length)
+    base_left = base_center + lateral * (0.5 * width)
+    base_right = base_center - lateral * (0.5 * width)
+    points = [tip, base_right, base_left]
+    return [(float(point[0].item()), float(point[1].item())) for point in points]
+
+
+def _legend_handles(line_cls):
+    return [
+        line_cls([0], [0], color="#c7c7c7", lw=1.2, label="Map"),
+        line_cls([0], [0], color="#8f63d2", lw=1.8, linestyle=":", label="Ego History"),
+        line_cls([0], [0], color="#a9d2ff", lw=1.8, linestyle=":", label="Other History"),
+        line_cls([0], [0], color="#8f63d2", lw=1.8, linestyle="-", label="GT Future"),
+        line_cls([0], [0], color="#e15759", lw=1.8, linestyle="-", label="Pred Future"),
+    ]
