@@ -162,7 +162,7 @@ AR rerank 也不是一个单独的类，而是 `smart_ar_diffusion` 的一套特
 - Proposal carry：默认开启。
 - Proposal conditioning：默认开启。
 - Current state：启用当前运动特征和 current-state edges。
-- 训练策略：clean / rollout / perturb 风格的 closed-loop curriculum，并有 retokenization recovery。
+- 训练策略：clean / rollout closed-loop curriculum，并有 retokenization recovery；连续高斯 state perturb 已移除，当前使用 SMART-style top-k history-token noise 增强鲁棒性，future target 只做 deterministic retokenization。
 - Safety guidance：支持 `guidance.mode = none | safe | ego_stress | ego_edit`。
 - 采样选择：safe guidance 会用 lane / dynamics / collision / ego-risk energy 对 top-k frontier token 做 rerank。
 

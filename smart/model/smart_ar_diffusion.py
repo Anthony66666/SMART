@@ -167,10 +167,6 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
             1,
             min(4, int(getattr(diffusion_cfg, 'closed_loop_max_depth', 4))),
         )
-        self.ar_state_perturb_prob = float(getattr(diffusion_cfg, 'state_perturb_prob', 0.5))
-        self.ar_state_perturb_prob = min(max(self.ar_state_perturb_prob, 0.0), 1.0)
-        self.ar_state_perturb_pos_sigma_m = float(getattr(diffusion_cfg, 'state_perturb_pos_sigma_m', 0.3))
-        self.ar_state_perturb_heading_sigma_rad = float(getattr(diffusion_cfg, 'state_perturb_heading_sigma_rad', 0.05))
         sampling_guidance_cfg = getattr(diffusion_cfg, 'sampling_guidance', None)
         self.ar_sampling_guidance_enabled = bool(
             getattr(
@@ -647,9 +643,7 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
     def _ar_closed_loop_curriculum(self, epoch):
         epoch = max(0, int(epoch))
         maximum = float(getattr(self, 'ar_closed_loop_batch_ratio_max', 0.0))
-        if epoch <= 3:
-            return 0.0, maximum
-        return 0.25, maximum
+        return 0.0, maximum
 
     def _current_state_motion(self, data):
         agent = data['agent']
@@ -878,24 +872,114 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
         )
 
     def _select_retokenization_token(self, distances, chunk_idx):
+        del chunk_idx
         best_error, best_token = distances.min(dim=0)
-        if (
-            chunk_idx <= 0
-            or not self._retokenization_noise_active()
-            or distances.numel() <= 1
-        ):
-            return best_error, best_token
+        return best_error, best_token
 
+    def _history_token_noise_enabled_for_view(self, perturb):
+        return perturb is not False and self._retokenization_noise_active()
+
+    def _sample_history_token_noise(self, token_ids, token_valid, agent_types):
         topk = min(
             int(getattr(self, 'retokenization_noise_topk', 5)),
-            int(distances.shape[0]),
+            int(getattr(self, 'token_size', self.model_config.decoder.token_size)),
         )
-        if topk <= 1:
-            return best_error, best_token
-        topk_errors, topk_tokens = distances.topk(topk, largest=False)
-        sample_slot = torch.randint(topk, (1,), device=distances.device)
-        sample_slot = sample_slot.squeeze(0)
-        return topk_errors[sample_slot], topk_tokens[sample_slot]
+        changed = torch.zeros_like(token_valid, dtype=torch.bool)
+        if topk <= 1 or token_ids.shape[1] <= 1:
+            return token_ids, changed
+        token_size = int(getattr(self, 'token_size', self.model_config.decoder.token_size))
+        valid = (
+            token_valid.bool()
+            & (token_ids >= 0)
+            & (token_ids < token_size)
+        )
+        valid[:, 0] = False
+        if not valid.any():
+            return token_ids, changed
+
+        neighbor_table = self._token_neighbor_table(topk, token_ids.device)
+        type_ids = agent_types.long().clamp(0, neighbor_table.shape[0] - 1)
+        safe_ids = token_ids.long().clamp(0, token_size - 1)
+        neighbors = neighbor_table[type_ids[:, None], safe_ids]
+        sample_slots = torch.randint(
+            topk,
+            safe_ids.shape,
+            device=token_ids.device,
+        )
+        sampled = neighbors.gather(-1, sample_slots.unsqueeze(-1)).squeeze(-1)
+        noisy = token_ids.clone()
+        noisy[valid] = sampled[valid]
+        changed = valid & (noisy != token_ids)
+        return noisy, changed
+
+    def _apply_history_token_noise(self, view, perturb=None):
+        agent = view['agent']
+        history_tokens = min(
+            int(getattr(self, 'ar_history_tokens', 0)),
+            int(agent['token_idx'].shape[1]),
+        )
+        if history_tokens <= 0:
+            return False
+        if not self._history_token_noise_enabled_for_view(perturb):
+            return False
+
+        history_ids = agent['token_idx'][:, :history_tokens].long()
+        history_valid = agent['agent_valid_mask'][:, :history_tokens].bool()
+        noisy_ids, changed = self._sample_history_token_noise(
+            history_ids,
+            history_valid,
+            agent['type'],
+        )
+        agent['history_token_noise_mask'] = changed
+        if not changed.any():
+            return False
+
+        agent['token_idx'][:, :history_tokens] = noisy_ids.to(
+            dtype=agent['token_idx'].dtype,
+        )
+        if 'position' not in agent or 'heading' not in agent:
+            return True
+
+        (
+            history_traj,
+            history_head,
+            _history_frame_valid,
+            history_token_pos,
+            history_token_heading,
+            _end_positions,
+            _end_headings,
+        ) = self._decode_token_sequence(
+            noisy_ids,
+            history_valid,
+            agent['type'],
+            agent['position'][:, 0, :2],
+            agent['heading'][:, 0],
+        )
+        if 'token_pos' in agent:
+            agent['token_pos'][:, :history_tokens] = history_token_pos
+        if 'token_heading' in agent:
+            agent['token_heading'][:, :history_tokens] = history_token_heading
+        frame_count = min(
+            self.num_historical_steps - 1,
+            int(history_traj.shape[1]),
+            int(agent['position'].shape[1]) - 1,
+        )
+        if frame_count > 0:
+            agent['position'][:, 1:1 + frame_count, :2] = history_traj[
+                :,
+                :frame_count,
+            ]
+            agent['heading'][:, 1:1 + frame_count] = history_head[
+                :,
+                :frame_count,
+            ]
+        return True
+
+    def _history_token_noise_was_applied(self, view):
+        agent = view['agent']
+        if 'history_token_noise_mask' not in agent:
+            return False
+        return bool(agent['history_token_noise_mask'].any())
 
     def _retokenize_future(
         self,
@@ -1309,7 +1393,7 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
 
     def _build_ar_frontier_training_view(self, data):
         epoch = int(getattr(self, 'current_epoch', 0))
-        perturb_prob, rollout_prob = self._ar_closed_loop_curriculum(epoch)
+        _unused, rollout_prob = self._ar_closed_loop_curriculum(epoch)
         rollout_draw = torch.rand((), device=data['agent']['token_idx'].device)
         if rollout_prob > 0.0 and rollout_draw < rollout_prob:
             rollout_depth = int(torch.randint(
@@ -1328,15 +1412,11 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
 
         view, _tokens, _valid, _anchor = self._build_ar_training_view(
             data,
-            perturb=False,
+            perturb=None,
         )
-        if perturb_prob > 0.0 and torch.rand(
-            (),
-            device=data['agent']['token_idx'].device,
-        ) < perturb_prob:
-            self._perturb_ar_history_state(view)
+        if self._history_token_noise_was_applied(view):
             metadata = self._retokenize_training_view(view)
-            return view, metadata, 'perturb', 0
+            return view, metadata, 'clean', 0
         return view, self._clean_retokenization_metadata(view), 'clean', 0
 
     def _last_incomplete_anchor_token(self, data):
@@ -1677,19 +1757,14 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
             if 'shape' in source_agent and source_agent['shape'].dim() == 3:
                 agent['shape'] = source_agent['shape'][:, frame_start:frame_end + 1].clone()
 
+        self._apply_history_token_noise(view, perturb=perturb)
         target_slice = slice(
             self.ar_history_tokens,
             self.ar_history_tokens + self.ar_prediction_tokens,
         )
         target_tokens = agent['token_idx'][:, target_slice].long().clone()
         target_valid = agent['agent_valid_mask'][:, target_slice].bool().clone()
-        do_perturb = bool(perturb) if perturb is not None else (
-            getattr(self, 'training', False)
-            and self.ar_state_perturb_prob > 0.0
-            and torch.rand((), device=target_tokens.device) < self.ar_state_perturb_prob
-        )
-        if do_perturb:
-            self._perturb_ar_history_state(view)
+        del perturb
         return view, target_tokens, target_valid, anchor
 
     def _training_step_index(self) -> int:
@@ -2048,21 +2123,6 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
             initial_proposal_confidence=packed_proposal_confidence,
         )
         return loss, acc, True
-
-    def _perturb_ar_history_state(self, data):
-        agent = data['agent']
-        num_agents = int(agent['position'].shape[0])
-        device = agent['position'].device
-        if self.ar_state_perturb_pos_sigma_m > 0.0:
-            offset = torch.randn(num_agents, 2, device=device) * self.ar_state_perturb_pos_sigma_m
-            agent['position'][:, :self.num_historical_steps, :2] += offset[:, None, :]
-            if 'token_pos' in agent:
-                agent['token_pos'][:, :self.ar_history_tokens, :2] += offset[:, None, :]
-        if self.ar_state_perturb_heading_sigma_rad > 0.0:
-            delta = torch.randn(num_agents, device=device) * self.ar_state_perturb_heading_sigma_rad
-            agent['heading'][:, :self.num_historical_steps] += delta[:, None]
-            if 'token_heading' in agent:
-                agent['token_heading'][:, :self.ar_history_tokens] += delta[:, None]
 
     def _roll_history_token_ids(self, history_token_ids, committed_token_ids):
         combined = torch.cat([history_token_ids, committed_token_ids], dim=1)
@@ -2542,6 +2602,8 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
                 )
             else:
                 data, _target_tokens, _target_valid, _anchor = self._build_ar_training_view(data)
+                if self._history_token_noise_was_applied(data):
+                    retokenization = self._retokenize_training_view(data)
         packed, summary, _ft, _fv, _generation_agents, _supervision_agents, _agent_batch = self._build_diffusion_inputs(data)
         if packed is None:
             zero_loss = self._zero_connected_loss()
@@ -2591,7 +2653,7 @@ class SMARTAutoregressiveDiffusion(SMARTDiffusion):
                  prog_bar=False, on_step=True, on_epoch=True, batch_size=1)
         self.log('train_mask_acc', mask_acc, on_step=True, on_epoch=True, batch_size=1)
         if getattr(self, 'ar_objective', 'maskgit') == 'causal_frontier_v1':
-            for name in ('clean', 'perturb', 'rollout'):
+            for name in ('clean', 'rollout'):
                 value = loss.new_tensor(1.0 if state_mode == name else 0.0)
                 self.log(
                     f'train_ar_state_mode_{name}',

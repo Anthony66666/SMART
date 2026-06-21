@@ -272,17 +272,11 @@ class SMARTDiscreteDiffusionPolicy(SMARTAutoregressiveDiffusion):
         scenes = self._split_anchor_source_scenes(data)
         views = []
         for anchor in anchors:
-            perturb = (
-                getattr(self, 'training', False)
-                and self.ar_state_perturb_prob > 0.0
-                and torch.rand((), device=data['agent']['token_idx'].device) < self.ar_state_perturb_prob
-            )
-            perturb = bool(perturb)
             for scene_idx, scene in enumerate(scenes):
                 view, _target_tokens, _target_valid, _anchor = self._build_ar_training_view(
                     scene,
                     anchor_token=int(anchor),
-                    perturb=perturb,
+                    perturb=False,
                     allow_incomplete_window=True,
                 )
                 num_agents = int(view['agent']['token_idx'].shape[0])

@@ -298,13 +298,12 @@ DDPStrategy(find_unused_parameters=True, gradient_as_bucket_view=True)
 - 训练最多运行 32 个 epoch。
 - causal closed-loop curriculum 也是按 `current_epoch` 设计的：
 
-| epoch，代码从 0 开始 | clean/perturb/rollout 分布 |
+| epoch，代码从 0 开始 | clean/rollout 分布 |
 | --- | --- |
 | 0-3 | 50% rollout，50% clean |
-| 4+ | 50% rollout，25% perturb，25% clean |
+| 4+ | 50% rollout，50% clean |
 
-- model-rollout 从第 0 个 epoch 开始参与训练；第 4 个 epoch 起额外加入
-  25% perturb state。
+- model-rollout 从第 0 个 epoch 开始参与训练；连续高斯 state perturb 已从代码和配置中移除。
 
 ### `Trainer.save_ckpt_path: null`
 
@@ -753,26 +752,18 @@ total_rollout_steps % (commit_tokens * token_steps) == 0
 ### `Model.diffusion.rolling_anchor_training: true`
 
 - **状态：生效。**
-- 训练不总是固定在当前帧，而是构造短 AR window，并启用 clean、perturb、
-  model-rollout state curriculum。
+- 训练不总是固定在当前帧，而是构造短 AR window，并启用 clean / model-rollout
+  state curriculum。
 - 设为 `false` 会跳过 `_build_causal_training_view()`，闭环分布训练失效。
 
-### `Model.diffusion.state_perturb_pos_sigma_m: 0.3`
+### Gaussian state perturbation
 
-- **状态：生效，单位为米。**
-- curriculum 选择 perturb state 时，对 agent 历史位置加入二维高斯平移噪声：
-
-```text
-offset ~ Normal(0, 0.3^2)
-```
-
-- 同一 agent 的历史 frame 和 history token position 使用同一个 offset。
-
-### `Model.diffusion.state_perturb_heading_sigma_rad: 0.05`
-
-- **状态：生效，单位为弧度。**
-- 对历史 heading 加高斯噪声，标准差约 `2.86°`。
-- 过大可能产生训练数据之外的局部坐标系。
+- **状态：已移除。**
+- 旧的 `state_perturb_pos_sigma_m` / `state_perturb_heading_sigma_rad` 配置不再存在，
+  代码也不再对历史 position 或 heading 加连续高斯噪声。
+- 当前鲁棒性主要来自 model-rollout state curriculum 和 SMART-style top-k
+  history-token noise；future target 会从 noised history anchor 做 deterministic
+  retokenization。
 
 ### `Model.diffusion.closed_loop_max_depth: 4`
 
@@ -784,8 +775,7 @@ offset ~ Normal(0, 0.3^2)
 ### `Model.diffusion.closed_loop_batch_ratio_max: 0.5`
 
 - **状态：生效。**
-- 从 epoch 0 开始最多 50% batch 使用模型 rollout state；其余 batch 保持
-  clean，epoch 4 起再混入 perturb。
+- 从 epoch 0 开始最多 50% batch 使用模型 rollout state；其余 batch 保持 clean。
 - 在当前 1-4 token rollout depth 下，目标是把总体训练开销增量控制在约 30%。
 
 ### `Model.diffusion.current_state_enabled: true`
@@ -823,7 +813,7 @@ offset ~ Normal(0, 0.3^2)
   error 是有效 frame 上轨迹点欧氏距离的平均值。
 - 低于对应阈值：使用离散 token CE。
 - 高于阈值：认为没有合理离散 token，改用 continuous recovery loss。
-- 当前使用 10,000 scene、带 perturbation 的 P99：
+- 当前使用 10,000 scene calibration 得到的 P99：
 
 ```text
 [0.7379697561264038, 0.8562850952148438, 1.2705252170562744]

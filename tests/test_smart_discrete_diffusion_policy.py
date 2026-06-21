@@ -51,7 +51,6 @@ def _policy_shell():
     model.cadf_lite_local_ntp_loss_weight = 0.0
     model.commitment_aware_training = False
     model.proposal_shift_consistency_loss_weight = 0.0
-    model.ar_state_perturb_prob = 0.0
     model.proposal_dropout_prob = 0.0
     model.proposal_noise_topk = 0
     model.proposal_confidence = 0.5

@@ -1,10 +1,21 @@
 # Progress
 
 ## 2026-06-21 CST
+- Task: Moved SMART-style token perturbation from future labels to history inputs.
+- Result: `retokenization_noise` now samples top-k nearest SMART motion-token neighbors only for valid history tokens after the first history token, refreshes history token/frame geometry from those noised tokens, and retokenizes future supervision deterministically from the noised history anchor. `_retokenize_future()` no longer randomizes future target chunks.
+- Validation: Added regressions that fail if future targets are top-k randomized when noise is enabled, or if the training view does not perturb and refresh the latest history token.
+
+## 2026-06-21 CST
+- Task: Removed continuous Gaussian history-state perturbation from AR/causal diffusion training.
+- Result: Deleted the Gaussian perturb helper path, stopped using perturb states in AR/causal closed-loop training views, removed `state_perturb_*` YAML fields, and changed causal state-mode logging to clean/rollout only. `_build_ar_training_view(perturb=False)` now explicitly disables token-space history noise, not a continuous Gaussian perturb.
+- Docs: Updated current causal training docs to describe clean/model-rollout curriculum plus SMART-style retokenization noise instead of Gaussian state perturbation.
+- Validation: Added a regression that requires `_perturb_ar_history_state` to be absent and updated curriculum expectations to keep perturb probability at zero.
+
+## 2026-06-21 CST
 - Task: Added SMART-style noised rolling retokenization to causal diffusion training.
-- Result: `SMARTAutoregressiveDiffusion._retokenize_future()` can now, when enabled, keep chunk 0 matched to the nearest token and sample later chunks from the nearest top-k SMART motion tokens, then roll the retokenization state from the sampled token. `SMARTCausalDiffusion` now reuses the shared AR retokenization implementation instead of carrying a duplicate copy.
+- Result: `SMARTAutoregressiveDiffusion` now supports config-gated token-space training noise. The current implementation perturbs history-token inputs with top-k nearest SMART motion-token neighbors, then recomputes future targets by deterministic nearest retokenization. `SMARTCausalDiffusion` reuses the shared AR retokenization implementation instead of carrying a duplicate copy.
 - Config: Causal diffusion train/local/1000/validation configs now declare `retokenization_noise.enabled: true` and `topk: 5`. The noise is gated by `model.training`, so standalone validation remains deterministic.
-- Validation: Added a regression for rolling from a noised top-k token and config assertions for the causal retokenization-noise fields.
+- Validation: Added regressions for noised history-token inputs and config assertions for the causal retokenization-noise fields.
 
 ## 2026-06-20 CST
 - Task: Fixed a second AMP `16-mixed` dtype crash in SMARTDiffusion physical token embeddings.

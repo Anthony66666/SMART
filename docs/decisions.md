@@ -1,11 +1,25 @@
 # Decisions
 
+## Decision: Apply SMART-style token noise to history, not future targets
+- Date: 2026-06-21
+- Context: The first `retokenization_noise` implementation sampled chunk 1+ future targets from top-k nearest tokens. That changed the labels but did not make the model condition on noised committed/history tokens like SMART's rolling tokenization does.
+- Decision: Move the random top-k sampling to the history-token input path. When training, enabled, and not explicitly disabled by `perturb=False`, the AR training view samples valid history tokens after the first history token from same-type nearest-token neighbors, updates history token ids/positions/headings and history frames, and then retokenizes future targets deterministically from that noised history anchor.
+- Why: This matches the intended SMART-like robustness mechanism: the model learns to continue from a noised token-space history state, while future supervision remains a nearest-token target in the resulting local frame.
+- Impact: `retokenization_noise.enabled` now means history-token input perturbation plus deterministic future retokenization, not random future-label perturbation. Validation and explicit `perturb=False` paths remain deterministic.
+
+## Decision: Remove continuous Gaussian state perturbation from AR/causal training
+- Date: 2026-06-21
+- Context: The active causal training path already uses model-rollout states and SMART-style history-token noise. Keeping the older continuous Gaussian perturbation on history position/heading created a second robustness mechanism that differs from official SMART's token-space perturbation.
+- Decision: Remove the Gaussian history-state perturbation helper, stop reading `state_perturb_*` config fields, and make AR/causal closed-loop curriculum return clean/model-rollout states only. The public training-view API keeps the `perturb` argument to let callers explicitly disable token-space history noise with `perturb=False`.
+- Why: This keeps robustness training closer to SMART's discrete tokenization-noise mechanism and avoids training on continuous coordinate-frame noise that inference never sees.
+- Impact: New AR/causal/discrete-policy runs should not set `state_perturb_*` fields. Compare new checkpoints against older runs with the Gaussian perturb path called out as an architectural difference.
+
 ## Decision: Use SMART-style top-k rolling retokenization noise for causal training
 - Date: 2026-06-21
 - Context: Original SMART reduces train/inference distribution mismatch by rolling tokenization from a slightly perturbed matched token, while causal diffusion retokenization previously always selected the nearest token and rolled from that clean token.
-- Decision: Add config-gated `retokenization_noise` to the shared AR retokenization path. When training and enabled, chunk 0 remains nearest-token matched, and chunk 1+ sample uniformly from the nearest `topk` motion tokens; the next chunk's local frame is updated from the sampled token.
+- Decision: Add config-gated `retokenization_noise` to the shared AR training view. When training and enabled, history-token inputs are sampled from nearest `topk` motion-token neighbors and the history geometry is refreshed; future targets are then nearest-token retokenized from the noised history state.
 - Why: This mirrors the official SMART robustness mechanism without adding a model rollout forward to every retokenization step, and it keeps validation/eval deterministic because the noise is gated by `model.training`.
-- Impact: Active causal diffusion configs set `retokenization_noise.enabled: true` and `topk: 5`. Checkpoints trained before this change did not have noised rolling retokenization targets and should be treated as stale for distribution-shift ablations.
+- Impact: Active causal diffusion configs set `retokenization_noise.enabled: true` and `topk: 5`. Checkpoints trained before this change did not see noised token-space history inputs and should be treated as stale for distribution-shift ablations.
 
 ## Decision: Batch discrete-policy training anchors in one forward
 - Date: 2026-06-20

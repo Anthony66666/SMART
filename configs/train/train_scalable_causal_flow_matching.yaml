@@ -96,8 +96,6 @@ Model:
     total_rollout_steps: 80
     local_map_refresh: rescreen
     rolling_anchor_training: true
-    state_perturb_pos_sigma_m: 0.3
-    state_perturb_heading_sigma_rad: 0.05
     closed_loop_max_depth: 4
     closed_loop_batch_ratio_max: 0.5
     current_state_enabled: true

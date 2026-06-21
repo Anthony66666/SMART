@@ -99,9 +99,6 @@ Model:
     total_rollout_steps: 80
     local_map_refresh: rescreen
     rolling_anchor_training: true
-    state_perturb_prob: 0.5
-    state_perturb_pos_sigma_m: 0.3
-    state_perturb_heading_sigma_rad: 0.05
     sampling_guidance:
       enabled: false
       mode: safe_speed

@@ -263,26 +263,26 @@ anchor：
 
 ### 7.2 闭环 curriculum
 
-当前 `_closed_loop_curriculum(epoch)` 返回两个概率：
+当前 `_closed_loop_curriculum(epoch)` 为了兼容旧调用仍返回两个概率槽位：
 
 ```text
-perturb_prob, rollout_prob
+unused_state_noise_prob, rollout_prob
 ```
 
 schedule 是：
 
-| epoch | perturb | model rollout |
+| epoch | Gaussian state perturb | model rollout |
 | --- | --- | --- |
 | 0-3 | 0.00 | `closed_loop_batch_ratio_max`，当前 0.5 |
-| 4+ | 0.25 | `closed_loop_batch_ratio_max`，当前 0.5 |
+| 4+ | 0.00 | `closed_loop_batch_ratio_max`，当前 0.5 |
 
 model-rollout view 会先用当前模型 no-grad 采样 1 到 4 个 committed token，把 agent
 状态滚动到预测状态，再从这个新状态继续构造训练目标。
 
 ### 7.3 retokenization
 
-一旦历史状态被 perturb 或模型 rollout 改写，原始 GT future token 就可能不再是这个
-新 anchor 下的合理 token。causal path 会重新 retokenize：
+一旦历史状态被模型 rollout 改写，原始 GT future token 就可能不再是这个新 anchor
+下的合理 token。causal path 会重新 retokenize：
 
 1. 取新 anchor 后的 4 个 token 对应的 GT world-frame future positions。
 2. 对每个 chunk，把 world future 转到当前 token anchor 的 local frame。
@@ -615,8 +615,8 @@ diffusion mask denoising，也没有 causal frontier release。
 - 严格 causal temporal token graph。
 - `discrete_frontier_v2` 训练目标。
 - 单调 frontier release，不 remask。
-- 训练时 perturb/model-rollout state curriculum。
-- predicted/perturbed anchor 下的 retokenization。
+- 训练时 clean/model-rollout state curriculum。
+- predicted/noised-history anchor 下的 deterministic retokenization，以及 SMART-style top-k history-token noise。
 - retokenization invalid 的 continuous recovery。
 - current motion conditioning。
 - all-mask chunk-0 current-state source。

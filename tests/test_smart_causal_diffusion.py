@@ -1265,9 +1265,9 @@ class ClosedLoopCurriculumTest(unittest.TestCase):
 
         self.assertEqual(model._closed_loop_curriculum(0), (0.0, 0.50))
         self.assertEqual(model._closed_loop_curriculum(3), (0.0, 0.50))
-        self.assertEqual(model._closed_loop_curriculum(4), (0.25, 0.50))
-        self.assertEqual(model._closed_loop_curriculum(16), (0.25, 0.50))
-        self.assertEqual(model._closed_loop_curriculum(31), (0.25, 0.50))
+        self.assertEqual(model._closed_loop_curriculum(4), (0.0, 0.50))
+        self.assertEqual(model._closed_loop_curriculum(16), (0.0, 0.50))
+        self.assertEqual(model._closed_loop_curriculum(31), (0.0, 0.50))
 
     def test_retokenization_matches_world_future_in_predicted_local_frame(self):
         model = _causal_shell()

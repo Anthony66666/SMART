@@ -38,7 +38,6 @@ def _ar_shell():
     model.cadf_lite_local_ntp_loss_weight = 1.0
     model.commitment_aware_training = False
     model.proposal_shift_consistency_loss_weight = 0.0
-    model.ar_state_perturb_prob = 0.0
     model.proposal_dropout_prob = 0.0
     model.proposal_noise_topk = 5
     model.proposal_confidence = 0.5
@@ -1007,7 +1006,12 @@ class SMARTAutoregressiveDiffusionTest(unittest.TestCase):
 
         self.assertEqual(model._ar_closed_loop_curriculum(0), (0.0, 0.5))
         self.assertEqual(model._ar_closed_loop_curriculum(3), (0.0, 0.5))
-        self.assertEqual(model._ar_closed_loop_curriculum(4), (0.25, 0.5))
+        self.assertEqual(model._ar_closed_loop_curriculum(4), (0.0, 0.5))
+
+    def test_gaussian_history_perturbation_helper_is_removed(self):
+        model = _ar_shell()
+
+        self.assertFalse(hasattr(model, "_perturb_ar_history_state"))
 
     def test_ar_frontier_training_view_uses_rollout_when_selected(self):
         model = _ar_shell()
@@ -1528,7 +1532,7 @@ class SMARTAutoregressiveDiffusionTest(unittest.TestCase):
         self.assertTrue(torch.equal(metadata["retokenization_valid"], retokenization_valid))
         self.assertTrue(torch.equal(metadata["recovery_target_local_endpoint"], local_endpoints))
 
-    def test_retokenize_future_can_roll_from_noised_topk_token(self):
+    def test_retokenize_future_uses_nearest_targets_when_noise_enabled(self):
         model = _ar_shell()
         model.ar_token_steps = 1
         model.retokenization_error_thresholds = (100.0, 100.0, 100.0)
@@ -1552,7 +1556,7 @@ class SMARTAutoregressiveDiffusionTest(unittest.TestCase):
         future_positions = torch.tensor([[
             [[1.0, 0.0]],
             [[2.0, 0.0]],
-            [[1.0, 2.0]],
+            [[3.0, 0.0]],
         ]])
         future_valid = torch.ones(1, 3, 1, dtype=torch.bool)
 
@@ -1566,8 +1570,60 @@ class SMARTAutoregressiveDiffusionTest(unittest.TestCase):
             token_center_vocabs=token_center_vocabs,
         )
 
-        self.assertTrue(torch.equal(token_ids, torch.tensor([[0, 1, 0]])))
+        self.assertTrue(torch.equal(token_ids, torch.tensor([[0, 0, 0]])))
         self.assertTrue(valid.all())
+
+    def test_retokenization_noise_perturbs_latest_history_token(self):
+        test_case = self
+        model = _ar_shell()
+        model.training = True
+        model.retokenization_noise_enabled = True
+        model.retokenization_noise_topk = 2
+        data = _toy_sequence(num_agents=1)
+        table = torch.arange(model.model_config.decoder.token_size).view(1, -1, 1)
+        table = table.expand(4, -1, 2).clone()
+        table[0, 3, :] = 123
+        captured = {}
+
+        def fake_neighbor_table(self, topk, device):
+            test_case.assertEqual(topk, 2)
+            return table.to(device)
+
+        def fake_decode(self, token_ids, token_valid, agent_types, start_pos, start_heading):
+            captured["token_ids"] = token_ids.clone()
+            traj = torch.full((1, 10, 2), 9.0)
+            head = torch.full((1, 10), 0.5)
+            valid = torch.ones(1, 10, dtype=torch.bool)
+            token_pos = torch.tensor([[[2.0, 0.0], [123.0, 0.0]]])
+            token_heading = torch.tensor([[0.2, 1.23]])
+            return traj, head, valid, token_pos, token_heading, token_pos[:, -1], token_heading[:, -1]
+
+        model._token_neighbor_table = MethodType(fake_neighbor_table, model)
+        model._decode_token_sequence = MethodType(fake_decode, model)
+
+        view, target_tokens, _target_valid, _anchor = model._build_ar_training_view(
+            data,
+            anchor_token=4,
+            perturb=None,
+        )
+
+        self.assertIn("token_ids", captured)
+        self.assertTrue(torch.equal(captured["token_ids"], torch.tensor([[2, 123]])))
+        self.assertEqual(int(view["agent"]["token_idx"][0, 0].item()), 2)
+        self.assertEqual(int(view["agent"]["token_idx"][0, 1].item()), 123)
+        self.assertTrue(torch.equal(target_tokens[0], torch.tensor([4, 5, 6, 7])))
+        self.assertTrue(torch.equal(
+            view["agent"]["token_idx"][0, 2:6],
+            torch.tensor([4, 5, 6, 7]),
+        ))
+        self.assertTrue(torch.equal(
+            view["agent"]["history_token_noise_mask"],
+            torch.tensor([[False, True]]),
+        ))
+        self.assertTrue(torch.equal(
+            view["agent"]["token_pos"][0, :2],
+            torch.tensor([[2.0, 0.0], [123.0, 0.0]]),
+        ))
 
     def test_current_state_context_is_added_to_each_agent_chunk(self):
         model = _ar_shell()

@@ -428,9 +428,7 @@ class SMARTCausalDiffusion(SMARTAutoregressiveDiffusion):
         maximum = float(
             getattr(self, 'closed_loop_batch_ratio_max', 0.5)
         )
-        if epoch <= 3:
-            return 0.1, maximum
-        return 0.1, maximum
+        return 0.0, maximum
 
     def _pool_agent_context(self, hist_tokens, hist_mask):
         """Pool ordered history with greater weight on the latest token."""
@@ -2055,7 +2053,7 @@ class SMARTCausalDiffusion(SMARTAutoregressiveDiffusion):
 
     def _build_causal_training_view(self, data):
         epoch = int(getattr(self, 'current_epoch', 0))
-        perturb_prob, rollout_prob = self._closed_loop_curriculum(epoch)
+        _unused, rollout_prob = self._closed_loop_curriculum(epoch)
         rollout_draw = torch.rand((), device=data['agent']['token_idx'].device)
         if rollout_prob > 0.0 and rollout_draw < rollout_prob:
             rollout_depth = int(torch.randint(
@@ -2074,15 +2072,11 @@ class SMARTCausalDiffusion(SMARTAutoregressiveDiffusion):
 
         view, _tokens, _valid, _anchor = self._build_ar_training_view(
             data,
-            perturb=False,
+            perturb=None,
         )
-        if perturb_prob > 0.0 and torch.rand(
-            (),
-            device=data['agent']['token_idx'].device,
-        ) < perturb_prob:
-            self._perturb_ar_history_state(view)
+        if self._history_token_noise_was_applied(view):
             metadata = self._retokenize_training_view(view)
-            return view, metadata, 'perturb', 0
+            return view, metadata, 'clean', 0
         return view, self._clean_retokenization_metadata(view), 'clean', 0
 
     def training_step(self, data, batch_idx):
@@ -2122,7 +2116,7 @@ class SMARTCausalDiffusion(SMARTAutoregressiveDiffusion):
         diffusion_loss, mask_acc = self._compute_diffusion_loss(packed, summary)
         ntp_loss = self._compute_optional_ntp_loss(data, diffusion_loss)
         loss = diffusion_loss + self.ntp_aux_loss_weight * ntp_loss
-        mode_values = {'clean': 0.0, 'perturb': 1.0, 'rollout': 2.0}
+        mode_values = {'clean': 0.0, 'rollout': 1.0}
         self.log(
             'train_state_mode',
             loss.new_tensor(mode_values[state_mode]),
